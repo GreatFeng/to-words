@@ -1,0 +1,39 @@
+{
+  "input": {
+    "background_color": "#E8E8E8",
+    "opacity": 0.49799997,
+    "width": 200.0,
+    "height": 30.0,
+    "font_size": 14.0,
+    "corner_radius": 9.0
+  },
+  "results": {
+    "background_color": "#E8E8E8",
+    "opacity": 0.50399995,
+    "min_width": 200.0,
+    "max_width": 600.0,
+    "min_row_height": 28.0,
+    "max_height": 360.0,
+    "font_size": 12.0,
+    "corner_radius": 7.0,
+    "max_visible_results": 8
+  },
+  "hotkeys": {
+    "popup": "ctrl+alt+Enter",
+    "settings": "ctrl+alt+shift+S",
+    "clear_composed": "ctrl+Backspace",
+    "ocr": "ctrl+alt+o"
+  },
+  "gap": 4.0,
+  "background_blur": true,
+  "continuous_input": false,
+  "ai_translation": true,
+  "ai_auto_save": true,
+  "clear_on_focus_return": false,
+  "translation_language": "ko",
+  "source_language": "auto",
+  "text_color": "#24272E",
+  "selected_color": "#A9CEFF",
+  "selected_text_color": "#0B57D0",
+  "selected_opacity": 0.70400023
+}
