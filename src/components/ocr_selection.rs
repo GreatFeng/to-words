@@ -1,15 +1,17 @@
 //! OCR 屏幕快照和可反复调整的框选控件。
 //!
-//! 首次拖拽创建选区；拖动选区内部可移动，拖动右下角手柄可缩放；
-//! 只有点击确认或取消才结束框选。
+//! 首次拖拽创建选区；松开后通知应用预览识别，拖动内部可移动，
+//! 拖动右下角手柄可缩放；只有点击确认或取消才结束框选。
 
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, Pos2, Rect, TextureHandle, Vec2};
 
+use crate::components::ocr_translation::paint_translation;
 use crate::platform::ocr::{self, CaptureRegion, CapturedScreen};
 
 pub(crate) enum SelectionAction {
+    Changed(CaptureRegion),
     Confirm(CaptureRegion),
     Cancel,
 }
@@ -45,7 +47,11 @@ impl OcrSelection {
         }
     }
 
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> Option<SelectionAction> {
+    pub(crate) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        preview: Option<(&str, bool)>,
+    ) -> Option<SelectionAction> {
         if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
             return Some(SelectionAction::Cancel);
         }
@@ -85,26 +91,21 @@ impl OcrSelection {
                 button_area = Some(buttons);
                 ui.painter()
                     .rect_filled(buttons.expand(3.0), 8.0, Color32::from_rgb(34, 40, 49));
-                let confirm = Rect::from_min_size(buttons.min, Vec2::new(36.0, 32.0));
+                let confirm = Rect::from_min_size(buttons.min, Vec2::new(30.0, 28.0));
                 let cancel =
-                    Rect::from_min_size(buttons.min + Vec2::new(46.0, 0.0), Vec2::new(36.0, 32.0));
+                    Rect::from_min_size(buttons.min + Vec2::new(38.0, 0.0), Vec2::new(30.0, 28.0));
                 if ui
                     .put(
                         confirm,
                         egui::Button::new(
-                            egui::RichText::new("√").size(21.0).color(Color32::WHITE),
+                            egui::RichText::new("√").size(18.0).color(Color32::WHITE),
                         )
                         .fill(Color32::from_rgb(38, 113, 91)),
                     )
-                    .on_hover_text("确认识别并复制")
+                    .on_hover_text("复制识别原文并关闭")
                     .clicked()
                 {
-                    let region = ocr::selected_region(
-                        self.screen.monitor,
-                        [area.width(), area.height()],
-                        [rect.left() - area.left(), rect.top() - area.top()],
-                        [rect.right() - area.left(), rect.bottom() - area.top()],
-                    );
+                    let region = region_from_rect(self.screen.monitor, rect, area);
                     if let Some(region) = region {
                         return Some(SelectionAction::Confirm(region));
                     }
@@ -113,7 +114,7 @@ impl OcrSelection {
                     .put(
                         cancel,
                         egui::Button::new(
-                            egui::RichText::new("×").size(21.0).color(Color32::WHITE),
+                            egui::RichText::new("×").size(18.0).color(Color32::WHITE),
                         )
                         .fill(Color32::from_rgb(92, 51, 52)),
                     )
@@ -123,6 +124,13 @@ impl OcrSelection {
                     return Some(SelectionAction::Cancel);
                 }
             }
+        }
+
+        if self.drag.is_none()
+            && let (Some(rect), Some(buttons), Some((text, is_error))) =
+                (self.selection, button_area, preview)
+        {
+            paint_translation(ui, rect, buttons, text, is_error);
         }
 
         let (pressed, down, released, pointer) = ui.input(|input| {
@@ -163,22 +171,35 @@ impl OcrSelection {
                 }
             });
         }
-        if released {
-            self.drag = None;
+        if released
+            && self.drag.take().is_some()
+            && let Some(rect) = self.selection
+            && let Some(region) = region_from_rect(self.screen.monitor, rect, area)
+        {
+            return Some(SelectionAction::Changed(region));
         }
 
-        let hint = Rect::from_min_size(area.min + Vec2::new(22.0, 22.0), Vec2::new(375.0, 38.0));
+        let hint = Rect::from_min_size(area.min + Vec2::new(22.0, 22.0), Vec2::new(410.0, 38.0));
         ui.painter()
             .rect_filled(hint, 7.0, Color32::from_black_alpha(195));
         ui.painter().text(
             hint.center(),
             egui::Align2::CENTER_CENTER,
-            "拖拽框选 · 拖动选区移动 · 拖动右下角缩放 · √ / ×",
+            "松开自动识别 · 可移动或缩放选区 · √复制并关闭 · ×取消",
             egui::FontId::proportional(14.0),
             Color32::WHITE,
         );
         None
     }
+}
+
+fn region_from_rect(monitor: ocr::MonitorBounds, rect: Rect, area: Rect) -> Option<CaptureRegion> {
+    ocr::selected_region(
+        monitor,
+        [area.width(), area.height()],
+        [rect.left() - area.left(), rect.top() - area.top()],
+        [rect.right() - area.left(), rect.bottom() - area.top()],
+    )
 }
 
 fn resize_handle(rect: Rect) -> Rect {
@@ -191,15 +212,16 @@ fn moved_rect(rect: Rect, requested_min: Pos2, area: Rect) -> Rect {
 }
 
 fn button_rect(selection: Rect, area: Rect) -> Rect {
-    let size = Vec2::new(82.0, 32.0);
-    let x =
-        (selection.right() - size.x).clamp(area.left(), (area.right() - size.x).max(area.left()));
-    let below = selection.bottom() + 12.0;
-    let y = if below + size.y <= area.bottom() {
-        below
+    let size = Vec2::new(68.0, 28.0);
+    // 按钮贴在选区右侧的下沿，不占用译文所在的下方区域。
+    let outside_right = selection.right() + 10.0;
+    let x = if outside_right + size.x <= area.right() - 6.0 {
+        outside_right
     } else {
-        (selection.top() - size.y - 12.0).max(area.top())
+        (selection.right() - size.x).clamp(area.left(), (area.right() - size.x).max(area.left()))
     };
+    let y =
+        (selection.bottom() - size.y).clamp(area.top(), (area.bottom() - size.y).max(area.top()));
     Rect::from_min_size(Pos2::new(x, y), size)
 }
 
@@ -214,5 +236,24 @@ mod tests {
         let moved = moved_rect(rect, Pos2::new(90.0, 95.0), area);
         assert_eq!(moved.min, Pos2::new(70.0, 80.0));
         assert_eq!(moved.size(), rect.size());
+    }
+
+    #[test]
+    fn buttons_sit_at_selection_lower_right_without_occupying_translation_row() {
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0));
+        let selection = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(200.0, 80.0));
+        let buttons = button_rect(selection, area);
+        assert!(buttons.left() > selection.right());
+        assert_eq!(buttons.bottom(), selection.bottom());
+        assert_eq!(buttons.size(), Vec2::new(68.0, 28.0));
+    }
+
+    #[test]
+    fn buttons_remain_visible_at_right_edge() {
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0));
+        let selection = Rect::from_min_size(Pos2::new(320.0, 150.0), Vec2::new(80.0, 60.0));
+        let buttons = button_rect(selection, area);
+        assert!(buttons.right() <= area.right());
+        assert_eq!(buttons.bottom(), selection.bottom());
     }
 }

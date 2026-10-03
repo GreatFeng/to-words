@@ -26,7 +26,7 @@ use crate::domain::ai_word_save;
 use crate::domain::continuous_input::ContinuousInput;
 use crate::domain::word_index::{SearchHit, WordEntry, WordIndex};
 use crate::platform::credentials;
-use crate::platform::ocr::{self, CapturedScreen, MonitorBounds};
+use crate::platform::ocr::{self, CaptureRegion, CapturedScreen, MonitorBounds};
 use crate::platform::system_tray::{SystemTray, TrayAction};
 use crate::{translation_language, ui_theme};
 
@@ -44,6 +44,7 @@ pub(crate) struct UiConfig {
     pub(crate) continuous_input: bool,
     pub(crate) ai_translation: bool,
     pub(crate) ai_auto_save: bool,
+    pub(crate) ocr_auto_translate: bool,
     pub(crate) clear_on_focus_return: bool,
     pub(crate) translation_language: String,
     pub(crate) source_language: String,
@@ -64,6 +65,7 @@ impl Default for UiConfig {
             continuous_input: false,
             ai_translation: false,
             ai_auto_save: true,
+            ocr_auto_translate: true,
             clear_on_focus_return: false,
             translation_language: String::new(),
             source_language: "auto".to_string(),
@@ -747,8 +749,53 @@ enum OcrState {
         ready_at: Instant,
     },
     Capturing(Receiver<Result<CapturedScreen>>),
-    Selecting(OcrSelection),
-    Running(Receiver<Result<String>>),
+    Selecting {
+        selection: OcrSelection,
+        preview: OcrPreview,
+    },
+    Finalizing(Receiver<Result<String>>),
+}
+
+#[derive(Default)]
+struct OcrPreview {
+    region: Option<CaptureRegion>,
+    ready_at: Option<Instant>,
+    recognizing: Option<Receiver<Result<String>>>,
+    recognized: Option<String>,
+    translating: Option<Receiver<Result<String>>>,
+    display: Option<(String, bool)>,
+}
+
+impl OcrPreview {
+    fn schedule(&mut self, region: CaptureRegion) {
+        if self.region == Some(region) {
+            return;
+        }
+        self.region = Some(region);
+        self.ready_at = Some(Instant::now() + Duration::from_millis(300));
+        self.recognizing = None;
+        self.recognized = None;
+        self.translating = None;
+        self.display = None;
+    }
+}
+
+fn translate_ocr_recognized(recognized: &str, target: &str) -> Result<String> {
+    let key = credentials::load_key()
+        .context("读取 DeepSeek API Key 失败")?
+        .filter(|key| !key.trim().is_empty())
+        .context("未配置 DeepSeek API Key")?;
+    ai::translate_ocr_text(recognized, target, &key)
+}
+
+fn ocr_translation_target(enabled: bool, source: &str) -> Option<String> {
+    enabled.then(|| {
+        if source == "auto" {
+            "cn".to_string()
+        } else {
+            source.to_string()
+        }
+    })
 }
 
 struct MatchApp {
@@ -993,7 +1040,10 @@ impl MatchApp {
     fn show_ocr_selection(&mut self, context: &egui::Context, screen: CapturedScreen) {
         let monitor = screen.monitor;
         let scale = context.pixels_per_point().max(1.0);
-        self.ocr_state = OcrState::Selecting(OcrSelection::new(context, screen));
+        self.ocr_state = OcrState::Selecting {
+            selection: OcrSelection::new(context, screen),
+            preview: OcrPreview::default(),
+        };
         self.is_open = true;
         context.send_viewport_cmd(egui::ViewportCommand::Title(
             "to_words OCR 框选".to_string(),
@@ -1056,31 +1106,109 @@ impl MatchApp {
             }
         }
 
-        let result = match &self.ocr_state {
-            OcrState::Running(receiver) => match receiver.try_recv() {
+        self.poll_ocr_preview();
+
+        let finalized = match &self.ocr_state {
+            OcrState::Finalizing(receiver) => match receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!("OCR 任务意外中断"))),
                 Err(TryRecvError::Empty) => None,
             },
             _ => None,
         };
-        if let Some(result) = result {
+        if let Some(result) = finalized {
             self.ocr_state = OcrState::Idle;
             match result {
-                Ok(text) => match arboard::Clipboard::new()
-                    .and_then(|mut clipboard| clipboard.set_text(text.clone()))
-                {
-                    Ok(()) => {
-                        self.system_tray
-                            .set_status(&format!("OCR 已复制 {} 个字符", text.chars().count()));
-                        self.is_open = false;
-                    }
-                    Err(error) => {
-                        self.show_ocr_error(context, format!("OCR 已识别，但复制失败：{error}"))
-                    }
-                },
+                Ok(text) => self.copy_ocr_original(context, &text),
                 Err(error) => self.show_ocr_error(context, format!("OCR 失败：{error:#}")),
             }
+        }
+    }
+
+    fn poll_ocr_preview(&mut self) {
+        let OcrState::Selecting { selection, preview } = &mut self.ocr_state else {
+            return;
+        };
+
+        if preview
+            .ready_at
+            .is_some_and(|ready_at| Instant::now() >= ready_at)
+            && let Some(region) = preview.region
+        {
+            let screen = Arc::clone(&selection.screen);
+            let source = self.config.source_language.clone();
+            let target = self.config.translation_language.clone();
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(ocr::recognize_selection(&screen, region, &source, &target));
+            });
+            preview.ready_at = None;
+            preview.recognizing = Some(receiver);
+            preview.display = Some(("正在识别…".to_string(), false));
+        }
+
+        let recognized =
+            preview
+                .recognizing
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err(anyhow::anyhow!("OCR 任务意外中断")))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = recognized {
+            preview.recognizing = None;
+            match result {
+                Ok(text) => {
+                    preview.recognized = Some(text.clone());
+                    if let Some(target) = ocr_translation_target(
+                        self.config.ocr_auto_translate,
+                        &self.config.source_language,
+                    ) {
+                        let (sender, receiver) = mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = sender.send(translate_ocr_recognized(&text, &target));
+                        });
+                        preview.translating = Some(receiver);
+                        preview.display = Some(("正在翻译…".to_string(), false));
+                    } else {
+                        preview.display = None;
+                    }
+                }
+                Err(error) => {
+                    preview.display = Some((format!("OCR 识别失败：{error:#}"), true));
+                }
+            }
+        }
+
+        let translated =
+            preview
+                .translating
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(TryRecvError::Disconnected) => {
+                        Some(Err(anyhow::anyhow!("翻译任务意外中断")))
+                    }
+                    Err(TryRecvError::Empty) => None,
+                });
+        if let Some(result) = translated {
+            preview.translating = None;
+            preview.display = Some(match result {
+                Ok(text) => (text, false),
+                Err(error) => (format!("翻译失败：{error:#}"), true),
+            });
+        }
+    }
+
+    fn copy_ocr_original(&mut self, context: &egui::Context, text: &str) {
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+            Ok(()) => self
+                .system_tray
+                .set_status(&format!("OCR 原文已复制 {} 个字符", text.chars().count())),
+            Err(error) => self.show_ocr_error(context, format!("OCR 已识别，但复制失败：{error}")),
         }
     }
 
@@ -1877,10 +2005,10 @@ impl eframe::App for MatchApp {
             return;
         }
 
-        if matches!(self.ocr_state, OcrState::Selecting(_)) {
+        if matches!(self.ocr_state, OcrState::Selecting { .. }) {
             if let Some(window) = frame.winit_window() {
                 window.set_blur(false);
-                if let OcrState::Selecting(selection) = &self.ocr_state {
+                if let OcrState::Selecting { selection, .. } = &self.ocr_state {
                     let monitor = selection.screen.monitor;
                     let target_position = winit::dpi::PhysicalPosition::new(monitor.x, monitor.y);
                     let target_size = winit::dpi::PhysicalSize::new(monitor.width, monitor.height);
@@ -1893,30 +2021,47 @@ impl eframe::App for MatchApp {
                 }
             }
             let action = match &mut self.ocr_state {
-                OcrState::Selecting(selection) => selection.show(ui),
+                OcrState::Selecting { selection, preview } => selection.show(
+                    ui,
+                    preview
+                        .display
+                        .as_ref()
+                        .map(|(text, error)| (text.as_str(), *error)),
+                ),
                 _ => None,
             };
             match action {
+                Some(SelectionAction::Changed(region)) => {
+                    if let OcrState::Selecting { preview, .. } = &mut self.ocr_state {
+                        preview.schedule(region);
+                    }
+                }
                 Some(SelectionAction::Cancel) => {
                     self.hide(ui.ctx());
                     self.system_tray.set_status("OCR 已取消");
                 }
                 Some(SelectionAction::Confirm(region)) => {
-                    let OcrState::Selecting(selection) = &self.ocr_state else {
+                    let OcrState::Selecting { selection, preview } = &self.ocr_state else {
                         unreachable!()
                     };
-                    let screen: Arc<CapturedScreen> = Arc::clone(&selection.screen);
-                    let source = self.config.source_language.clone();
-                    let target = self.config.translation_language.clone();
-                    let (sender, receiver) = mpsc::channel();
-                    std::thread::spawn(move || {
-                        let _ = sender
-                            .send(ocr::recognize_selection(&screen, region, &source, &target));
-                    });
-                    self.ocr_state = OcrState::Running(receiver);
-                    self.is_open = false;
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    let recognized = (preview.region == Some(region))
+                        .then(|| preview.recognized.clone())
+                        .flatten();
+                    if let Some(text) = recognized {
+                        self.hide(ui.ctx());
+                        self.copy_ocr_original(ui.ctx(), &text);
+                    } else {
+                        let screen: Arc<CapturedScreen> = Arc::clone(&selection.screen);
+                        let source = self.config.source_language.clone();
+                        let target = self.config.translation_language.clone();
+                        let (sender, receiver) = mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = sender
+                                .send(ocr::recognize_selection(&screen, region, &source, &target));
+                        });
+                        self.hide(ui.ctx());
+                        self.ocr_state = OcrState::Finalizing(receiver);
+                    }
                 }
                 None => {}
             }
@@ -2377,6 +2522,7 @@ mod tests {
         assert_eq!(config.results.max_visible_results, 8);
         assert!(!config.continuous_input);
         assert!(config.ai_auto_save);
+        assert!(config.ocr_auto_translate);
         assert!(!config.clear_on_focus_return);
         assert!(config.translation_language.is_empty());
         assert_eq!(config.source_language, "auto");
@@ -2387,7 +2533,43 @@ mod tests {
         let config: UiConfig = serde_json::from_str(r#"{"ai_translation":true}"#).unwrap();
         assert!(config.ai_translation);
         assert!(config.ai_auto_save);
+        assert!(config.ocr_auto_translate);
         assert_eq!(config.source_language, "auto");
+    }
+
+    #[test]
+    fn ocr_auto_translation_can_be_disabled_in_config() {
+        let config: UiConfig = serde_json::from_str(r#"{"ocr_auto_translate":false}"#).unwrap();
+        assert!(!config.ocr_auto_translate);
+    }
+
+    #[test]
+    fn disabled_ocr_translation_does_not_request_translation() {
+        use super::ocr_translation_target;
+
+        assert_eq!(ocr_translation_target(false, "ko"), None);
+        assert_eq!(ocr_translation_target(true, "auto").as_deref(), Some("cn"));
+        assert_eq!(ocr_translation_target(true, "ja").as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn unchanged_ocr_selection_keeps_its_recognition_preview() {
+        use super::{CaptureRegion, OcrPreview};
+
+        let mut preview = OcrPreview::default();
+        let region = CaptureRegion {
+            x: 10,
+            y: 20,
+            width: 120,
+            height: 40,
+        };
+        preview.schedule(region);
+        preview.recognized = Some("原文".to_string());
+        preview.schedule(region);
+        assert_eq!(preview.recognized.as_deref(), Some("原文"));
+
+        preview.schedule(CaptureRegion { x: 11, ..region });
+        assert!(preview.recognized.is_none());
     }
 
     #[test]

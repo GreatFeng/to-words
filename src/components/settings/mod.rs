@@ -44,6 +44,7 @@ pub(crate) struct SettingsPanel {
     remove_ai_key: bool,
     active_source_language: String,
     ocr_status: String,
+    ocr_help_hover_started: Option<f64>,
 }
 
 impl SettingsPanel {
@@ -61,6 +62,7 @@ impl SettingsPanel {
             remove_ai_key: false,
             active_source_language: "cn".to_string(),
             ocr_status: String::new(),
+            ocr_help_hover_started: None,
         }
     }
 
@@ -68,6 +70,7 @@ impl SettingsPanel {
         self.draft = config.clone();
         self.active_source_language = active_source_language.to_string();
         self.ocr_status = ocr::engine_status();
+        self.ocr_help_hover_started = None;
         self.message = None;
         self.active_shortcut = None;
         self.active_number = None;
@@ -112,12 +115,14 @@ impl SettingsPanel {
         }
 
         if self.word_editor.is_open() {
+            self.ocr_help_hover_started = None;
             self.active_shortcut = None;
             self.active_number = None;
             self.word_editor.show(ui);
             return None;
         }
         if self.word_merge_panel.is_open() {
+            self.ocr_help_hover_started = None;
             self.active_shortcut = None;
             self.active_number = None;
             self.word_merge_panel.show(ui);
@@ -174,9 +179,11 @@ impl SettingsPanel {
                                     if secondary_button(ui, "编辑词库", 104.0).clicked() {
                                         self.open_word_editor(ui.ctx());
                                     }
-                                    if secondary_button(ui, "合并本地词库", 128.0)
-                                        .on_hover_text("选择一个或多个词库并合并到当前语言词库")
-                                        .clicked()
+                                    if ui_theme::opaque_hover_text(
+                                        secondary_button(ui, "合并本地词库", 128.0),
+                                        "选择一个或多个词库并合并到当前语言词库",
+                                    )
+                                    .clicked()
                                     {
                                         let file_name = self.current_word_file_name();
                                         self.word_merge_panel.open(file_name);
@@ -189,7 +196,7 @@ impl SettingsPanel {
                         settings_card(
                             ui,
                             "AI 翻译 · DeepSeek",
-                            "可随时主动翻译当前输入文字；译文确认后加入组合。",
+                            "查询框可主动翻译，OCR 可自动翻译识别文字。",
                             |ui| self.draw_ai_settings(ui),
                         );
                         ui.add_space(14.0);
@@ -317,6 +324,8 @@ impl SettingsPanel {
             );
         });
         ui.add_space(8.0);
+        self.draw_ocr_auto_translation(ui);
+        ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 egui::RichText::new("API Key")
@@ -347,6 +356,36 @@ impl SettingsPanel {
         } else {
             ui.label(egui::RichText::new("密钥保存在 Windows 凭据管理器，不写入 ui_config.json。未选择目标语言时无法请求翻译。")
                 .size(12.0).color(muted_text()));
+        }
+    }
+
+    fn draw_ocr_auto_translation(&mut self, ui: &mut egui::Ui) {
+        let response = contrast_checkbox(
+            ui,
+            &mut self.draft.ocr_auto_translate,
+            "OCR 识别后自动翻译成原始语言",
+        );
+        if response.hovered() {
+            let now = ui.input(|input| input.time);
+            let started = self.ocr_help_hover_started.get_or_insert(now);
+            if now - *started >= 2.0 {
+                let mut tooltip = egui::Tooltip::for_widget(&response).width(390.0);
+                tooltip.popup = tooltip.popup.frame(ui_theme::tooltip_frame());
+                tooltip.show(|ui| {
+                    ui.label(
+                        egui::RichText::new("松开截图选区后自动显示纯文字译文；点击 √ 才复制 OCR 原文并关闭。开启后仅向 DeepSeek 发送识别文字，不发送截图。原始语言为“自动检测”时译成简体中文。需要 API Key，可能产生费用。")
+                            .size(13.0)
+                            .color(primary_text()),
+                    );
+                });
+            } else {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(
+                        (2.0 - (now - *started)).max(0.0),
+                    ));
+            }
+        } else {
+            self.ocr_help_hover_started = None;
         }
     }
 
@@ -876,8 +915,8 @@ fn shortcut_row(
     } else {
         control_surface()
     };
-    if ui
-        .add_sized(
+    let response =
+        ui.add_sized(
             [width, 32.0],
             egui::Button::new(egui::RichText::new(text).monospace().size(12.5).color(
                 if recording {
@@ -889,9 +928,8 @@ fn shortcut_row(
             .fill(fill)
             .stroke(egui::Stroke::new(1.0, border()))
             .corner_radius(4),
-        )
-        .on_hover_text("点击后，通过键盘按下新的组合键")
-        .clicked()
+        );
+    if ui_theme::opaque_hover_text(response, "点击后，通过键盘按下新的组合键").clicked()
     {
         value.clear();
         *active = Some(target);
@@ -919,8 +957,8 @@ fn number_row(
         format!("{value:.0}")
     };
     let width = ui.available_width().clamp(132.0, 180.0);
-    let response = ui
-        .add_sized(
+    let response =
+        ui.add_sized(
             [width, 32.0],
             egui::Button::new(egui::RichText::new(text).monospace().size(12.5).color(
                 if selected {
@@ -936,8 +974,8 @@ fn number_row(
             })
             .stroke(egui::Stroke::new(1.0, border()))
             .corner_radius(4),
-        )
-        .on_hover_text("点击选中，然后滚动鼠标滚轮调整");
+        );
+    let response = ui_theme::opaque_hover_text(response, "点击选中，然后滚动鼠标滚轮调整");
     if response.clicked() {
         *active = Some(id);
         response.request_focus();
@@ -970,28 +1008,27 @@ fn usize_number_row(
     let id = ui.make_persistent_id(id_source);
     let selected = *active == Some(id);
     let width = ui.available_width().clamp(132.0, 180.0);
-    let response = ui
-        .add_sized(
-            [width, 32.0],
-            egui::Button::new(
-                egui::RichText::new(value.to_string())
-                    .monospace()
-                    .size(12.5)
-                    .color(if selected {
-                        accent_text()
-                    } else {
-                        primary_text()
-                    }),
-            )
-            .fill(if selected {
-                accent_fill()
-            } else {
-                control_surface()
-            })
-            .stroke(egui::Stroke::new(1.0, border()))
-            .corner_radius(4),
+    let response = ui.add_sized(
+        [width, 32.0],
+        egui::Button::new(
+            egui::RichText::new(value.to_string())
+                .monospace()
+                .size(12.5)
+                .color(if selected {
+                    accent_text()
+                } else {
+                    primary_text()
+                }),
         )
-        .on_hover_text("点击选中，然后滚动鼠标滚轮调整");
+        .fill(if selected {
+            accent_fill()
+        } else {
+            control_surface()
+        })
+        .stroke(egui::Stroke::new(1.0, border()))
+        .corner_radius(4),
+    );
+    let response = ui_theme::opaque_hover_text(response, "点击选中，然后滚动鼠标滚轮调整");
     if response.clicked() {
         *active = Some(id);
         response.request_focus();

@@ -289,14 +289,16 @@ impl WordEditorState {
                     self.batch_import_content.clear();
                     self.batch_import_open = true;
                 }
-                if filled_toolbar_button(
-                    ui,
-                    "批量导出",
-                    104.0,
-                    ui_theme::pale_green(),
-                    ui_theme::green_text(),
+                if ui_theme::opaque_hover_text(
+                    filled_toolbar_button(
+                        ui,
+                        "批量导出",
+                        104.0,
+                        ui_theme::pale_green(),
+                        ui_theme::green_text(),
+                    ),
+                    "将格式化后的 JSON 导出到 word_libraries 词库目录",
                 )
-                .on_hover_text("将格式化后的 JSON 导出到 word_libraries 词库目录")
                 .clicked()
                 {
                     self.batch_export_file_name = "user_words_export.json".to_string();

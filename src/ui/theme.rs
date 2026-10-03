@@ -61,6 +61,24 @@ pub(crate) fn yellow_text() -> egui::Color32 {
     egui::Color32::from_rgb(149, 100, 0)
 }
 
+/// 设置页面及其子页面共用的不透明悬停提示。
+pub(crate) fn tooltip_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(255, 254, 250))
+        .stroke(egui::Stroke::new(1.0, border()))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(12))
+}
+
+pub(crate) fn opaque_hover_text(response: egui::Response, text: &str) -> egui::Response {
+    let mut tooltip = egui::Tooltip::for_enabled(&response).width(390.0);
+    tooltip.popup = tooltip.popup.frame(tooltip_frame());
+    tooltip.show(|ui| {
+        ui.label(egui::RichText::new(text).size(13.0).color(primary_text()));
+    });
+    response
+}
+
 pub(crate) fn apply(ui: &mut egui::Ui) {
     ui.spacing_mut().icon_width = 18.0;
     ui.spacing_mut().icon_width_inner = 11.0;
