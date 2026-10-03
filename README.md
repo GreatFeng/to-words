@@ -29,7 +29,11 @@ OCR 需要预先安装 [Tesseract OCR](https://github.com/tesseract-ocr/tesserac
 
 识别哪种文字，就需要相应的 [Tesseract 语言包](https://github.com/tesseract-ocr/tessdata_fast)：简体中文 `chi_sim`、繁体中文 `chi_tra`、韩文 `kor`、日文 `jpn`、英文 `eng`。只有英文包时，无法可靠识别中文或韩文。
 
-安装语言包：进入上方链接，打开所需的 `*.traineddata` 文件并点击「Download raw file」，把文件原名放到 `tesseract.exe` 旁边的 `tessdata` 文件夹。例如本机安装在 `D:\Tesseract_OCR\tesseract.exe` 时，应保存为 `D:\Tesseract_OCR\tessdata\chi_sim.traineddata` 或 `D:\Tesseract_OCR\tessdata\kor.traineddata`。不要保存成 `.txt` 或 GitHub 网页。之后在 PowerShell 执行 `& 'D:\Tesseract_OCR\tesseract.exe' --list-langs`，确认输出包含 `chi_sim`、`kor` 等语言代码，再重启 `to_words`。需要发布便携版时，也可将 `tesseract.exe` 和 `tessdata` 一起放在程序目录的 `assets/ocr` 下。详细安装方法也可参考 [Tesseract 官方安装说明](https://github.com/tesseract-ocr/tessdoc/blob/main/Installation.md)。
+安装语言包：
+进入上方链接，打开所需的 `*.traineddata` 文件并点击「Download raw file」，把文件原名放到 `tesseract.exe` 旁边的 `tessdata` 文件夹。
+例如本机安装在 `D:\Tesseract_OCR\tesseract.exe` 时，应保存为 `D:\Tesseract_OCR\tessdata\chi_sim.traineddata` 或 `D:\Tesseract_OCR\tessdata\kor.traineddata`。不要保存成 `.txt` 或 GitHub 网页。
+之后在 PowerShell 执行 `& 'D:\Tesseract_OCR\tesseract.exe' --list-langs`，确认输出包含 `chi_sim`、`kor` 等语言代码，再重启 `to_words`。需要发布便携版时，也可将 `tesseract.exe` 和 `tessdata` 一起放在程序目录的 `assets/ocr` 下。
+详细安装方法也可参考 [Tesseract 官方安装说明](https://github.com/tesseract-ocr/tessdoc/blob/main/Installation.md)。
 
 ## 查询和组合词条
 
