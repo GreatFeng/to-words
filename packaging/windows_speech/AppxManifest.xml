@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         xmlns:systemai="http://schemas.microsoft.com/appx/manifest/systemai/windows10"
+         IgnorableNamespaces="uap uap10 rescap systemai">
+  <Identity Name="ToWordsSpeech" Publisher="CN=to_words" Version="0.1.0.0" ProcessorArchitecture="neutral" />
+  <Properties>
+    <DisplayName>to_words</DisplayName>
+    <PublisherDisplayName>to_words</PublisherDisplayName>
+    <Logo>assets\icons\to_words_tray_32.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+  <Resources><Resource Language="zh-CN" /></Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.26100.0" MaxVersionTested="10.0.26226.0" />
+  </Dependencies>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+    <systemai:Capability Name="systemAIModels" />
+  </Capabilities>
+  <Applications>
+    <Application Id="ToWords" Executable="to_words.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements AppListEntry="none" DisplayName="to_words" Description="to_words"
+                          BackgroundColor="transparent" Square150x150Logo="assets\icons\to_words_tray_32.png"
+                          Square44x44Logo="assets\icons\to_words_tray_32.png" />
+    </Application>
+    <Application Id="SpeechBridge" Executable="assets\voice\to_words_windows_speech.exe"
+                 uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements AppListEntry="none" DisplayName="to_words Windows speech" Description="Local speech bridge"
+                          BackgroundColor="transparent" Square150x150Logo="assets\icons\to_words_tray_32.png"
+                          Square44x44Logo="assets\icons\to_words_tray_32.png" />
+    </Application>
+  </Applications>
+</Package>

@@ -6,21 +6,26 @@
 
 use crate::platform::credentials;
 use crate::platform::ocr;
+use crate::platform::voice;
 use crate::ui_theme::{
     self, accent_fill, accent_text, border, canvas, control_surface, green_text, muted_text,
-    pale_green, pale_red, pale_yellow, primary_text, red_text, surface, yellow_text,
+    pale_yellow, primary_text, red_text, surface, yellow_text,
 };
 use crate::word_editor::WordEditor;
 use crate::word_merge_panel::WordMergePanel;
 use crate::{UiConfig, translation_language};
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
+#[cfg(feature = "windows-speech")]
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShortcutTarget {
     Popup,
     Settings,
     Ocr,
+    Voice,
     ClearComposed,
 }
 
@@ -44,7 +49,9 @@ pub(crate) struct SettingsPanel {
     remove_ai_key: bool,
     active_source_language: String,
     ocr_status: String,
-    ocr_help_hover_started: Option<f64>,
+    voice_status: String,
+    windows_prepare_receiver: Option<Receiver<Result<String, String>>>,
+    windows_prepare_confirm: bool,
 }
 
 impl SettingsPanel {
@@ -62,7 +69,9 @@ impl SettingsPanel {
             remove_ai_key: false,
             active_source_language: "cn".to_string(),
             ocr_status: String::new(),
-            ocr_help_hover_started: None,
+            voice_status: String::new(),
+            windows_prepare_receiver: None,
+            windows_prepare_confirm: false,
         }
     }
 
@@ -70,7 +79,8 @@ impl SettingsPanel {
         self.draft = config.clone();
         self.active_source_language = active_source_language.to_string();
         self.ocr_status = ocr::engine_status();
-        self.ocr_help_hover_started = None;
+        self.voice_status = voice::engine_status(&self.draft.voice_backend);
+        self.windows_prepare_confirm = false;
         self.message = None;
         self.active_shortcut = None;
         self.active_number = None;
@@ -109,20 +119,37 @@ impl SettingsPanel {
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> Option<(UiConfig, AiKeyUpdate)> {
+        if let Some(receiver) = &self.windows_prepare_receiver {
+            match receiver.try_recv() {
+                Ok(Ok(status)) => {
+                    self.voice_status = status;
+                    self.windows_prepare_receiver = None;
+                }
+                Ok(Err(error)) => {
+                    self.voice_status = error;
+                    self.windows_prepare_receiver = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.voice_status = "Windows 语音模型准备任务已中断".to_string();
+                    self.windows_prepare_receiver = None;
+                }
+                Err(TryRecvError::Empty) => ui
+                    .ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(200)),
+            }
+        }
         if ui.input(|input| input.pointer.any_pressed()) {
             self.active_shortcut = None;
             self.active_number = None;
         }
 
         if self.word_editor.is_open() {
-            self.ocr_help_hover_started = None;
             self.active_shortcut = None;
             self.active_number = None;
             self.word_editor.show(ui);
             return None;
         }
         if self.word_merge_panel.is_open() {
-            self.ocr_help_hover_started = None;
             self.active_shortcut = None;
             self.active_number = None;
             self.word_merge_panel.show(ui);
@@ -159,6 +186,33 @@ impl SettingsPanel {
                 );
                 ui.add_space(18.0);
 
+                egui::Panel::bottom("settings_actions_footer")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE)
+                            .inner_margin(egui::Margin::symmetric(0, 10)),
+                    )
+                    .show(ui, |ui| {
+                        if let Some((message, is_error)) = &self.message {
+                            status_message(ui, message, *is_error);
+                            ui.add_space(8.0);
+                        }
+                        ui.horizontal(|ui| {
+                            if primary_button(ui, "保存并应用", 124.0).clicked() {
+                                save = true;
+                            }
+                            if quiet_button(ui, "恢复默认值", 112.0).clicked() {
+                                self.draft = UiConfig::default();
+                                self.message = None;
+                                self.active_shortcut = None;
+                                self.active_number = None;
+                                self.ai_key_input.clear();
+                                self.remove_ai_key = false;
+                            }
+                        });
+                    });
+
                 egui::ScrollArea::vertical()
                     .id_salt("settings_scroll")
                     .auto_shrink([false, false])
@@ -171,7 +225,7 @@ impl SettingsPanel {
                         settings_card(
                             ui,
                             "词库",
-                            "选择原始语言与目标语言，并管理对应的用户词库。",
+                            Some("选择原始语言与目标语言，并管理对应的用户词库。"),
                             |ui| {
                                 self.draw_translation_selector(ui);
                                 ui.add_space(12.0);
@@ -179,15 +233,11 @@ impl SettingsPanel {
                                     if secondary_button(ui, "编辑词库", 104.0).clicked() {
                                         self.open_word_editor(ui.ctx());
                                     }
-                                    if ui_theme::opaque_hover_text(
-                                        secondary_button(ui, "合并本地词库", 128.0),
-                                        "选择一个或多个词库并合并到当前语言词库",
-                                    )
-                                    .clicked()
-                                    {
+                                    if secondary_button(ui, "合并本地词库", 128.0).clicked() {
                                         let file_name = self.current_word_file_name();
                                         self.word_merge_panel.open(file_name);
                                     }
+                                    help_icon(ui, "选择一个或多个词库并合并到当前语言词库");
                                 });
                             },
                         );
@@ -196,15 +246,154 @@ impl SettingsPanel {
                         settings_card(
                             ui,
                             "AI 翻译 · DeepSeek",
-                            "查询框可主动翻译，OCR 可自动翻译识别文字。",
+                            Some("查询框可主动翻译；OCR 与语音识别可按设置自动翻译。"),
                             |ui| self.draw_ai_settings(ui),
                         );
                         ui.add_space(14.0);
 
                         settings_card(
                             ui,
+                            "语音识别",
+                            Some("本地录音与识别；无词库匹配时使用已配置的 DeepSeek 翻译。"),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new("识别引擎")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(primary_text()),
+                                );
+                                #[cfg(not(feature = "windows-speech"))]
+                                ui.label("内置 whisper.cpp");
+                                #[cfg(feature = "windows-speech")]
+                                {
+                                let old_backend = self.draft.voice_backend.clone();
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("voice_backend")
+                                        .selected_text(if self.draft.voice_backend == "windows" {
+                                            "Windows 本地 AI 识别（实验版）"
+                                        } else {
+                                            "内置 whisper.cpp"
+                                        })
+                                        .width(220.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.draft.voice_backend, "whisper".to_string(), "内置 whisper.cpp");
+                                            ui.selectable_value(&mut self.draft.voice_backend, "windows".to_string(), "Windows 本地 AI 识别（实验版）");
+                                        });
+                                    if self.draft.voice_backend == "windows" {
+                                        help_icon(ui, "需安装带 MSIX 身份的版本；此 API 不等同于 Win+H。微软实验版没有公开的识别语言设置方式，部分非英语语音可能被误译成英语。");
+                                    }
+                                });
+                                if old_backend != self.draft.voice_backend {
+                                    self.voice_status = voice::engine_status(&self.draft.voice_backend);
+                                    self.windows_prepare_confirm = false;
+                                }
+                                if self.draft.voice_backend == "windows" {
+                                    if self.windows_prepare_receiver.is_none()
+                                        && ui.button("准备 Windows 语音模型").clicked()
+                                    {
+                                        self.windows_prepare_confirm = true;
+                                    }
+                                    if self.windows_prepare_confirm {
+                                        ui.label("首次准备可能通过 Windows Update 下载可选语音模型。是否继续？");
+                                        ui.horizontal(|ui| {
+                                            if ui.button("确认下载并准备").clicked() {
+                                                self.windows_prepare_confirm = false;
+                                                self.voice_status = "正在准备 Windows 语音模型…".to_string();
+                                                let (sender, receiver) = mpsc::channel();
+                                                std::thread::spawn(move || {
+                                                    let result = voice::prepare_windows_model().map_err(|error| format!("{error:#}"));
+                                                    let _ = sender.send(result);
+                                                });
+                                                self.windows_prepare_receiver = Some(receiver);
+                                            }
+                                            if ui.button("取消").clicked() {
+                                                self.windows_prepare_confirm = false;
+                                            }
+                                        });
+                                    }
+                                }
+                                }
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new("识别语言")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(primary_text()),
+                                );
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("voice_language")
+                                        .selected_text(if self.draft.voice_language == "auto" {
+                                            "自动识别"
+                                        } else {
+                                            translation_language::language_label(&self.draft.voice_language)
+                                        })
+                                        .width(220.0)
+                                        .height(320.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.draft.voice_language,
+                                                "auto".to_string(),
+                                                "自动识别",
+                                            );
+                                            ui.separator();
+                                            for language in translation_language::LANGUAGES {
+                                                ui.selectable_value(
+                                                    &mut self.draft.voice_language,
+                                                    language.code.to_string(),
+                                                    language.label,
+                                                );
+                                            }
+                                        });
+                                    help_icon(
+                                        ui,
+                                        if self.draft.voice_backend == "whisper" {
+                                            "经常说同一种语言时，手动指定可减少短句误判。"
+                                        } else {
+                                            "Windows 实验版暂不能按此选项限定识别语言；这里的设置仅用于 Whisper。"
+                                        },
+                                    );
+                                });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    contrast_checkbox(
+                                        ui,
+                                        &mut self.draft.voice_keep_input,
+                                        "是否保持语音输入",
+                                    );
+                                    help_icon(ui, "默认说完一句后自动停止；勾选后持续监听下一句，再按快捷键结束。");
+                                });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    contrast_checkbox(
+                                        ui,
+                                        &mut self.draft.voice_auto_copy_first,
+                                        "多条词库匹配时自动输入第一条",
+                                    );
+                                    help_icon(ui, "关闭后会打开查询框，供你自行选择匹配结果。");
+                                });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    contrast_checkbox(
+                                        ui,
+                                        &mut self.draft.voice_aion2_manual_paste,
+                                        "Aion2 兼容模式：复制语音结果，手动粘贴",
+                                    );
+                                    help_icon(ui, "默认关闭；仅在 Aion2 位于前台时生效，其他程序仍自动输入。");
+                                });
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(&self.voice_status)
+                                        .size(12.0)
+                                        .color(muted_text()),
+                                );
+                            },
+                        );
+                        ui.add_space(14.0);
+
+                        settings_card(
+                            ui,
                             "快捷键",
-                            "点击按键框后，直接按下新的组合键。",
+                            None,
                             |ui| {
                                 self.draw_shortcuts(ui);
                                 ui.add_space(10.0);
@@ -222,7 +411,7 @@ impl SettingsPanel {
                                 settings_card(
                                     &mut columns[0],
                                     "输入框",
-                                    "调整查询输入区域的尺寸与外观。",
+                                    None,
                                     |ui| {
                                         ui.set_min_height(390.0);
                                         self.draw_input_settings(ui);
@@ -231,7 +420,7 @@ impl SettingsPanel {
                                 settings_card(
                                     &mut columns[1],
                                     "查询结果",
-                                    "设置结果列表的范围、密度和分页。",
+                                    None,
                                     |ui| {
                                         ui.set_min_height(390.0);
                                         self.draw_result_settings(ui);
@@ -242,14 +431,14 @@ impl SettingsPanel {
                             settings_card(
                                 ui,
                                 "输入框",
-                                "调整查询输入区域的尺寸与外观。",
+                                None,
                                 |ui| self.draw_input_settings(ui),
                             );
                             ui.add_space(14.0);
                             settings_card(
                                 ui,
                                 "查询结果",
-                                "设置结果列表的范围、密度和分页。",
+                                None,
                                 |ui| self.draw_result_settings(ui),
                             );
                         }
@@ -257,30 +446,10 @@ impl SettingsPanel {
                         settings_card(
                             ui,
                             "通用",
-                            "统一控制文字、选中状态和连续输入行为。",
+                            None,
                             |ui| self.draw_general_settings(ui),
                         );
                         ui.add_space(18.0);
-
-                        if let Some((message, is_error)) = &self.message {
-                            status_message(ui, message, *is_error);
-                            ui.add_space(12.0);
-                        }
-
-                        ui.horizontal(|ui| {
-                            if primary_button(ui, "保存并应用", 124.0).clicked() {
-                                save = true;
-                            }
-                            if quiet_button(ui, "恢复默认值", 112.0).clicked() {
-                                self.draft = UiConfig::default();
-                                self.message = None;
-                                self.active_shortcut = None;
-                                self.active_number = None;
-                                self.ai_key_input.clear();
-                                self.remove_ai_key = false;
-                            }
-                        });
-                        ui.add_space(8.0);
                     });
             });
 
@@ -346,6 +515,7 @@ impl SettingsPanel {
                 self.ai_key_input.clear();
                 self.remove_ai_key = true;
             }
+            help_icon(ui, "密钥保存在 Windows 凭据管理器，不写入 ui_config.json。未选择目标语言时无法请求翻译。");
         });
         if self.remove_ai_key {
             ui.label(
@@ -353,40 +523,18 @@ impl SettingsPanel {
                     .size(12.0)
                     .color(red_text()),
             );
-        } else {
-            ui.label(egui::RichText::new("密钥保存在 Windows 凭据管理器，不写入 ui_config.json。未选择目标语言时无法请求翻译。")
-                .size(12.0).color(muted_text()));
         }
     }
 
     fn draw_ocr_auto_translation(&mut self, ui: &mut egui::Ui) {
-        let response = contrast_checkbox(
-            ui,
-            &mut self.draft.ocr_auto_translate,
-            "OCR 识别后自动翻译成原始语言",
-        );
-        if response.hovered() {
-            let now = ui.input(|input| input.time);
-            let started = self.ocr_help_hover_started.get_or_insert(now);
-            if now - *started >= 2.0 {
-                let mut tooltip = egui::Tooltip::for_widget(&response).width(390.0);
-                tooltip.popup = tooltip.popup.frame(ui_theme::tooltip_frame());
-                tooltip.show(|ui| {
-                    ui.label(
-                        egui::RichText::new("松开截图选区后自动显示纯文字译文；点击 √ 才复制 OCR 原文并关闭。开启后仅向 DeepSeek 发送识别文字，不发送截图。原始语言为“自动检测”时译成简体中文。需要 API Key，可能产生费用。")
-                            .size(13.0)
-                            .color(primary_text()),
-                    );
-                });
-            } else {
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_secs_f64(
-                        (2.0 - (now - *started)).max(0.0),
-                    ));
-            }
-        } else {
-            self.ocr_help_hover_started = None;
-        }
+        ui.horizontal(|ui| {
+            contrast_checkbox(
+                ui,
+                &mut self.draft.ocr_auto_translate,
+                "OCR 识别后自动翻译成原始语言",
+            );
+            help_icon(ui, "松开截图选区后自动显示纯文字译文；点击 √ 才复制 OCR 原文并关闭。开启后仅向 DeepSeek 发送识别文字，不发送截图。原始语言为“自动检测”时译成简体中文。需要 API Key，可能产生费用。");
+        });
     }
 
     fn draw_translation_selector(&mut self, ui: &mut egui::Ui) {
@@ -455,28 +603,23 @@ impl SettingsPanel {
         });
 
         let file_name = self.current_word_file_name();
-        ui.label(
-            egui::RichText::new(format!("词库文件：{file_name}"))
-                .monospace()
-                .size(12.0)
-                .color(muted_text()),
-        );
-        if self.draft.source_language == "auto" {
+        ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(format!(
-                    "自动检测当前使用：{}；语言难以判断时沿用该词库。缺少的词库会自动创建。",
-                    translation_language::language_label(&self.active_source_language)
-                ))
-                .size(12.0)
-                .color(muted_text()),
-            );
-        } else {
-            ui.label(
-                egui::RichText::new("缺少的词库会自动创建，不会覆盖已有词条。")
+                egui::RichText::new(format!("词库文件：{file_name}"))
+                    .monospace()
                     .size(12.0)
                     .color(muted_text()),
             );
-        }
+            if self.draft.source_language == "auto" {
+                let explanation = format!(
+                    "自动检测当前使用：{}；语言难以判断时沿用该词库。缺少的词库会自动创建。",
+                    translation_language::language_label(&self.active_source_language)
+                );
+                help_icon(ui, &explanation);
+            } else {
+                help_icon(ui, "缺少的词库会自动创建，不会覆盖已有词条。");
+            }
+        });
     }
 
     fn current_word_file_name(&self) -> String {
@@ -528,6 +671,13 @@ impl SettingsPanel {
                     &mut self.draft.hotkeys.ocr,
                     &mut self.active_shortcut,
                     ShortcutTarget::Ocr,
+                );
+                shortcut_row(
+                    ui,
+                    "开关语音录音",
+                    &mut self.draft.hotkeys.voice,
+                    &mut self.active_shortcut,
+                    ShortcutTarget::Voice,
                 );
                 shortcut_row(
                     ui,
@@ -715,13 +865,6 @@ impl SettingsPanel {
                     &mut self.last_wheel_change,
                 );
                 ui.label(
-                    egui::RichText::new("背景模糊")
-                        .size(13.0)
-                        .color(muted_text()),
-                );
-                contrast_checkbox(ui, &mut self.draft.background_blur, "启用");
-                ui.end_row();
-                ui.label(
                     egui::RichText::new("保持打开")
                         .size(13.0)
                         .color(muted_text()),
@@ -774,6 +917,7 @@ impl SettingsPanel {
                     ShortcutTarget::Popup => self.draft.hotkeys.popup = shortcut,
                     ShortcutTarget::Settings => self.draft.hotkeys.settings = shortcut,
                     ShortcutTarget::Ocr => self.draft.hotkeys.ocr = shortcut,
+                    ShortcutTarget::Voice => self.draft.hotkeys.voice = shortcut,
                     ShortcutTarget::ClearComposed => self.draft.hotkeys.clear_composed = shortcut,
                 }
                 self.active_shortcut = None;
@@ -801,10 +945,48 @@ fn contrast_checkbox(ui: &mut egui::Ui, value: &mut bool, text: &str) -> egui::R
     .inner
 }
 
+fn help_icon(ui: &mut egui::Ui, explanation: &str) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+    let color = if response.hovered() {
+        accent_text()
+    } else {
+        muted_text()
+    };
+    let center = rect.center();
+    let painter = ui.painter();
+    painter.circle_filled(
+        center,
+        7.0,
+        if response.hovered() {
+            accent_fill()
+        } else {
+            control_surface()
+        },
+    );
+    painter.circle_stroke(center, 7.0, egui::Stroke::new(1.3, color));
+    painter.circle_filled(egui::pos2(center.x, center.y - 2.5), 1.0, color);
+    painter.rect_filled(
+        egui::Rect::from_center_size(egui::pos2(center.x, center.y + 1.5), egui::vec2(1.6, 4.2)),
+        0.8,
+        color,
+    );
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    egui::Popup::from_toggle_button_response(&response)
+        .width(360.0)
+        .frame(ui_theme::tooltip_frame())
+        .show(|ui| {
+            ui.label(
+                egui::RichText::new(explanation)
+                    .size(13.0)
+                    .color(primary_text()),
+            );
+        });
+}
+
 fn settings_card<R>(
     ui: &mut egui::Ui,
     title: &str,
-    description: &str,
+    description: Option<&str>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     egui::Frame::new()
@@ -814,18 +996,18 @@ fn settings_card<R>(
         .inner_margin(egui::Margin::same(18))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(
-                egui::RichText::new(title)
-                    .size(17.0)
-                    .strong()
-                    .color(primary_text()),
-            );
-            ui.label(
-                egui::RichText::new(description)
-                    .size(12.5)
-                    .color(muted_text()),
-            );
-            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(17.0)
+                        .strong()
+                        .color(primary_text()),
+                );
+                if let Some(description) = description {
+                    help_icon(ui, description);
+                }
+            });
+            ui.add_space(10.0);
             add_contents(ui)
         })
         .inner
@@ -867,20 +1049,8 @@ fn quiet_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
 }
 
 fn status_message(ui: &mut egui::Ui, message: &str, is_error: bool) {
-    let (fill, color) = if is_error {
-        (pale_red(), red_text())
-    } else {
-        (pale_green(), green_text())
-    };
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.16)))
-        .corner_radius(6)
-        .inner_margin(egui::Margin::symmetric(12, 9))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(egui::RichText::new(message).size(13.0).color(color));
-        });
+    let color = if is_error { red_text() } else { green_text() };
+    ui.label(egui::RichText::new(message).size(13.0).color(color));
 }
 
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
@@ -929,8 +1099,7 @@ fn shortcut_row(
             .stroke(egui::Stroke::new(1.0, border()))
             .corner_radius(4),
         );
-    if ui_theme::opaque_hover_text(response, "点击后，通过键盘按下新的组合键").clicked()
-    {
+    if response.clicked() {
         value.clear();
         *active = Some(target);
     }
@@ -975,7 +1144,6 @@ fn number_row(
             .stroke(egui::Stroke::new(1.0, border()))
             .corner_radius(4),
         );
-    let response = ui_theme::opaque_hover_text(response, "点击选中，然后滚动鼠标滚轮调整");
     if response.clicked() {
         *active = Some(id);
         response.request_focus();
@@ -1028,7 +1196,6 @@ fn usize_number_row(
         .stroke(egui::Stroke::new(1.0, border()))
         .corner_radius(4),
     );
-    let response = ui_theme::opaque_hover_text(response, "点击选中，然后滚动鼠标滚轮调整");
     if response.clicked() {
         *active = Some(id);
         response.request_focus();

@@ -7,4 +7,5 @@
 pub(crate) mod ocr_selection;
 pub(crate) mod ocr_translation;
 pub(crate) mod settings;
+pub(crate) mod voice_overlay;
 pub(crate) mod word_library;

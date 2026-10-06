@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use eframe::egui;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,17 +17,22 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 const INPUT_ID: &str = "word_match_input";
+const VOICE_OVERLAY_HOLD: Duration = Duration::from_secs(1);
 pub(crate) const WORD_EDITOR_FONT_FAMILY: &str = "word_editor_chinese";
 
 use crate::ai::{self, AiCandidate, TranslationDirection};
 use crate::components::ocr_selection::{OcrSelection, SelectionAction};
 use crate::components::settings::{AiKeyUpdate, SettingsPanel, shortcut_pressed};
+use crate::components::voice_overlay::VoiceOverlay;
 use crate::domain::ai_word_save;
 use crate::domain::continuous_input::ContinuousInput;
 use crate::domain::word_index::{SearchHit, WordEntry, WordIndex};
 use crate::platform::credentials;
 use crate::platform::ocr::{self, CaptureRegion, CapturedScreen, MonitorBounds};
 use crate::platform::system_tray::{SystemTray, TrayAction};
+use crate::platform::voice::{self, VoiceEvent, VoiceSession};
+use crate::platform::voice_metrics::VoiceTrace;
+use crate::platform::voice_output::{VoiceInputMethod, VoiceInputTarget, input_error_trace_code};
 use crate::{translation_language, ui_theme};
 
 #[derive(Debug, Deserialize)]
@@ -40,11 +45,15 @@ pub(crate) struct UiConfig {
     pub(crate) results: ResultsConfig,
     pub(crate) hotkeys: HotkeyConfig,
     pub(crate) gap: f32,
-    pub(crate) background_blur: bool,
     pub(crate) continuous_input: bool,
     pub(crate) ai_translation: bool,
     pub(crate) ai_auto_save: bool,
     pub(crate) ocr_auto_translate: bool,
+    pub(crate) voice_auto_copy_first: bool,
+    pub(crate) voice_aion2_manual_paste: bool,
+    pub(crate) voice_keep_input: bool,
+    pub(crate) voice_backend: String,
+    pub(crate) voice_language: String,
     pub(crate) clear_on_focus_return: bool,
     pub(crate) translation_language: String,
     pub(crate) source_language: String,
@@ -61,11 +70,15 @@ impl Default for UiConfig {
             results: ResultsConfig::default(),
             hotkeys: HotkeyConfig::default(),
             gap: 4.0,
-            background_blur: false,
             continuous_input: false,
             ai_translation: false,
             ai_auto_save: true,
             ocr_auto_translate: true,
+            voice_auto_copy_first: true,
+            voice_aion2_manual_paste: false,
+            voice_keep_input: false,
+            voice_backend: "whisper".to_string(),
+            voice_language: "auto".to_string(),
             clear_on_focus_return: false,
             translation_language: String::new(),
             source_language: "auto".to_string(),
@@ -138,6 +151,7 @@ pub(crate) struct HotkeyConfig {
     pub(crate) settings: String,
     pub(crate) clear_composed: String,
     pub(crate) ocr: String,
+    pub(crate) voice: String,
 }
 
 impl Default for HotkeyConfig {
@@ -147,6 +161,7 @@ impl Default for HotkeyConfig {
             settings: "ctrl+alt+s".to_string(),
             clear_composed: "ctrl+backspace".to_string(),
             ocr: "ctrl+alt+o".to_string(),
+            voice: "ctrl+alt+v".to_string(),
         }
     }
 }
@@ -172,6 +187,10 @@ impl UiConfig {
         self.translation_language =
             translation_language::normalize_language_code(&self.translation_language);
         self.source_language = translation_language::normalize_source_code(&self.source_language);
+        self.voice_language = translation_language::normalize_source_code(&self.voice_language);
+        if !cfg!(feature = "windows-speech") || self.voice_backend != "windows" {
+            self.voice_backend = "whisper".to_string();
+        }
         self
     }
 
@@ -295,7 +314,7 @@ fn save_ui_config(config: &UiConfig) -> Result<()> {
         .with_context(|| format!("无法写入文件：{}", display_path(&path)))
 }
 
-fn parse_hotkeys(config: &UiConfig) -> Result<(HotKey, HotKey, HotKey)> {
+fn parse_hotkeys(config: &UiConfig) -> Result<(HotKey, HotKey, HotKey, HotKey)> {
     let popup = config
         .hotkeys
         .popup
@@ -321,16 +340,22 @@ fn parse_hotkeys(config: &UiConfig) -> Result<(HotKey, HotKey, HotKey)> {
         .ocr
         .parse::<HotKey>()
         .with_context(|| format!("OCR 快捷键格式无效：{}", config.hotkeys.ocr))?;
+    let voice = config
+        .hotkeys
+        .voice
+        .parse::<HotKey>()
+        .with_context(|| format!("语音识别快捷键格式无效：{}", config.hotkeys.voice))?;
     if popup.id() == settings.id()
         || popup.id() == clear_composed.id()
         || settings.id() == clear_composed.id()
         || ocr.id() == popup.id()
         || ocr.id() == settings.id()
         || ocr.id() == clear_composed.id()
+        || [popup.id(), settings.id(), clear_composed.id(), ocr.id()].contains(&voice.id())
     {
         bail!("快捷键不能使用相同的组合");
     }
-    Ok((popup, settings, ocr))
+    Ok((popup, settings, ocr, voice))
 }
 
 fn display_path(path: &Path) -> String {
@@ -766,6 +791,55 @@ struct OcrPreview {
     display: Option<(String, bool)>,
 }
 
+struct VoiceSaveRequest {
+    candidate: AiCandidate,
+    config: UiConfig,
+    active_source_language: String,
+}
+
+struct VoiceSaveEvent {
+    library_name: String,
+    saved: Result<()>,
+    refreshed_words: Option<Result<WordIndex>>,
+}
+
+fn start_voice_save_worker() -> (mpsc::Sender<VoiceSaveRequest>, Receiver<VoiceSaveEvent>) {
+    let (request_sender, request_receiver) = mpsc::channel::<VoiceSaveRequest>();
+    let (event_sender, event_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for request in request_receiver {
+            let library_name = translation_language::word_file_name(
+                &request.candidate.source_language_code,
+                &request.candidate.language_code,
+            );
+            let active_library_name = translation_language::word_file_name(
+                &request.active_source_language,
+                &request.config.translation_language,
+            );
+            let saved = ai_word_save::save_candidate(&request.candidate);
+            let refreshed_words = if saved.is_ok() && library_name == active_library_name {
+                Some(load_user_words(
+                    &request.config,
+                    &request.active_source_language,
+                ))
+            } else {
+                None
+            };
+            if event_sender
+                .send(VoiceSaveEvent {
+                    library_name,
+                    saved,
+                    refreshed_words,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (request_sender, event_receiver)
+}
+
 impl OcrPreview {
     fn schedule(&mut self, region: CaptureRegion) {
         if self.region == Some(region) {
@@ -803,6 +877,7 @@ struct MatchApp {
     popup_hotkey: HotKey,
     settings_hotkey: HotKey,
     ocr_hotkey: HotKey,
+    voice_hotkey: HotKey,
     hotkeys_suspended: bool,
     system_tray: SystemTray,
     config: UiConfig,
@@ -815,13 +890,21 @@ struct MatchApp {
     matches: Vec<SearchHit>,
     ai_state: AiState,
     ocr_state: OcrState,
+    voice_session: Option<VoiceSession>,
+    voice_overlay: Option<VoiceOverlay>,
+    voice_translation: Option<(u64, Receiver<Result<AiCandidate>>)>,
+    voice_pending: VecDeque<(u64, String)>,
+    voice_trace: Option<VoiceTrace>,
+    voice_save_requests: mpsc::Sender<VoiceSaveRequest>,
+    voice_save_results: Receiver<VoiceSaveEvent>,
+    voice_last_logged_drawn_original_id: u64,
+    voice_active_utterance_id: u64,
     last_ai_candidate: Option<AiCandidate>,
     last_query: String,
     selected: usize,
     result_page: usize,
     no_match_delete_armed: bool,
     request_input_focus: bool,
-    blur_initialized: bool,
     message: Option<String>,
     viewport_size: egui::Vec2,
     popup_anchor: Option<PopupAnchor>,
@@ -839,7 +922,7 @@ impl MatchApp {
         configure_style(context);
 
         let config = load_ui_config().unwrap_or_default();
-        let (popup_hotkey, settings_hotkey, ocr_hotkey) = parse_hotkeys(&config)?;
+        let (popup_hotkey, settings_hotkey, ocr_hotkey, voice_hotkey) = parse_hotkeys(&config)?;
         let manager = GlobalHotKeyManager::new().context("无法初始化全局快捷键")?;
         manager
             .register(popup_hotkey)
@@ -855,7 +938,14 @@ impl MatchApp {
             return Err(error)
                 .with_context(|| format!("无法注册 {}，可能已被其他程序占用", config.hotkeys.ocr));
         }
+        if let Err(error) = manager.register(voice_hotkey) {
+            let _ = manager.unregister_all(&[popup_hotkey, settings_hotkey, ocr_hotkey]);
+            return Err(error).with_context(|| {
+                format!("无法注册 {}，可能已被其他程序占用", config.hotkeys.voice)
+            });
+        }
         let system_tray = SystemTray::new()?;
+        let (voice_save_requests, voice_save_results) = start_voice_save_worker();
         let active_source_language = if config.source_language == "auto" {
             "cn".to_string()
         } else {
@@ -878,6 +968,7 @@ impl MatchApp {
             popup_hotkey,
             settings_hotkey,
             ocr_hotkey,
+            voice_hotkey,
             hotkeys_suspended: false,
             system_tray,
             config,
@@ -890,13 +981,21 @@ impl MatchApp {
             matches: Vec::new(),
             ai_state: AiState::Idle,
             ocr_state: OcrState::Idle,
+            voice_session: None,
+            voice_overlay: None,
+            voice_translation: None,
+            voice_pending: VecDeque::new(),
+            voice_trace: None,
+            voice_save_requests,
+            voice_save_results,
+            voice_last_logged_drawn_original_id: 0,
+            voice_active_utterance_id: 0,
             last_ai_candidate: None,
             last_query: String::new(),
             selected: 0,
             result_page: 0,
             no_match_delete_armed: false,
             request_input_focus: false,
-            blur_initialized: false,
             message: None,
             viewport_size,
             popup_anchor: None,
@@ -956,7 +1055,6 @@ impl MatchApp {
         self.settings_open = false;
         self.popup_anchor = capture_popup_anchor(context.pixels_per_point());
         self.manually_moved = false;
-        self.blur_initialized = false;
         self.resize_window(context);
         context.send_viewport_cmd(egui::ViewportCommand::Title(
             "hotkey_word_match".to_string(),
@@ -989,7 +1087,6 @@ impl MatchApp {
             .open(&self.config, &self.active_source_language);
         self.is_open = true;
         self.settings_open = true;
-        self.blur_initialized = false;
 
         let size = egui::vec2(800.0, 600.0);
         context.send_viewport_cmd(egui::ViewportCommand::Title("to_words 设置".to_string()));
@@ -1032,7 +1129,6 @@ impl MatchApp {
         };
         self.is_open = false;
         self.settings_open = false;
-        self.blur_initialized = false;
         context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         context.request_repaint_after(Duration::from_millis(230));
     }
@@ -1219,9 +1315,626 @@ impl MatchApp {
         self.resize_window(context);
     }
 
+    fn voice_work_area(&self, context: &egui::Context) -> egui::Rect {
+        if let Some(anchor) = capture_popup_anchor(context.pixels_per_point()) {
+            return anchor.work_rect;
+        }
+        if let Ok(monitor) = ocr::monitor_under_cursor() {
+            let scale = context.pixels_per_point().max(1.0);
+            return egui::Rect::from_min_size(
+                egui::pos2(monitor.x as f32 / scale, monitor.y as f32 / scale),
+                egui::vec2(monitor.width as f32 / scale, monitor.height as f32 / scale),
+            );
+        }
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))
+    }
+
+    fn ensure_voice_overlay(&mut self, context: &egui::Context) -> &mut VoiceOverlay {
+        if self.voice_overlay.is_none() {
+            self.voice_overlay = Some(VoiceOverlay::new(self.voice_work_area(context)));
+        }
+        self.voice_overlay.as_mut().expect("voice overlay exists")
+    }
+
+    fn toggle_voice(&mut self, context: &egui::Context) {
+        if let Some(session) = &mut self.voice_session {
+            session.stop();
+            session.trace.record(0, "manual_stop_requested", None, "ok");
+            if let Some(overlay) = &mut self.voice_overlay {
+                overlay.status = "已手动停止，正在处理最后一句…".to_string();
+            }
+            return;
+        }
+        if let Some((utterance_id, _)) = self.voice_translation.take()
+            && let Some(trace) = &self.voice_trace
+        {
+            trace.finish(utterance_id, "cancelled_by_new_session");
+        }
+        if let Some(trace) = &self.voice_trace {
+            for (utterance_id, _) in &self.voice_pending {
+                trace.finish(*utterance_id, "cancelled_by_new_session");
+            }
+        }
+        self.voice_pending.clear();
+        self.voice_trace = None;
+        self.voice_last_logged_drawn_original_id = 0;
+        self.voice_active_utterance_id = 0;
+        let mut overlay = VoiceOverlay::new(self.voice_work_area(context));
+        match voice::start(
+            self.config.voice_keep_input,
+            &self.config.voice_language,
+            &self.config.voice_backend,
+        ) {
+            Ok(session) => {
+                self.voice_trace = Some(session.trace.clone());
+                self.voice_session = Some(session);
+                self.system_tray.set_status("语音识别正在录音");
+            }
+            Err(error) => {
+                overlay.status = format!("无法开始语音识别：{error:#}");
+                overlay.finish_after(VOICE_OVERLAY_HOLD);
+                self.system_tray.set_status(&overlay.status);
+            }
+        }
+        self.voice_overlay = Some(overlay);
+        context.request_repaint();
+    }
+
+    fn poll_voice(&mut self, context: &egui::Context) {
+        let saved_events: Vec<_> = self.voice_save_results.try_iter().collect();
+        for event in saved_events {
+            match event.saved {
+                Ok(()) => {
+                    let active_library_name = translation_language::word_file_name(
+                        &self.active_source_language,
+                        &self.config.translation_language,
+                    );
+                    if event.library_name == active_library_name
+                        && let Some(refreshed) = event.refreshed_words
+                    {
+                        match refreshed {
+                            Ok(words) => {
+                                self.words = words;
+                                self.word_load_error = None;
+                                self.last_query.clear();
+                                self.matches.clear();
+                            }
+                            Err(error) => self.system_tray.set_status(&format!(
+                                "AI 译文已保存，但重新加载词库失败：{error:#}"
+                            )),
+                        }
+                    }
+                }
+                Err(error) => self
+                    .system_tray
+                    .set_status(&format!("保存语音 AI 译文到词库失败：{error:#}")),
+            }
+        }
+        let mut events = Vec::new();
+        let mut recognized_this_frame = false;
+        if let Some(session) = &self.voice_session {
+            events.extend(session.receiver.try_iter());
+        }
+        for event in events {
+            match event {
+                VoiceEvent::SpeechStarted(utterance_id) => {
+                    if let Some(trace) = &self.voice_trace {
+                        trace.record(utterance_id, "ui_speech_started", None, "ok");
+                    }
+                    self.voice_active_utterance_id = utterance_id;
+                    self.ensure_voice_overlay(context).begin_utterance();
+                }
+                VoiceEvent::Recognizing(utterance_id) => {
+                    if let Some(trace) = &self.voice_trace {
+                        trace.record(utterance_id, "ui_vad_received", None, "ok");
+                    }
+                    if utterance_id == self.voice_active_utterance_id
+                        && let Some(overlay) = &mut self.voice_overlay
+                    {
+                        overlay.status = "说话结束，正在识别…".to_string();
+                    }
+                }
+                VoiceEvent::Utterance(utterance_id, result) => match result {
+                    Ok(text) => {
+                        if let Some(trace) = &self.voice_trace {
+                            trace.record(utterance_id, "asr_ui_received", None, "ok");
+                        }
+                        if utterance_id == self.voice_active_utterance_id {
+                            let overlay = self.ensure_voice_overlay(context);
+                            overlay.original = text.trim().to_string();
+                            overlay.original_utterance_id = utterance_id;
+                            overlay.result.clear();
+                            overlay.status = "识别完成，正在查询词库…".to_string();
+                            overlay.keep_visible();
+                        }
+                        self.voice_pending.push_back((utterance_id, text));
+                        recognized_this_frame = true;
+                        context.request_repaint();
+                    }
+                    Err(error) => {
+                        if let Some(trace) = &self.voice_trace {
+                            trace.finish(utterance_id, "asr_error");
+                        }
+                        self.finish_voice_error_for(utterance_id, format!("语音识别失败：{error}"));
+                    }
+                },
+                VoiceEvent::Stopped(error) => {
+                    self.voice_session = None;
+                    if let Some(trace) = &self.voice_trace {
+                        trace.record(
+                            0,
+                            "ui_session_stopped",
+                            None,
+                            if error.is_some() { "error" } else { "ok" },
+                        );
+                    }
+                    if let Some(error) = error {
+                        self.finish_voice_error(format!("语音录音失败：{error}"));
+                    } else if self.voice_pending.is_empty() && self.voice_translation.is_none() {
+                        let recognition_failed = self
+                            .voice_overlay
+                            .as_ref()
+                            .is_some_and(|overlay| overlay.status.starts_with("语音识别失败："));
+                        if recognition_failed {
+                            continue;
+                        }
+                        if self
+                            .voice_overlay
+                            .as_ref()
+                            .is_some_and(|overlay| overlay.original.is_empty())
+                        {
+                            self.finish_voice_error(
+                                "没有检测到语音，请检查麦克风或重试".to_string(),
+                            );
+                        } else {
+                            self.finish_voice_status("语音输入已结束");
+                        }
+                    }
+                }
+            }
+        }
+        let translation = self
+            .voice_translation
+            .as_ref()
+            .and_then(|(utterance_id, receiver)| match receiver.try_recv() {
+                Ok(result) => Some((*utterance_id, result)),
+                Err(TryRecvError::Disconnected) => {
+                    Some((*utterance_id, Err(anyhow::anyhow!("AI 翻译任务中断"))))
+                }
+                Err(TryRecvError::Empty) => None,
+            });
+        if let Some((utterance_id, result)) = translation {
+            self.voice_translation = None;
+            if let Some(trace) = &self.voice_trace {
+                trace.record(
+                    utterance_id,
+                    "ai_ui_received",
+                    None,
+                    if result.is_ok() { "ok" } else { "error" },
+                );
+            }
+            match result {
+                Ok(candidate) => {
+                    let translated = candidate.translated.clone();
+                    let newer_utterance_pending = !self.voice_pending.is_empty()
+                        || self.voice_active_utterance_id > utterance_id;
+                    if !newer_utterance_pending && let Some(overlay) = &mut self.voice_overlay {
+                        overlay.original = candidate.source.clone();
+                        overlay.result = translated.clone();
+                    }
+                    if self
+                        .voice_save_requests
+                        .send(VoiceSaveRequest {
+                            candidate,
+                            config: self.config.clone(),
+                            active_source_language: self.active_source_language.clone(),
+                        })
+                        .is_err()
+                    {
+                        self.system_tray
+                            .set_status("词库保存线程已停止，AI 译文未保存");
+                    }
+                    let input_started = Instant::now();
+                    // 翻译完成时再选目标，允许持续录音期间切换到另一个输入窗口。
+                    let typed = VoiceInputTarget::capture().map_or(Ok(None), |target| {
+                        target.type_if_active(&translated, self.config.voice_aion2_manual_paste)
+                    });
+                    if let Some(trace) = &self.voice_trace {
+                        trace.record(
+                            utterance_id,
+                            "text_input",
+                            Some(input_started.elapsed()),
+                            match &typed {
+                                Ok(Some(VoiceInputMethod::Paste)) => "paste_sent",
+                                Ok(Some(VoiceInputMethod::Unicode)) => "unicode_sent",
+                                Ok(Some(VoiceInputMethod::ManualPaste)) => "manual_paste_ready",
+                                #[cfg(feature = "tsf-notepad-prototype")]
+                                Ok(Some(VoiceInputMethod::TextService)) => "text_service_queued",
+                                Ok(None) => "skipped",
+                                Err(error) => input_error_trace_code(error),
+                            },
+                        );
+                        trace.finish(
+                            utterance_id,
+                            match &typed {
+                                Ok(Some(_)) => "ai_input_sent",
+                                Ok(None) => "input_skipped",
+                                Err(_) => "input_error",
+                            },
+                        );
+                    }
+                    match typed {
+                        Ok(Some(method)) if newer_utterance_pending => {
+                            self.system_tray
+                                .set_status(voice_input_status(true, method));
+                        }
+                        Ok(Some(method)) => {
+                            self.finish_voice_status_for(
+                                utterance_id,
+                                voice_input_status(true, method),
+                            );
+                        }
+                        Ok(None) if newer_utterance_pending => {
+                            self.system_tray
+                                .set_status("当前窗口不可用或焦点已变化，未输入 AI 译文");
+                        }
+                        Ok(None) => {
+                            self.finish_voice_status_for(
+                                utterance_id,
+                                "当前窗口不可用或焦点已变化，未输入 AI 译文",
+                            );
+                        }
+                        Err(reason) if newer_utterance_pending => {
+                            self.system_tray
+                                .set_status(&format!("AI 译文输入失败：{reason:#}"));
+                        }
+                        Err(reason) => {
+                            self.finish_voice_status_for(
+                                utterance_id,
+                                &format!("AI 译文输入失败：{reason:#}"),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Some(trace) = &self.voice_trace {
+                        trace.finish(utterance_id, "ai_error");
+                    }
+                    let message = format!("AI 翻译失败：{error:#}");
+                    if self.voice_pending.is_empty()
+                        && self.voice_active_utterance_id == utterance_id
+                    {
+                        self.finish_voice_error_for(utterance_id, message);
+                    } else {
+                        self.system_tray.set_status(&message);
+                    }
+                }
+            }
+        }
+        if !recognized_this_frame
+            && self.voice_translation.is_none()
+            && let Some((utterance_id, text)) = self.voice_pending.pop_front()
+        {
+            self.finish_voice_recognition(utterance_id, text, context);
+        }
+        if let Some(overlay) = &self.voice_overlay {
+            let drawn_id = overlay.drawn_original_id();
+            if drawn_id > self.voice_last_logged_drawn_original_id {
+                self.voice_last_logged_drawn_original_id = drawn_id;
+                if let Some(trace) = &self.voice_trace {
+                    trace.record(drawn_id, "overlay_original_drawn", None, "ok");
+                }
+            }
+        }
+        if self
+            .voice_overlay
+            .as_ref()
+            .is_some_and(VoiceOverlay::expired)
+        {
+            if let Some(trace) = &self.voice_trace {
+                trace.record(0, "overlay_hidden", None, "ok");
+            }
+            self.voice_overlay = None;
+        }
+    }
+
+    fn finish_voice_recognition(
+        &mut self,
+        utterance_id: u64,
+        text: String,
+        context: &egui::Context,
+    ) {
+        let lookup_started = Instant::now();
+        if let Some(trace) = &self.voice_trace {
+            trace.record(utterance_id, "lookup_started", None, "ok");
+        }
+        let query = text.trim();
+        if query.is_empty() || query == "[BLANK_AUDIO]" {
+            if let Some(trace) = &self.voice_trace {
+                trace.finish(utterance_id, "empty_transcript");
+            }
+            self.finish_voice_error_for(utterance_id, "没有识别到清晰的语音，请重试".to_string());
+            return;
+        }
+        if utterance_id == self.voice_active_utterance_id
+            && let Some(overlay) = &mut self.voice_overlay
+        {
+            overlay.original = query.to_string();
+            overlay.result.clear();
+            overlay.status = "正在查询本地词库…".to_string();
+        }
+        if self.config.source_language == "auto"
+            && let Some(detected) = translation_language::detect_source_language(query)
+            && detected != self.config.translation_language
+            && detected != self.active_source_language
+        {
+            match load_user_words(&self.config, detected) {
+                Ok(words) => {
+                    self.words = words;
+                    self.active_source_language = detected.to_string();
+                    self.word_load_error = None;
+                    self.last_query.clear();
+                    self.matches.clear();
+                }
+                Err(error) => {
+                    if let Some(trace) = &self.voice_trace {
+                        trace.record(
+                            utterance_id,
+                            "lookup_completed",
+                            Some(lookup_started.elapsed()),
+                            "error",
+                        );
+                        trace.finish(utterance_id, "dictionary_load_error");
+                    }
+                    self.finish_voice_error_for(
+                        utterance_id,
+                        format!("读取语音对应词库失败：{error:#}"),
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(error) = &self.word_load_error {
+            if let Some(trace) = &self.voice_trace {
+                trace.record(
+                    utterance_id,
+                    "lookup_completed",
+                    Some(lookup_started.elapsed()),
+                    "error",
+                );
+                trace.finish(utterance_id, "dictionary_load_error");
+            }
+            self.finish_voice_error_for(utterance_id, error.clone());
+            return;
+        }
+        let (hits, search_query) = search_voice_words(&self.words, query);
+        if let Some(trace) = &self.voice_trace {
+            trace.record(
+                utterance_id,
+                "lookup_completed",
+                Some(lookup_started.elapsed()),
+                if hits.is_empty() { "miss" } else { "hit" },
+            );
+        }
+        if let Some(first) = hits.first() {
+            if hits.len() > 1 && !self.config.voice_auto_copy_first {
+                if let Some(trace) = &self.voice_trace {
+                    trace.finish(utterance_id, "manual_selection_required");
+                }
+                if let Some(mut session) = self.voice_session.take() {
+                    session.stop();
+                }
+                self.voice_pending.clear();
+                self.voice_overlay = None;
+                self.open_popup(context);
+                self.input = search_query.to_string();
+                self.refresh_matches(context);
+                self.system_tray
+                    .set_status("语音找到多条词库结果，请在查询框选择");
+                return;
+            }
+            let Some(entry) = self.words.get(first.entry_id) else {
+                if let Some(trace) = &self.voice_trace {
+                    trace.finish(utterance_id, "dictionary_entry_missing");
+                }
+                return;
+            };
+            let output = voice_lookup_output(entry, search_query).to_string();
+            if utterance_id == self.voice_active_utterance_id
+                && let Some(overlay) = &mut self.voice_overlay
+            {
+                overlay.result = output.clone();
+            }
+            let input_started = Instant::now();
+            let typed = VoiceInputTarget::capture().map_or(Ok(None), |target| {
+                target.type_if_active(&output, self.config.voice_aion2_manual_paste)
+            });
+            if let Some(trace) = &self.voice_trace {
+                trace.record(
+                    utterance_id,
+                    "text_input",
+                    Some(input_started.elapsed()),
+                    match &typed {
+                        Ok(Some(VoiceInputMethod::Paste)) => "paste_sent",
+                        Ok(Some(VoiceInputMethod::Unicode)) => "unicode_sent",
+                        Ok(Some(VoiceInputMethod::ManualPaste)) => "manual_paste_ready",
+                        #[cfg(feature = "tsf-notepad-prototype")]
+                        Ok(Some(VoiceInputMethod::TextService)) => "text_service_queued",
+                        Ok(None) => "skipped",
+                        Err(error) => input_error_trace_code(error),
+                    },
+                );
+                trace.finish(
+                    utterance_id,
+                    match &typed {
+                        Ok(Some(_)) => "dictionary_input_sent",
+                        Ok(None) => "input_skipped",
+                        Err(_) => "input_error",
+                    },
+                );
+            }
+            match typed {
+                Ok(Some(method)) => {
+                    if hits.len() > 1 && method == VoiceInputMethod::Paste {
+                        self.finish_voice_status_for(
+                            utterance_id,
+                            &format!("已发送 Ctrl+V（首条词库结果，共 {} 条匹配）", hits.len()),
+                        );
+                    } else {
+                        self.finish_voice_status_for(
+                            utterance_id,
+                            voice_input_status(false, method),
+                        );
+                    }
+                }
+                Ok(None) => {
+                    self.finish_voice_status_for(
+                        utterance_id,
+                        "当前窗口不可用或焦点已变化，未输入词库结果",
+                    );
+                }
+                Err(reason) => {
+                    self.finish_voice_status_for(
+                        utterance_id,
+                        &format!("词库结果输入失败：{reason:#}"),
+                    );
+                }
+            }
+            return;
+        }
+        if !self.ai_available() {
+            if let Some(trace) = &self.voice_trace {
+                trace.finish(utterance_id, "ai_unavailable");
+            }
+            self.finish_voice_error_for(
+                utterance_id,
+                "词库无匹配；请在设置中启用 DeepSeek 翻译并选择目标语言".to_string(),
+            );
+            return;
+        }
+        let credentials_started = Instant::now();
+        let key_result = credentials::load_key();
+        if let Some(trace) = &self.voice_trace {
+            trace.record(
+                utterance_id,
+                "credential_load",
+                Some(credentials_started.elapsed()),
+                if key_result.is_ok() { "ok" } else { "error" },
+            );
+        }
+        let key = match key_result {
+            Ok(Some(key)) if !key.trim().is_empty() => key,
+            Ok(_) => {
+                if let Some(trace) = &self.voice_trace {
+                    trace.finish(utterance_id, "api_key_missing");
+                }
+                self.finish_voice_error_for(
+                    utterance_id,
+                    "词库无匹配；请先设置 DeepSeek API Key".to_string(),
+                );
+                return;
+            }
+            Err(error) => {
+                if let Some(trace) = &self.voice_trace {
+                    trace.finish(utterance_id, "credential_error");
+                }
+                self.finish_voice_error_for(
+                    utterance_id,
+                    format!("读取 DeepSeek API Key 失败：{error}"),
+                );
+                return;
+            }
+        };
+        let source = query.to_string();
+        let source_language = self.active_source_language.clone();
+        let target_language = self.config.translation_language.clone();
+        let reverse_language = if self.config.source_language == "auto" {
+            "cn".to_string()
+        } else {
+            self.config.source_language.clone()
+        };
+        let (sender, receiver) = mpsc::channel();
+        let trace = self.voice_trace.clone();
+        if let Some(trace) = &trace {
+            trace.record(utterance_id, "ai_queued", None, "ok");
+        }
+        std::thread::spawn(move || {
+            let ai_started = Instant::now();
+            if let Some(trace) = &trace {
+                trace.record(utterance_id, "ai_request_started", None, "ok");
+            }
+            let result = ai::translate(
+                source,
+                source_language,
+                target_language,
+                reverse_language,
+                key,
+            );
+            if let Some(trace) = &trace {
+                trace.record(
+                    utterance_id,
+                    "ai_request_completed",
+                    Some(ai_started.elapsed()),
+                    if result.is_ok() { "ok" } else { "error" },
+                );
+            }
+            let _ = sender.send(result);
+        });
+        self.voice_translation = Some((utterance_id, receiver));
+        if utterance_id == self.voice_active_utterance_id
+            && let Some(overlay) = &mut self.voice_overlay
+        {
+            overlay.status = "本地词库无匹配，正在 AI 翻译…".to_string();
+            overlay.keep_visible();
+        }
+    }
+
+    fn finish_voice_status(&mut self, status: &str) {
+        self.system_tray.set_status(status);
+        if let Some(overlay) = &mut self.voice_overlay {
+            overlay.status = status.to_string();
+            overlay.finish_after(VOICE_OVERLAY_HOLD);
+        }
+        if let Some(trace) = &self.voice_trace {
+            trace.record(0, "overlay_hide_scheduled", Some(VOICE_OVERLAY_HOLD), "ok");
+        }
+    }
+
+    fn finish_voice_status_for(&mut self, utterance_id: u64, status: &str) {
+        if utterance_id == self.voice_active_utterance_id {
+            self.finish_voice_status(status);
+        } else {
+            self.system_tray.set_status(status);
+        }
+    }
+
+    fn finish_voice_error(&mut self, error: String) {
+        self.system_tray.set_status(&error);
+        if let Some(overlay) = &mut self.voice_overlay {
+            overlay.status = error;
+            overlay.finish_after(VOICE_OVERLAY_HOLD);
+        }
+        if let Some(trace) = &self.voice_trace {
+            trace.record(
+                0,
+                "overlay_hide_scheduled",
+                Some(VOICE_OVERLAY_HOLD),
+                "error",
+            );
+        }
+    }
+
+    fn finish_voice_error_for(&mut self, utterance_id: u64, error: String) {
+        if utterance_id == self.voice_active_utterance_id {
+            self.finish_voice_error(error);
+        } else {
+            self.system_tray.set_status(&error);
+        }
+    }
+
     fn apply_settings(&mut self, config: UiConfig, key_update: &AiKeyUpdate) -> Result<()> {
         let config = config.normalized();
-        let (new_popup, new_settings, new_ocr) = parse_hotkeys(&config)?;
+        let (new_popup, new_settings, new_ocr, new_voice) = parse_hotkeys(&config)?;
         let new_source = if config.source_language == "auto" {
             self.active_source_language.clone()
         } else {
@@ -1237,10 +1950,16 @@ impl MatchApp {
                 credentials::delete_key().context("删除 DeepSeek API Key 失败")?
             }
         }
-        let old_hotkeys = [self.popup_hotkey, self.settings_hotkey, self.ocr_hotkey];
+        let old_hotkeys = [
+            self.popup_hotkey,
+            self.settings_hotkey,
+            self.ocr_hotkey,
+            self.voice_hotkey,
+        ];
         let shortcuts_changed = new_popup != self.popup_hotkey
             || new_settings != self.settings_hotkey
-            || new_ocr != self.ocr_hotkey;
+            || new_ocr != self.ocr_hotkey
+            || new_voice != self.voice_hotkey;
 
         if shortcuts_changed {
             self.hotkey_manager
@@ -1263,13 +1982,23 @@ impl MatchApp {
                 let _ = self.hotkey_manager.register_all(&old_hotkeys);
                 return Err(error).context("OCR 快捷键注册失败，可能已被其他程序占用");
             }
+            if let Err(error) = self.hotkey_manager.register(new_voice) {
+                let _ = self
+                    .hotkey_manager
+                    .unregister_all(&[new_popup, new_settings, new_ocr]);
+                let _ = self.hotkey_manager.register_all(&old_hotkeys);
+                return Err(error).context("语音识别快捷键注册失败，可能已被其他程序占用");
+            }
         }
 
         if let Err(error) = save_ui_config(&config) {
             if shortcuts_changed {
-                let _ = self
-                    .hotkey_manager
-                    .unregister_all(&[new_popup, new_settings, new_ocr]);
+                let _ = self.hotkey_manager.unregister_all(&[
+                    new_popup,
+                    new_settings,
+                    new_ocr,
+                    new_voice,
+                ]);
                 let _ = self.hotkey_manager.register_all(&old_hotkeys);
             }
             return Err(error);
@@ -1278,6 +2007,7 @@ impl MatchApp {
         self.popup_hotkey = new_popup;
         self.settings_hotkey = new_settings;
         self.ocr_hotkey = new_ocr;
+        self.voice_hotkey = new_voice;
         self.config = config;
         self.words = new_words;
         self.active_source_language = new_source;
@@ -1291,7 +2021,12 @@ impl MatchApp {
 
     fn sync_shortcut_recording(&mut self) {
         let should_suspend = self.settings_open && self.settings_panel.is_recording_shortcut();
-        let hotkeys = [self.popup_hotkey, self.settings_hotkey, self.ocr_hotkey];
+        let hotkeys = [
+            self.popup_hotkey,
+            self.settings_hotkey,
+            self.ocr_hotkey,
+            self.voice_hotkey,
+        ];
 
         if should_suspend && !self.hotkeys_suspended {
             match self.hotkey_manager.unregister_all(&hotkeys) {
@@ -1953,6 +2688,7 @@ impl eframe::App for MatchApp {
         self.sync_shortcut_recording();
         self.poll_ai_translation(context);
         self.poll_ocr(context);
+        self.poll_voice(context);
         let recording_shortcut = self.settings_open && self.settings_panel.is_recording_shortcut();
         // 设置窗口拥有焦点时，部分环境不会把组合键送到全局热键通道。
         // 同时读取 egui 的本地按键事件，并与全局事件合并，避免重复打开。
@@ -1961,6 +2697,9 @@ impl eframe::App for MatchApp {
             && shortcut_pressed(context, &self.config.hotkeys.popup);
         let mut open_settings = false;
         let mut open_ocr = false;
+        let mut toggle_voice = self.settings_open
+            && !recording_shortcut
+            && shortcut_pressed(context, &self.config.hotkeys.voice);
         for event in GlobalHotKeyEvent::receiver().try_iter() {
             if event.state != HotKeyState::Pressed || recording_shortcut {
                 continue;
@@ -1971,6 +2710,8 @@ impl eframe::App for MatchApp {
                 open_settings = true;
             } else if event.id == self.ocr_hotkey.id() {
                 open_ocr = true;
+            } else if event.id == self.voice_hotkey.id() {
+                toggle_voice = true;
             }
         }
         if open_query {
@@ -1981,6 +2722,11 @@ impl eframe::App for MatchApp {
             reveal_native_window(frame);
         } else if open_ocr {
             self.begin_ocr_capture(context);
+        } else if toggle_voice {
+            self.toggle_voice(context);
+        }
+        if let Some(overlay) = &self.voice_overlay {
+            overlay.show(context);
         }
 
         let repaint_interval = if self.settings_panel.has_open_dialog() {
@@ -2007,7 +2753,6 @@ impl eframe::App for MatchApp {
 
         if matches!(self.ocr_state, OcrState::Selecting { .. }) {
             if let Some(window) = frame.winit_window() {
-                window.set_blur(false);
                 if let OcrState::Selecting { selection, .. } = &self.ocr_state {
                     let monitor = selection.screen.monitor;
                     let target_position = winit::dpi::PhysicalPosition::new(monitor.x, monitor.y);
@@ -2082,9 +2827,6 @@ impl eframe::App for MatchApp {
                 self.hide(ui.ctx());
                 return;
             }
-            if let Some(window) = frame.winit_window() {
-                window.set_blur(false);
-            }
             if let Some((config, key_update)) = self.settings_panel.show(ui) {
                 let result = self
                     .apply_settings(config, &key_update)
@@ -2098,13 +2840,6 @@ impl eframe::App for MatchApp {
         }
 
         ui_theme::apply(ui);
-
-        if !self.blur_initialized {
-            if let Some(window) = frame.winit_window() {
-                window.set_blur(self.config.background_blur);
-            }
-            self.blur_initialized = true;
-        }
 
         let input_rect = egui::Rect::from_min_size(ui.max_rect().min, self.config.input_size());
         ui.painter().rect_filled(
@@ -2340,6 +3075,51 @@ fn reveal_native_window(frame: &eframe::Frame) {
     }
 }
 
+fn voice_input_status(ai_result: bool, method: VoiceInputMethod) -> &'static str {
+    match (ai_result, method) {
+        (true, VoiceInputMethod::Paste) => "AI 译文已发送 Ctrl+V（目标是否接收需实测）",
+        (false, VoiceInputMethod::Paste) => "词库结果已发送 Ctrl+V（目标是否接收需实测）",
+        (true, VoiceInputMethod::Unicode) => "AI 译文改用 Unicode 输入（剪贴板不可用）",
+        (false, VoiceInputMethod::Unicode) => "词库结果改用 Unicode 输入（剪贴板不可用）",
+        (true, VoiceInputMethod::ManualPaste) => "AI 译文已复制；请在 Aion2 按 Ctrl+V",
+        (false, VoiceInputMethod::ManualPaste) => "词库结果已复制；请在 Aion2 按 Ctrl+V",
+        #[cfg(feature = "tsf-notepad-prototype")]
+        (true, VoiceInputMethod::TextService) => "AI 译文已交给记事本文本服务（原型）",
+        #[cfg(feature = "tsf-notepad-prototype")]
+        (false, VoiceInputMethod::TextService) => "词库结果已交给记事本文本服务（原型）",
+    }
+}
+
+fn search_voice_words<'a>(words: &WordIndex, query: &'a str) -> (Vec<SearchHit>, &'a str) {
+    let hits = words.search(query, "", &[]);
+    if !hits.is_empty() {
+        return (hits, query);
+    }
+    let cleaned = clean_voice_query(query);
+    if cleaned == query || cleaned.is_empty() {
+        return (hits, query);
+    }
+    (words.search(cleaned, "", &[]), cleaned)
+}
+
+fn voice_lookup_output<'a>(entry: &'a WordEntry, query: &str) -> &'a str {
+    if entry.key.contains(query) && !entry.value.contains(query) {
+        &entry.value
+    } else {
+        &entry.key
+    }
+}
+
+fn clean_voice_query(text: &str) -> &str {
+    text.trim_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '。' | '，' | '！' | '？' | '、' | '.' | ',' | '!' | '?' | '"' | '\'' | '“' | '”'
+            )
+    })
+}
+
 fn estimate_text_width(entry: &WordEntry, font_size: f32) -> f32 {
     let units: f32 = entry
         .key
@@ -2468,7 +3248,7 @@ fn configure_style(context: &egui::Context) {
     context.set_theme(egui::Theme::Light);
     let mut style = (*context.style_of(egui::Theme::Light)).clone();
     style.spacing.item_spacing = egui::Vec2::ZERO;
-    style.visuals.window_fill = egui::Color32::TRANSPARENT;
+    style.visuals.window_fill = ui_theme::control_surface();
     style.visuals.panel_fill = egui::Color32::TRANSPARENT;
     context.set_style_of(egui::Theme::Light, style);
 }
@@ -2514,6 +3294,15 @@ mod tests {
     use eframe::egui;
 
     #[test]
+    fn dropdown_background_is_opaque_while_main_panel_stays_transparent() {
+        let context = egui::Context::default();
+        super::configure_style(&context);
+        let visuals = &context.style_of(egui::Theme::Light).visuals;
+        assert_eq!(visuals.window_fill.a(), 255);
+        assert_eq!(visuals.panel_fill, egui::Color32::TRANSPARENT);
+    }
+
+    #[test]
     fn default_input_is_200_by_30_with_twenty_percent_opacity() {
         let config = UiConfig::default();
         assert_eq!(config.input.width, 200.0);
@@ -2523,9 +3312,24 @@ mod tests {
         assert!(!config.continuous_input);
         assert!(config.ai_auto_save);
         assert!(config.ocr_auto_translate);
+        assert!(config.voice_auto_copy_first);
+        assert!(!config.voice_aion2_manual_paste);
+        assert!(!config.voice_keep_input);
+        assert_eq!(config.voice_backend, "whisper");
+        assert_eq!(config.voice_language, "auto");
         assert!(!config.clear_on_focus_return);
         assert!(config.translation_language.is_empty());
         assert_eq!(config.source_language, "auto");
+    }
+
+    #[cfg(not(feature = "windows-speech"))]
+    #[test]
+    fn default_build_ignores_saved_windows_speech_backend() {
+        let config = UiConfig {
+            voice_backend: "windows".to_string(),
+            ..UiConfig::default()
+        };
+        assert_eq!(config.normalized().voice_backend, "whisper");
     }
 
     #[test]
@@ -2541,6 +3345,63 @@ mod tests {
     fn ocr_auto_translation_can_be_disabled_in_config() {
         let config: UiConfig = serde_json::from_str(r#"{"ocr_auto_translate":false}"#).unwrap();
         assert!(!config.ocr_auto_translate);
+    }
+
+    #[test]
+    fn older_config_receives_default_voice_options() {
+        let config: UiConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.voice_auto_copy_first);
+        assert!(!config.voice_aion2_manual_paste);
+        assert!(!config.voice_keep_input);
+        assert_eq!(config.voice_backend, "whisper");
+        assert_eq!(config.voice_language, "auto");
+        assert_eq!(config.hotkeys.voice, "ctrl+alt+v");
+    }
+
+    #[test]
+    fn legacy_background_blur_setting_is_ignored() {
+        let config: UiConfig = serde_json::from_str(r#"{"background_blur":true}"#).unwrap();
+        assert!(
+            serde_json::to_value(config)
+                .unwrap()
+                .get("background_blur")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn voice_query_can_ignore_spoken_sentence_punctuation() {
+        assert_eq!(super::clean_voice_query("  “你好。”  "), "你好");
+        assert_eq!(super::clean_voice_query("谢谢！"), "谢谢");
+    }
+
+    #[test]
+    fn voice_query_uses_local_dictionary_before_ai_fallback() {
+        use super::{WordIndex, search_voice_words, voice_lookup_output};
+        use std::collections::HashMap;
+
+        let words = WordIndex::from_map(HashMap::from([(
+            "안녕하세요".to_string(),
+            "你好".to_string(),
+        )]));
+        let (hits, query) = search_voice_words(&words, "你好！");
+        assert_eq!(query, "你好");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(words.get(hits[0].entry_id).unwrap().key, "안녕하세요");
+        assert_eq!(
+            voice_lookup_output(words.get(hits[0].entry_id).unwrap(), query),
+            "안녕하세요"
+        );
+
+        let (reverse_hits, reverse_query) = search_voice_words(&words, "안녕하세요");
+        assert_eq!(
+            voice_lookup_output(words.get(reverse_hits[0].entry_id).unwrap(), reverse_query),
+            "你好"
+        );
+
+        let (misses, query) = search_voice_words(&words, "未收录");
+        assert!(misses.is_empty());
+        assert_eq!(query, "未收录");
     }
 
     #[test]
@@ -2605,14 +3466,18 @@ mod tests {
     #[test]
     fn default_hotkeys_are_distinct_and_valid() {
         let config = UiConfig::default();
-        let (popup, settings, ocr) = parse_hotkeys(&config).unwrap();
+        let (popup, settings, ocr, voice) = parse_hotkeys(&config).unwrap();
         assert_ne!(popup.id(), settings.id());
         assert_ne!(ocr.id(), popup.id());
         assert_ne!(ocr.id(), settings.id());
+        assert_ne!(voice.id(), popup.id());
+        assert_ne!(voice.id(), settings.id());
+        assert_ne!(voice.id(), ocr.id());
         assert_eq!(config.hotkeys.popup, "ctrl+alt+enter");
         assert_eq!(config.hotkeys.settings, "ctrl+alt+s");
         assert_eq!(config.hotkeys.clear_composed, "ctrl+backspace");
         assert_eq!(config.hotkeys.ocr, "ctrl+alt+o");
+        assert_eq!(config.hotkeys.voice, "ctrl+alt+v");
     }
 
     #[test]
@@ -2648,6 +3513,13 @@ mod tests {
     fn duplicate_ocr_hotkey_is_rejected() {
         let mut config = UiConfig::default();
         config.hotkeys.ocr = config.hotkeys.settings.clone();
+        assert!(parse_hotkeys(&config).is_err());
+    }
+
+    #[test]
+    fn duplicate_voice_hotkey_is_rejected() {
+        let mut config = UiConfig::default();
+        config.hotkeys.voice = config.hotkeys.popup.clone();
         assert!(parse_hotkeys(&config).is_err());
     }
 

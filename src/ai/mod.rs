@@ -1,15 +1,17 @@
 //! DeepSeek 翻译请求与词库候选项。
 //!
-//! 查询框翻译由用户主动触发；OCR 翻译由设置项控制。网络请求在后台线程执行，
+//! 查询框翻译由用户主动触发；OCR 和语音翻译由设置项与匹配结果控制。网络请求在后台线程执行，
 //! 本模块不持久化 API Key。
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 const MODEL: &str = "deepseek-flash";
+static CLIENT: OnceLock<std::result::Result<reqwest::blocking::Client, String>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub(crate) struct AiCandidate {
@@ -103,11 +105,16 @@ fn request_completion(
     api_key: &str,
     max_tokens: u32,
 ) -> Result<Completion> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(25))
-        .build()
-        .context("无法初始化网络连接")?;
+    let client = CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(25))
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("无法初始化网络连接：{error}"))?;
     let response = client
         .post(ENDPOINT)
         .bearer_auth(api_key)

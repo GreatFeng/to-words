@@ -64,7 +64,7 @@ pub(crate) fn yellow_text() -> egui::Color32 {
 /// 设置页面及其子页面共用的不透明悬停提示。
 pub(crate) fn tooltip_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(255, 254, 250))
+        .fill(egui::Color32::from_rgb(236, 234, 229))
         .stroke(egui::Stroke::new(1.0, border()))
         .corner_radius(8)
         .inner_margin(egui::Margin::same(12))
@@ -84,6 +84,8 @@ pub(crate) fn apply(ui: &mut egui::Ui) {
     ui.spacing_mut().icon_width_inner = 11.0;
     let visuals = &mut ui.style_mut().visuals;
     visuals.override_text_color = Some(primary_text());
+    visuals.window_fill = control_surface();
+    visuals.window_stroke = egui::Stroke::new(1.0, border());
     visuals.selection.bg_fill = accent_fill();
     visuals.selection.stroke = egui::Stroke::new(1.5, accent_text());
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.2, primary_text());

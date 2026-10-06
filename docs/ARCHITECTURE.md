@@ -2,7 +2,7 @@
 
 ```text
 hotkey_word_match/
-├─ assets/                 # 字体、图标、图片等静态资源
+├─ assets/                 # 字体、图标、OCR 与语音模型等资源
 ├─ docs/                   # 架构和开发文档
 ├─ src/
 │  ├─ app/                 # 应用状态、窗口生命周期与功能调度
@@ -11,7 +11,7 @@ hotkey_word_match/
 │  │  ├─ settings/         # 设置面板
 │  │  └─ word_library/     # 词库编辑、导入导出和合并界面
 │  ├─ domain/              # 查询索引、连续组合、词库合并及 AI 词条保存
-│  ├─ platform/            # 系统托盘、Windows 凭据管理器等系统能力
+│  ├─ platform/            # 系统托盘、凭据、OCR、麦克风与本地语音识别
 │  ├─ ui/                  # 颜色、间距等统一视觉规范
 │  └─ main.rs              # 程序入口和模块装配
 ├─ tests/                  # 后续跨模块集成测试

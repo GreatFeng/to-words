@@ -19,9 +19,22 @@ cargo run
 - `Ctrl + Alt + Enter`：打开查询框
 - `Ctrl + Alt + S`：打开设置面板
 - `Ctrl + Alt + O`：框选屏幕文字；松开后预览本地 OCR 与译文，点击 `√` 复制识别原文并关闭
+- `Ctrl + Alt + V`：开始或结束本地语音识别
 - `Ctrl + Backspace`：查询框为空时清空全部组合内容
 
 快捷键均可在设置页面重新录制。
+
+### 本地语音识别
+
+语音模块见 `src/platform/voice.rs`，使用 Windows `waveIn` 以 16 kHz 单声道录音，并调用随程序发布的 `whisper-cli.exe` 和多语言 GGML 模型。录音/停顿检测与语音识别使用独立线程，上一句识别时仍能检测下一句，识别任务按语句顺序处理；每 100 毫秒分析一帧音量，开头约 0.4 秒估计背景噪音，说话中根据语音峰值动态判断停顿，检测到约 0.9 秒停顿后只识别完整句子一次，不再每四秒重复启动模型。设置项 `voice_keep_input` 默认 `false`；开启后，每句自动提交并继续监听，直到再次按快捷键结束。语音活动检测仍是音量阈值启发式算法，持续人声或音乐等复杂噪声可能需要手动停止。悬浮文字由 `src/components/voice_overlay.rs` 的独立透明、置顶、鼠标穿透视口绘制，始终位于屏幕底部；最终结果显示约 1 秒后消失，即使保持语音输入也不会一直占据屏幕，下一句开始时清空旧文字。`src/platform/voice_output.rs` 在每条结果产生时捕获当前外部前台窗口，发送前再次确认窗口未变化；临时写入剪贴板后通过扫描码按下 Ctrl+V 并跨帧保持按键，然后恢复原剪贴板；非文本剪贴板或无法备份时退回 Unicode 按键事件。`src/platform/voice_overlay_window.rs` 会尽量移除 Windows 添加的原生边框，并设置不激活窗口样式。主窗口更新后显式请求子视口重绘，确保识别原文在 AI 请求尚未完成时先出现。资源放置和发布要求见 [assets/voice/README.md](../assets/voice/README.md)。
+
+Whisper CLI 的计算线程数自动取可用逻辑处理器数与 8 的较小值（查询失败则用 4）。实测同一段 4.5 秒中文录音，4 线程约 1.18 秒、8 线程约 0.75 秒，文字相同；更激进的解码参数虽然略快，但会丢失标点，因此没有启用。启用耗时诊断时，日志中的 `asr_threads` 会记录实际线程数。
+
+最终文字先按现有 `WordIndex` 在 key/value 两列搜索；命中时输入 key，多条命中默认输入第一条。设置项 `voice_auto_copy_first=false` 时，多条结果会交给现有查询框选择（手动选择沿用查询框的复制流程）。未命中时，仅在启用 `ai_translation`、配置目标语言和 DeepSeek API Key 后调用现有双向翻译，再输入译文，并异步保存到对应词库。窗口变化或输入被系统拒绝时跳过输入，避免写入错误窗口。设置项通过 `hotkeys.voice` 配置快捷键，默认 `ctrl+alt+v`；`voice_language` 默认 `auto`，可指定 Whisper 的识别语言。模型优先级为 medium → small → base → tiny。
+
+耗时诊断默认关闭，不创建或续写日志。需要临时诊断时可用 `cargo run --features voice-metrics` 启用；`src/platform/voice_metrics.rs` 会向程序目录的 `logs/voice_metrics.jsonl` 追加 JSON Lines。`session_id` 和 `utterance_id` 用于关联同一次录音与句子；`since_session_ms` 是从该次录音开始算起的时间，`duration_ms` 是当前阶段耗时。重点看 `speech_end_estimated` → `vad_complete`（停顿判断）、`audio_segment.duration_ms`（实际送入模型的音频长度，非处理耗时）、`asr_completed`（本地 Whisper）、`overlay_original_drawn`（原文绘制回调已执行）、`lookup_completed`（词库）、`credential_load`、`ai_request_completed`（整个 AI 调用）及 `text_input`。`vad_complete.result=max_duration` 表示没有检测到停顿、达到 30 秒上限才提交；此时真实说话结束时间未知，不会填写 `finished.duration_ms`。正常停顿时该总耗时是估算的说话结束到输入或失败的时间；`overlay_hide_scheduled` 和 `overlay_hidden` 对应完成后的 1 秒停留时间。日志不记录用户文字、音频或密钥，`result` 只记录固定状态或模型文件名。
+
+`voice_aion2_manual_paste` 默认 `false`。启用后，`VoiceInputTarget` 通过 Windows 进程快照比对当前前台窗口所属进程名；仅在 `Aion2.exe` 前台时跳过模拟按键，直接将结果保留在剪贴板供用户手动粘贴。正常输出路径的托盘状态会标明发送的是 Ctrl+V、Unicode，还是等待手动粘贴；`SendInput` 成功仅代表事件入队，不代表游戏已接收。
 
 ### 本地 OCR
 
@@ -178,7 +191,7 @@ user_words (1).json
 - 查询框、设置页面、本地 OCR 和清空组合内容快捷键
 - 查询框是否持续保持打开
 - 返回查询框后是否自动清空
-- 背景模糊和选中状态外观
+- 选中状态外观
 - DeepSeek AI 翻译开关和用户自己的 API Key
 
 快捷键框点击后直接按下新的组合键。数值项点击后使用鼠标滚轮调整，点击“保存并应用”后立即生效。
@@ -208,6 +221,23 @@ user_words (1).json
 运行时词库使用按 key 排序的 `Vec<WordEntry>`，查询结果只保存轻量的词条编号。程序还使用输入增长增量过滤和 key/value 双字段字符二元索引，并且只读取和绘制当前结果页需要的数据，适合逐渐增大的用户词库。
 
 ## 构建发布版本
+
+### Windows 本地语音识别（实验版）
+
+普通构建仅启用 `whisper.cpp`；Windows 本地识别实验代码保留在仓库工作区，通过 `windows-speech` Cargo feature 才会编译和显示设置选项，`packaging/windows_speech/build.ps1` 会显式启用该 feature。两种引擎共用现有录音、停顿检测、词库优先查询和结果输入流程。语音 AI 译文会异步写入对应的 `word_libraries/user_words_<原始语言>_<目标语言>.json`；相同 key/value 不重复写，冲突 key 不覆盖原词条。Whisper 仍是默认引擎。
+
+Windows 路线使用 `windows_speech_bridge/` 的 .NET 8 桥接程序和微软实验版 `Microsoft.Windows.AI.Speech`。当前文档没有公开的识别语言设置方式；对日语等语言可能返回英语译文，因此用户需要在自己的机器上验证结果。桥接程序要求 Windows 11 24H2+、WinAppSDK 实验版语音 API、已安装的本地语音模型，以及带 `systemAIModels` 权限的 MSIX 包身份。桥接程序使用 Windows App SDK 自包含发布，避免另外安装匹配的实验版 Windows App Runtime；这与 .NET 自包含发布是两个不同的选项。普通 `cargo run` 没有包身份，不能直接测试 Windows 选项。
+
+开发/发布准备：
+
+1. 安装 .NET 8 或更新版本的 SDK（本项目已用 10.0.401 编译桥接程序）、Windows SDK，并取得与 `packaging/windows_speech/AppxManifest.xml` 中 `Publisher` 一致的代码签名证书。生产发布应使用受信任的生产证书，不要把 `.pfx` 私钥提交到仓库。
+2. 运行 `powershell -ExecutionPolicy Bypass -File packaging/windows_speech/build.ps1`。脚本会构建 Rust 主程序和 .NET 桥接程序，把它们与配置/模型资源放入一个新的 `target/to_words_msix_stage_<时间>` 目录，将身份嵌入两个 EXE，并生成**未签名**的稀疏 MSIX 身份包。它不会复制你的词库，也不会安装证书或自动注册 MSIX。发布时保留桥接程序发布输出的**全部文件**，不仅是 `.exe`。
+3. 用 `signtool.exe` 对 `.msix` 签名。清单中的包名、Publisher、Application Id 必须和两个 EXE 内嵌清单完全一致。每次升级身份包应递增清单 Version。已有用户的 `word_libraries` 要单独保留并合并，不要用空目录覆盖。
+4. 自签名证书仅限开发测试。安装 MSIX 前，须经管理员同意将**公钥证书**导入 `Cert:\LocalMachine\TrustedPeople`；仅导入 `Cert:\CurrentUser\Root` 或 `Cert:\CurrentUser\TrustedPeople` 仍可能报 `0x800B0109`。这项信任会影响本机所有用户，测试完应移除对应证书。生产发布应使用受信任的正式签名方式，不应要求用户信任开发证书。
+5. 将签名后的身份包和发布目录一起部署，并以发布目录作为外部位置注册：`Add-AppxPackage -Path <身份包绝对路径> -ExternalLocation <发布目录绝对路径>`。这是微软的 *packaging with external location*（稀疏 MSIX）方案：保留程序目录和用户词库的现有行为，但身份包本身**不是**包含所有程序文件的独立安装器。不要把外部位置放在普通用户不可写的 `Program Files` 中，除非另行迁移配置和词库存储。
+6. 启动该发布目录中的程序，在设置里选 Windows 引擎，点击“准备 Windows 语音模型”并确认。CPU 设备可能通过 Windows Update 首次下载模型，等待就绪后再尝试语音快捷键。
+
+若本机只有 .NET Runtime、没有 .NET SDK，`build.ps1` 会在构建前停止。未签名的 MSIX 身份包不能直接安装；签名与实机识别验证是发布前的必要步骤。
 
 ```powershell
 cargo build --release
