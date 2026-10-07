@@ -23,6 +23,33 @@ use global_hotkey::hotkey::HotKey;
 #[cfg(feature = "windows-speech")]
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
+
+const SAVED_MESSAGE_DURATION: Duration = Duration::from_millis(1200);
+
+struct SettingsMessage {
+    text: String,
+    is_error: bool,
+    expires_at: Option<Instant>,
+}
+
+impl SettingsMessage {
+    fn saved() -> Self {
+        Self {
+            text: tr("配置已保存并立即生效。").to_string(),
+            is_error: false,
+            expires_at: Some(Instant::now() + SAVED_MESSAGE_DURATION),
+        }
+    }
+
+    fn error(text: String) -> Self {
+        Self {
+            text,
+            is_error: true,
+            expires_at: None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShortcutTarget {
@@ -42,7 +69,8 @@ pub(crate) enum AiKeyUpdate {
 
 pub(crate) struct SettingsPanel {
     draft: UiConfig,
-    message: Option<(String, bool)>,
+    message: Option<SettingsMessage>,
+    scroll_to_top: bool,
     active_shortcut: Option<ShortcutTarget>,
     active_number: Option<egui::Id>,
     last_wheel_change: f64,
@@ -64,6 +92,7 @@ impl SettingsPanel {
         Self {
             draft: config,
             message: None,
+            scroll_to_top: false,
             active_shortcut: None,
             active_number: None,
             last_wheel_change: 0.0,
@@ -89,6 +118,7 @@ impl SettingsPanel {
         self.voice_status = voice::engine_status(&self.draft.voice_backend);
         self.windows_prepare_confirm = false;
         self.message = None;
+        self.scroll_to_top = false;
         self.active_shortcut = None;
         self.active_number = None;
         self.word_editor.close();
@@ -99,13 +129,10 @@ impl SettingsPanel {
             Ok(key) => self.ai_key_present = key.is_some(),
             Err(error) => {
                 self.ai_key_present = false;
-                self.message = Some((
-                    i18n::message(
-                        "无法读取 DeepSeek 凭据：{error}",
-                        &[("error", &error.to_string())],
-                    ),
-                    true,
-                ));
+                self.message = Some(SettingsMessage::error(i18n::message(
+                    "无法读取 DeepSeek 凭据：{error}",
+                    &[("error", &error.to_string())],
+                )));
             }
         }
     }
@@ -126,13 +153,24 @@ impl SettingsPanel {
 
     pub(crate) fn set_result(&mut self, result: Result<(), String>) {
         self.message = Some(match result {
-            Ok(()) => (tr("配置已保存并立即生效。").to_string(), false),
-            Err(error) => (error, true),
+            Ok(()) => SettingsMessage::saved(),
+            Err(error) => SettingsMessage::error(error),
         });
+    }
+
+    fn expire_message(&mut self, context: &egui::Context, now: Instant) {
+        if let Some(expires_at) = self.message.as_ref().and_then(|message| message.expires_at) {
+            if now >= expires_at {
+                self.message = None;
+            } else {
+                context.request_repaint_after(expires_at - now);
+            }
+        }
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> Option<(UiConfig, AiKeyUpdate)> {
         i18n::set_language(&self.draft.ui_language);
+        self.expire_message(ui.ctx(), Instant::now());
         if let Some(receiver) = &self.windows_prepare_receiver {
             match receiver.try_recv() {
                 Ok(Ok(status)) => {
@@ -229,14 +267,17 @@ impl SettingsPanel {
                     body_rect.right_bottom(),
                 );
 
-                let scroll = egui::ScrollArea::vertical()
+                let mut scroll_area = egui::ScrollArea::vertical()
                     .id_salt("settings_scroll")
                     .auto_shrink([false, false])
                     .scroll_source(egui::scroll_area::ScrollSource {
                         mouse_wheel: allow_page_wheel,
                         ..Default::default()
-                    })
-                    .show(ui, |ui| {
+                    });
+                if std::mem::take(&mut self.scroll_to_top) {
+                    scroll_area = scroll_area.vertical_scroll_offset(0.0);
+                }
+                let scroll = scroll_area.show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         settings_card(
                             ui,
@@ -543,13 +584,16 @@ impl SettingsPanel {
                     .inner_margin(egui::Margin::symmetric(16, 10))
                     .show(ui, |ui| {
                         ui.set_width((rect.width() - 32.0).max(1.0));
-                        if let Some((message, is_error)) = &self.message {
-                            status_message(ui, message, *is_error, dark);
+                        if let Some(message) = &self.message {
+                            status_message(ui, &message.text, message.is_error, dark);
                             ui.add_space(7.0);
                         }
                         ui.horizontal(|ui| {
-                            let available =
-                                (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
+                            let icon_width = 40.0;
+                            let available = (ui.available_width()
+                                - icon_width
+                                - 2.0 * ui.spacing().item_spacing.x)
+                                .max(0.0);
                             let save_width = (available * 0.52).min(142.0);
                             let reset_width = (available - save_width).min(130.0);
                             if glass_action_button(ui, "保存并应用", save_width, true, dark)
@@ -566,6 +610,17 @@ impl SettingsPanel {
                                 self.active_number = None;
                                 self.ai_key_input.clear();
                                 self.remove_ai_key = false;
+                            }
+                            if scroll_to_top_visible(scroll_offset) {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if glass_scroll_to_top_button(ui, dark).clicked() {
+                                            self.scroll_to_top = true;
+                                            context.request_repaint();
+                                        }
+                                    },
+                                );
                             }
                         });
                     });
@@ -1037,7 +1092,7 @@ impl SettingsPanel {
                 self.active_shortcut = None;
                 self.message = None;
             }
-            Err(error) => self.message = Some((error, true)),
+            Err(error) => self.message = Some(SettingsMessage::error(error)),
         }
     }
 }
@@ -1184,6 +1239,43 @@ fn glass_action_button(
         .stroke(egui::Stroke::new(1.0, stroke))
         .corner_radius(13),
     )
+}
+
+fn glass_scroll_to_top_button(ui: &mut egui::Ui, dark_backdrop: bool) -> egui::Response {
+    let (fill, text_color, stroke) = if dark_backdrop {
+        (
+            egui::Color32::from_rgba_unmultiplied(226, 236, 243, 50),
+            egui::Color32::from_rgb(246, 248, 250),
+            egui::Color32::from_rgba_unmultiplied(226, 236, 243, 114),
+        )
+    } else {
+        (
+            egui::Color32::from_rgba_unmultiplied(248, 250, 250, 152),
+            egui::Color32::from_rgb(47, 53, 57),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 168),
+        )
+    };
+    let response = ui.add_sized(
+        [40.0, 40.0],
+        egui::Button::new("")
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, stroke))
+            .corner_radius(13),
+    );
+    let center = response.rect.center();
+    ui.painter().add(egui::Shape::line(
+        vec![
+            egui::pos2(center.x - 7.0, center.y + 3.0),
+            egui::pos2(center.x, center.y - 4.0),
+            egui::pos2(center.x + 7.0, center.y + 3.0),
+        ],
+        egui::Stroke::new(2.0, text_color),
+    ));
+    response.on_hover_text(tr("返回顶部"))
+}
+
+fn scroll_to_top_visible(offset: f32) -> bool {
+    offset > 1.0
 }
 
 fn status_message(ui: &mut egui::Ui, message: &str, is_error: bool, dark_backdrop: bool) {
@@ -1484,9 +1576,10 @@ fn shortcut_text(key: egui::Key, modifiers: egui::Modifiers) -> Result<String, S
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingsPanel, shortcut_text, step_voice_pause};
+    use super::{SettingsPanel, scroll_to_top_visible, shortcut_text, step_voice_pause};
     use crate::UiConfig;
     use eframe::egui;
+    use std::time::Duration;
 
     #[test]
     fn records_ctrl_alt_enter() {
@@ -1508,6 +1601,37 @@ mod tests {
         assert_eq!(step_voice_pause(0.6, -120.0, &range), 0.5);
         assert_eq!(step_voice_pause(3.0, 120.0, &range), 3.0);
         assert_eq!(step_voice_pause(0.2, -120.0, &range), 0.2);
+    }
+
+    #[test]
+    fn scroll_to_top_icon_is_hidden_at_the_top() {
+        assert!(!scroll_to_top_visible(0.0));
+        assert!(!scroll_to_top_visible(1.0));
+        assert!(scroll_to_top_visible(2.0));
+    }
+
+    #[test]
+    fn saved_message_expires_after_1_2_seconds_but_error_remains() {
+        let context = egui::Context::default();
+        let mut panel = SettingsPanel::new(UiConfig::default());
+        let before_save = std::time::Instant::now();
+        panel.set_result(Ok(()));
+        let after_save = std::time::Instant::now();
+        let first_deadline = panel.message.as_ref().unwrap().expires_at.unwrap();
+        assert!(first_deadline >= before_save + Duration::from_millis(1200));
+        assert!(first_deadline <= after_save + Duration::from_millis(1200));
+        panel.expire_message(&context, first_deadline - Duration::from_millis(1));
+        assert!(panel.message.is_some());
+
+        panel.set_result(Ok(()));
+        let renewed_deadline = panel.message.as_ref().unwrap().expires_at.unwrap();
+        assert!(renewed_deadline >= first_deadline);
+        panel.expire_message(&context, renewed_deadline);
+        assert!(panel.message.is_none());
+
+        panel.set_result(Err("save failed".to_string()));
+        panel.expire_message(&context, renewed_deadline + Duration::from_secs(10));
+        assert_eq!(panel.message.as_ref().unwrap().text, "save failed");
     }
 
     #[test]
