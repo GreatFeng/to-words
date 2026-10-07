@@ -4,6 +4,10 @@
 //! 词库编辑器和词库合并界面之间导航。公开的 [`SettingsPanel`] 由应用层持有，
 //! `shortcut_pressed` 用于判断 egui 收到的按键是否符合用户配置。
 
+mod glass_footer;
+
+use self::glass_footer::GlassFooter;
+use crate::i18n::{self, tr};
 use crate::platform::credentials;
 use crate::platform::ocr;
 use crate::platform::voice;
@@ -52,6 +56,7 @@ pub(crate) struct SettingsPanel {
     voice_status: String,
     windows_prepare_receiver: Option<Receiver<Result<String, String>>>,
     windows_prepare_confirm: bool,
+    glass_footer: GlassFooter,
 }
 
 impl SettingsPanel {
@@ -72,11 +77,13 @@ impl SettingsPanel {
             voice_status: String::new(),
             windows_prepare_receiver: None,
             windows_prepare_confirm: false,
+            glass_footer: GlassFooter::default(),
         }
     }
 
     pub(crate) fn open(&mut self, config: &UiConfig, active_source_language: &str) {
         self.draft = config.clone();
+        i18n::set_language(&self.draft.ui_language);
         self.active_source_language = active_source_language.to_string();
         self.ocr_status = ocr::engine_status();
         self.voice_status = voice::engine_status(&self.draft.voice_backend);
@@ -92,7 +99,13 @@ impl SettingsPanel {
             Ok(key) => self.ai_key_present = key.is_some(),
             Err(error) => {
                 self.ai_key_present = false;
-                self.message = Some((format!("无法读取 DeepSeek 凭据：{error}"), true));
+                self.message = Some((
+                    i18n::message(
+                        "无法读取 DeepSeek 凭据：{error}",
+                        &[("error", &error.to_string())],
+                    ),
+                    true,
+                ));
             }
         }
     }
@@ -113,16 +126,17 @@ impl SettingsPanel {
 
     pub(crate) fn set_result(&mut self, result: Result<(), String>) {
         self.message = Some(match result {
-            Ok(()) => ("配置已保存并立即生效。".to_string(), false),
+            Ok(()) => (tr("配置已保存并立即生效。").to_string(), false),
             Err(error) => (error, true),
         });
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> Option<(UiConfig, AiKeyUpdate)> {
+        i18n::set_language(&self.draft.ui_language);
         if let Some(receiver) = &self.windows_prepare_receiver {
             match receiver.try_recv() {
                 Ok(Ok(status)) => {
-                    self.voice_status = status;
+                    self.voice_status = tr(&status).to_string();
                     self.windows_prepare_receiver = None;
                 }
                 Ok(Err(error)) => {
@@ -130,7 +144,7 @@ impl SettingsPanel {
                     self.windows_prepare_receiver = None;
                 }
                 Err(TryRecvError::Disconnected) => {
-                    self.voice_status = "Windows 语音模型准备任务已中断".to_string();
+                    self.voice_status = tr("Windows 语音模型准备任务已中断").to_string();
                     self.windows_prepare_receiver = None;
                 }
                 Err(TryRecvError::Empty) => ui
@@ -164,56 +178,58 @@ impl SettingsPanel {
 
         let mut save = false;
         let allow_page_wheel = self.active_number.is_none();
+        let footer_height: f32 = if self.message.is_some() { 94.0 } else { 68.0 };
+        let mut footer_rect = egui::Rect::NOTHING;
+        let mut scroll_offset = 0.0;
         egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(28, 24))
+            .inner_margin(egui::Margin::symmetric(28, 18))
             .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("TO WORDS / PREFERENCES")
-                        .monospace()
-                        .size(11.0)
-                        .color(muted_text()),
-                );
-                ui.label(
-                    egui::RichText::new("设置")
-                        .size(29.0)
-                        .strong()
-                        .color(primary_text()),
-                );
-                ui.label(
-                    egui::RichText::new("管理词库、快捷键与查询窗口的显示方式。")
-                        .size(14.0)
-                        .color(muted_text()),
-                );
-                ui.add_space(18.0);
-
-                egui::Panel::bottom("settings_actions_footer")
-                    .frame(
-                        egui::Frame::new()
-                            .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::NONE)
-                            .inner_margin(egui::Margin::symmetric(0, 10)),
-                    )
-                    .show(ui, |ui| {
-                        if let Some((message, is_error)) = &self.message {
-                            status_message(ui, message, *is_error);
-                            ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(tr("TO WORDS / PREFERENCES"))
+                            .monospace()
+                            .size(11.0)
+                            .color(muted_text()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let previous_language = self.draft.ui_language.clone();
+                        egui::ComboBox::from_id_salt("ui_language")
+                            .selected_text(match self.draft.ui_language.as_str() {
+                                "en" => "English",
+                                "ko" => "한국어",
+                                "ja" => "日本語",
+                                _ => "简体中文",
+                            })
+                            .width(170.0)
+                            .show_ui(ui, |ui| {
+                                for (code, name) in [
+                                    ("zh-CN", "简体中文"),
+                                    ("en", "English"),
+                                    ("ko", "한국어"),
+                                    ("ja", "日本語"),
+                                ] {
+                                    ui.selectable_value(&mut self.draft.ui_language, code.to_string(), name);
+                                }
+                            });
+                        ui.label(egui::RichText::new(tr("界面语言")).size(13.0).color(primary_text()));
+                        if self.draft.ui_language != previous_language {
+                            i18n::set_language(&self.draft.ui_language);
+                            self.message = None;
+                            self.ocr_status = ocr::engine_status();
+                            self.voice_status = voice::engine_status(&self.draft.voice_backend);
+                            ui.ctx().request_repaint();
                         }
-                        ui.horizontal(|ui| {
-                            if primary_button(ui, "保存并应用", 124.0).clicked() {
-                                save = true;
-                            }
-                            if quiet_button(ui, "恢复默认值", 112.0).clicked() {
-                                self.draft = UiConfig::default();
-                                self.message = None;
-                                self.active_shortcut = None;
-                                self.active_number = None;
-                                self.ai_key_input.clear();
-                                self.remove_ai_key = false;
-                            }
-                        });
                     });
+                });
+                ui.add_space(12.0);
+                let body_rect = ui.available_rect_before_wrap();
+                let visible_footer_height = footer_height.min(body_rect.height().max(0.0));
+                footer_rect = egui::Rect::from_min_max(
+                    egui::pos2(body_rect.left(), body_rect.bottom() - visible_footer_height),
+                    body_rect.right_bottom(),
+                );
 
-                egui::ScrollArea::vertical()
+                let scroll = egui::ScrollArea::vertical()
                     .id_salt("settings_scroll")
                     .auto_shrink([false, false])
                     .scroll_source(egui::scroll_area::ScrollSource {
@@ -257,48 +273,52 @@ impl SettingsPanel {
                             Some("本地录音与识别；无词库匹配时使用已配置的 DeepSeek 翻译。"),
                             |ui| {
                                 ui.label(
-                                    egui::RichText::new("识别引擎")
+                                    egui::RichText::new(tr("识别引擎"))
                                         .size(13.0)
                                         .strong()
                                         .color(primary_text()),
                                 );
-                                #[cfg(not(feature = "windows-speech"))]
-                                ui.label("内置 whisper.cpp");
-                                #[cfg(feature = "windows-speech")]
-                                {
                                 let old_backend = self.draft.voice_backend.clone();
                                 ui.horizontal(|ui| {
                                     egui::ComboBox::from_id_salt("voice_backend")
-                                        .selected_text(if self.draft.voice_backend == "windows" {
-                                            "Windows 本地 AI 识别（实验版）"
-                                        } else {
-                                            "内置 whisper.cpp"
+                                        .selected_text(match self.draft.voice_backend.as_str() {
+                                            "sensevoice" => tr("SenseVoice（默认）"),
+                                            "whisper" => "whisper.cpp",
+                                            "windows" => tr("Windows 本地 AI 识别（实验版）"),
+                                            _ => tr("SenseVoice（默认）"),
                                         })
                                         .width(220.0)
                                         .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut self.draft.voice_backend, "whisper".to_string(), "内置 whisper.cpp");
-                                            ui.selectable_value(&mut self.draft.voice_backend, "windows".to_string(), "Windows 本地 AI 识别（实验版）");
+                                            ui.selectable_value(&mut self.draft.voice_backend, "sensevoice".to_string(), tr("SenseVoice（默认）"));
+                                            ui.selectable_value(&mut self.draft.voice_backend, "whisper".to_string(), "whisper.cpp");
+                                            #[cfg(feature = "windows-speech")]
+                                            ui.selectable_value(&mut self.draft.voice_backend, "windows".to_string(), tr("Windows 本地 AI 识别（实验版）"));
                                         });
+                                    #[cfg(feature = "windows-speech")]
                                     if self.draft.voice_backend == "windows" {
                                         help_icon(ui, "需安装带 MSIX 身份的版本；此 API 不等同于 Win+H。微软实验版没有公开的识别语言设置方式，部分非英语语音可能被误译成英语。");
                                     }
                                 });
                                 if old_backend != self.draft.voice_backend {
                                     self.voice_status = voice::engine_status(&self.draft.voice_backend);
-                                    self.windows_prepare_confirm = false;
+                                    #[cfg(feature = "windows-speech")]
+                                    {
+                                        self.windows_prepare_confirm = false;
+                                    }
                                 }
+                                #[cfg(feature = "windows-speech")]
                                 if self.draft.voice_backend == "windows" {
                                     if self.windows_prepare_receiver.is_none()
-                                        && ui.button("准备 Windows 语音模型").clicked()
+                                        && ui.button(tr("准备 Windows 语音模型")).clicked()
                                     {
                                         self.windows_prepare_confirm = true;
                                     }
                                     if self.windows_prepare_confirm {
-                                        ui.label("首次准备可能通过 Windows Update 下载可选语音模型。是否继续？");
+                                        ui.label(tr("首次准备可能通过 Windows Update 下载可选语音模型。是否继续？"));
                                         ui.horizontal(|ui| {
-                                            if ui.button("确认下载并准备").clicked() {
+                                            if ui.button(tr("确认下载并准备")).clicked() {
                                                 self.windows_prepare_confirm = false;
-                                                self.voice_status = "正在准备 Windows 语音模型…".to_string();
+                                                self.voice_status = tr("正在准备 Windows 语音模型…").to_string();
                                                 let (sender, receiver) = mpsc::channel();
                                                 std::thread::spawn(move || {
                                                     let result = voice::prepare_windows_model().map_err(|error| format!("{error:#}"));
@@ -306,50 +326,51 @@ impl SettingsPanel {
                                                 });
                                                 self.windows_prepare_receiver = Some(receiver);
                                             }
-                                            if ui.button("取消").clicked() {
+                                            if ui.button(tr("取消")).clicked() {
                                                 self.windows_prepare_confirm = false;
                                             }
                                         });
                                     }
                                 }
-                                }
                                 ui.add_space(8.0);
                                 ui.label(
-                                    egui::RichText::new("识别语言")
+                                    egui::RichText::new(tr("识别语言"))
                                         .size(13.0)
                                         .strong()
                                         .color(primary_text()),
                                 );
                                 ui.horizontal(|ui| {
-                                    egui::ComboBox::from_id_salt("voice_language")
-                                        .selected_text(if self.draft.voice_language == "auto" {
-                                            "自动识别"
-                                        } else {
-                                            translation_language::language_label(&self.draft.voice_language)
-                                        })
-                                        .width(220.0)
-                                        .height(320.0)
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.draft.voice_language,
-                                                "auto".to_string(),
-                                                "自动识别",
-                                            );
-                                            ui.separator();
-                                            for language in translation_language::LANGUAGES {
+                                    ui.add_enabled_ui(self.draft.voice_backend == "whisper", |ui| {
+                                        egui::ComboBox::from_id_salt("voice_language")
+                                            .selected_text(if self.draft.voice_language == "auto" {
+                                                tr("自动识别")
+                                            } else {
+                                                i18n::language_name(&self.draft.voice_language)
+                                            })
+                                            .width(220.0)
+                                            .height(320.0)
+                                            .show_ui(ui, |ui| {
                                                 ui.selectable_value(
                                                     &mut self.draft.voice_language,
-                                                    language.code.to_string(),
-                                                    language.label,
+                                                    "auto".to_string(),
+                                                    tr("自动识别"),
                                                 );
-                                            }
-                                        });
+                                                ui.separator();
+                                                for language in translation_language::LANGUAGES {
+                                                    ui.selectable_value(
+                                                        &mut self.draft.voice_language,
+                                                        language.code.to_string(),
+                                                        tr(language.label),
+                                                    );
+                                                }
+                                            });
+                                    });
                                     help_icon(
                                         ui,
-                                        if self.draft.voice_backend == "whisper" {
-                                            "经常说同一种语言时，手动指定可减少短句误判。"
-                                        } else {
-                                            "Windows 实验版暂不能按此选项限定识别语言；这里的设置仅用于 Whisper。"
+                                        match self.draft.voice_backend.as_str() {
+                                            "whisper" => "经常说同一种语言时，手动指定可减少短句误判。",
+                                            "sensevoice" => "SenseVoice 自动识别语言，不能通过此选项限定；识别语言设置仅用于 Whisper。",
+                                            _ => "Windows 实验版暂不能按此选项限定识别语言；这里的设置仅用于 Whisper。",
                                         },
                                     );
                                 });
@@ -361,6 +382,37 @@ impl SettingsPanel {
                                         "是否保持语音输入",
                                     );
                                     help_icon(ui, "默认说完一句后自动停止；勾选后持续监听下一句，再按快捷键结束。");
+                                });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    contrast_checkbox(
+                                        ui,
+                                        &mut self.draft.voice_hold_to_talk,
+                                        "按住语音快捷键说话，松开后停止",
+                                    );
+                                    help_icon(ui, "启用后按下快捷键开始录音，松开快捷键的主按键时停止并识别最后一句。按住期间可连续说多句；此模式优先于“是否保持语音输入”。");
+                                });
+                                ui.add_space(8.0);
+                                egui::Grid::new("voice_silence_settings")
+                                    .num_columns(2)
+                                    .spacing([16.0, 8.0])
+                                    .show(ui, |ui| {
+                                        number_row(
+                                            ui,
+                                            "voice_silence_seconds",
+                                            "语音停顿时间（秒）",
+                                            &mut self.draft.voice_silence_seconds,
+                                            0.2..=3.0,
+                                            0.1,
+                                            &mut self.active_number,
+                                            &mut self.last_wheel_change,
+                                        );
+                                    });
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(tr("点击数值后滚轮调整，每次 0.1 秒"))
+                                        .size(12.0)
+                                        .color(muted_text()));
+                                    help_icon(ui, "范围 0.2–3.0 秒，默认 0.6 秒。按住说话模式会等到松开快捷键才提交，停顿时间对该模式不生效。");
                                 });
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
@@ -449,9 +501,14 @@ impl SettingsPanel {
                             None,
                             |ui| self.draw_general_settings(ui),
                         );
-                        ui.add_space(18.0);
+                        ui.add_space(footer_height + 16.0);
                     });
+                scroll_offset = scroll.state.offset.y;
             });
+
+        if footer_rect.is_positive() {
+            self.draw_actions_footer(ui.ctx(), footer_rect, scroll_offset, &mut save);
+        }
 
         save.then(|| {
             let key_update = if !self.ai_key_input.trim().is_empty() {
@@ -463,6 +520,56 @@ impl SettingsPanel {
             };
             (self.draft.clone(), key_update)
         })
+    }
+
+    fn draw_actions_footer(
+        &mut self,
+        context: &egui::Context,
+        rect: egui::Rect,
+        scroll_offset: f32,
+        save: &mut bool,
+    ) {
+        let dark = self.glass_footer.background_is_dark();
+        egui::Area::new(egui::Id::new("settings_actions_footer"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .movable(false)
+            .show(context, |ui| {
+                ui.set_min_size(rect.size());
+                ui.set_max_size(rect.size());
+                let paint_rect = egui::Rect::from_min_size(ui.min_rect().min, rect.size());
+                self.glass_footer.paint(ui, paint_rect, scroll_offset);
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        ui.set_width((rect.width() - 32.0).max(1.0));
+                        if let Some((message, is_error)) = &self.message {
+                            status_message(ui, message, *is_error, dark);
+                            ui.add_space(7.0);
+                        }
+                        ui.horizontal(|ui| {
+                            let available =
+                                (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
+                            let save_width = (available * 0.52).min(142.0);
+                            let reset_width = (available - save_width).min(130.0);
+                            if glass_action_button(ui, "保存并应用", save_width, true, dark)
+                                .clicked()
+                            {
+                                *save = true;
+                            }
+                            if glass_action_button(ui, "恢复默认值", reset_width, false, dark)
+                                .clicked()
+                            {
+                                self.draft = UiConfig::default();
+                                self.message = None;
+                                self.active_shortcut = None;
+                                self.active_number = None;
+                                self.ai_key_input.clear();
+                                self.remove_ai_key = false;
+                            }
+                        });
+                    });
+            });
     }
 
     pub(crate) fn mark_ai_key_saved(&mut self, change: &AiKeyUpdate) {
@@ -479,7 +586,7 @@ impl SettingsPanel {
         ui.horizontal_wrapped(|ui| {
             contrast_checkbox(ui, &mut self.draft.ai_translation, "启用主动 AI 翻译");
             ui.label(
-                egui::RichText::new("模型：deepseek-flash")
+                egui::RichText::new(tr("模型：deepseek-flash"))
                     .size(12.0)
                     .color(muted_text()),
             );
@@ -493,11 +600,20 @@ impl SettingsPanel {
             );
         });
         ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            contrast_checkbox(
+                ui,
+                &mut self.draft.ai_polite_mode,
+                "敬语模式",
+            );
+            help_icon(ui, "AI 正向或反向翻译时，按译文语言使用自然礼貌的表达；没有专门敬语形式的语言会使用礼貌语气。词库已有的固定句式不受影响。");
+        });
+        ui.add_space(8.0);
         self.draw_ocr_auto_translation(ui);
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(
-                egui::RichText::new("API Key")
+                egui::RichText::new(tr("API Key"))
                     .size(13.0)
                     .color(muted_text()),
             );
@@ -506,9 +622,9 @@ impl SettingsPanel {
                 egui::TextEdit::singleline(&mut self.ai_key_input)
                     .password(true)
                     .hint_text(if self.ai_key_present && !self.remove_ai_key {
-                        "已安全保存；留空则保持不变"
+                        tr("已安全保存；留空则保持不变")
                     } else {
-                        "输入你的 DeepSeek API Key"
+                        tr("输入你的 DeepSeek API Key")
                     }),
             );
             if self.ai_key_present && secondary_button(ui, "删除密钥", 94.0).clicked() {
@@ -519,7 +635,7 @@ impl SettingsPanel {
         });
         if self.remove_ai_key {
             ui.label(
-                egui::RichText::new("保存并应用后将删除已保存的密钥。")
+                egui::RichText::new(tr("保存并应用后将删除已保存的密钥。"))
                     .size(12.0)
                     .color(red_text()),
             );
@@ -541,16 +657,16 @@ impl SettingsPanel {
         ui.horizontal_wrapped(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    egui::RichText::new("原始语言")
+                    egui::RichText::new(tr("原始语言"))
                         .size(13.0)
                         .strong()
                         .color(primary_text()),
                 );
                 egui::ComboBox::from_id_salt("source_language")
                     .selected_text(if self.draft.source_language == "auto" {
-                        "自动检测"
+                        tr("自动检测")
                     } else {
-                        translation_language::language_label(&self.draft.source_language)
+                        i18n::language_name(&self.draft.source_language)
                     })
                     .width(220.0)
                     .height(320.0)
@@ -558,14 +674,14 @@ impl SettingsPanel {
                         ui.selectable_value(
                             &mut self.draft.source_language,
                             "auto".to_string(),
-                            "自动检测",
+                            tr("自动检测"),
                         );
                         ui.separator();
                         for language in translation_language::LANGUAGES {
                             ui.selectable_value(
                                 &mut self.draft.source_language,
                                 language.code.to_string(),
-                                language.label,
+                                tr(language.label),
                             );
                         }
                     });
@@ -573,29 +689,27 @@ impl SettingsPanel {
             ui.add_space(12.0);
             ui.vertical(|ui| {
                 ui.label(
-                    egui::RichText::new("目标语言")
+                    egui::RichText::new(tr("目标语言"))
                         .size(13.0)
                         .strong()
                         .color(primary_text()),
                 );
                 egui::ComboBox::from_id_salt("translation_language")
-                    .selected_text(translation_language::language_label(
-                        &self.draft.translation_language,
-                    ))
+                    .selected_text(i18n::language_name(&self.draft.translation_language))
                     .width(220.0)
                     .height(320.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
                             &mut self.draft.translation_language,
                             String::new(),
-                            "未选择（默认词库）",
+                            tr("未选择（默认词库）"),
                         );
                         ui.separator();
                         for language in translation_language::LANGUAGES {
                             ui.selectable_value(
                                 &mut self.draft.translation_language,
                                 language.code.to_string(),
-                                language.label,
+                                tr(language.label),
                             );
                         }
                     });
@@ -605,15 +719,15 @@ impl SettingsPanel {
         let file_name = self.current_word_file_name();
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(format!("词库文件：{file_name}"))
+                egui::RichText::new(i18n::message("词库文件：{file}", &[("file", &file_name)]))
                     .monospace()
                     .size(12.0)
                     .color(muted_text()),
             );
             if self.draft.source_language == "auto" {
-                let explanation = format!(
-                    "自动检测当前使用：{}；语言难以判断时沿用该词库。缺少的词库会自动创建。",
-                    translation_language::language_label(&self.active_source_language)
+                let explanation = i18n::message(
+                    "自动检测当前使用：{language}；语言难以判断时沿用该词库。缺少的词库会自动创建。",
+                    &[("language", i18n::language_name(&self.active_source_language))]
                 );
                 help_icon(ui, &explanation);
             } else {
@@ -865,7 +979,7 @@ impl SettingsPanel {
                     &mut self.last_wheel_change,
                 );
                 ui.label(
-                    egui::RichText::new("保持打开")
+                    egui::RichText::new(tr("保持打开"))
                         .size(13.0)
                         .color(muted_text()),
                 );
@@ -876,7 +990,7 @@ impl SettingsPanel {
                 );
                 ui.end_row();
                 ui.label(
-                    egui::RichText::new("返回后自动清空")
+                    egui::RichText::new(tr("返回后自动清空"))
                         .size(13.0)
                         .color(muted_text()),
                 );
@@ -939,7 +1053,9 @@ fn contrast_checkbox(ui: &mut egui::Ui, value: &mut bool, text: &str) -> egui::R
         }
         ui.checkbox(
             value,
-            egui::RichText::new(text).size(13.0).color(primary_text()),
+            egui::RichText::new(tr(text))
+                .size(13.0)
+                .color(primary_text()),
         )
     })
     .inner
@@ -976,7 +1092,7 @@ fn help_icon(ui: &mut egui::Ui, explanation: &str) {
         .frame(ui_theme::tooltip_frame())
         .show(|ui| {
             ui.label(
-                egui::RichText::new(explanation)
+                egui::RichText::new(tr(explanation))
                     .size(13.0)
                     .color(primary_text()),
             );
@@ -998,7 +1114,7 @@ fn settings_card<R>(
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(title)
+                    egui::RichText::new(tr(title))
                         .size(17.0)
                         .strong()
                         .color(primary_text()),
@@ -1013,48 +1129,80 @@ fn settings_card<R>(
         .inner
 }
 
-fn primary_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+fn secondary_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
     ui.add_sized(
-        [width, 38.0],
+        [width, 36.0],
         egui::Button::new(
-            egui::RichText::new(text)
-                .size(14.0)
-                .strong()
-                .color(egui::Color32::WHITE),
+            egui::RichText::new(tr(text))
+                .size(13.5)
+                .color(primary_text()),
         )
-        .fill(egui::Color32::from_rgb(31, 31, 30))
-        .stroke(egui::Stroke::NONE)
+        .fill(control_surface())
+        .stroke(egui::Stroke::new(1.0, border()))
         .corner_radius(6),
     )
 }
 
-fn secondary_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+fn glass_action_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    width: f32,
+    primary: bool,
+    dark_backdrop: bool,
+) -> egui::Response {
+    let (fill, text_color, stroke) = match (primary, dark_backdrop) {
+        (true, false) => (
+            egui::Color32::from_rgba_unmultiplied(31, 35, 38, 238),
+            egui::Color32::WHITE,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 85),
+        ),
+        (true, true) => (
+            egui::Color32::from_rgba_unmultiplied(242, 246, 249, 244),
+            egui::Color32::from_rgb(28, 33, 38),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140),
+        ),
+        (false, false) => (
+            egui::Color32::from_rgba_unmultiplied(248, 250, 250, 152),
+            egui::Color32::from_rgb(47, 53, 57),
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 168),
+        ),
+        (false, true) => (
+            egui::Color32::from_rgba_unmultiplied(226, 236, 243, 50),
+            egui::Color32::from_rgb(246, 248, 250),
+            egui::Color32::from_rgba_unmultiplied(226, 236, 243, 114),
+        ),
+    };
     ui.add_sized(
-        [width, 36.0],
-        egui::Button::new(egui::RichText::new(text).size(13.5).color(primary_text()))
-            .fill(control_surface())
-            .stroke(egui::Stroke::new(1.0, border()))
-            .corner_radius(6),
+        [width, 40.0],
+        egui::Button::new(
+            egui::RichText::new(tr(text))
+                .size(13.5)
+                .strong()
+                .color(text_color),
+        )
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(13),
     )
 }
 
-fn quiet_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
-    ui.add_sized(
-        [width, 38.0],
-        egui::Button::new(egui::RichText::new(text).size(13.5).color(muted_text()))
-            .fill(surface())
-            .stroke(egui::Stroke::new(1.0, border()))
-            .corner_radius(6),
-    )
-}
-
-fn status_message(ui: &mut egui::Ui, message: &str, is_error: bool) {
-    let color = if is_error { red_text() } else { green_text() };
-    ui.label(egui::RichText::new(message).size(13.0).color(color));
+fn status_message(ui: &mut egui::Ui, message: &str, is_error: bool, dark_backdrop: bool) {
+    let color = match (is_error, dark_backdrop) {
+        (true, false) => red_text(),
+        (false, false) => green_text(),
+        (true, true) => egui::Color32::from_rgb(255, 184, 185),
+        (false, true) => egui::Color32::from_rgb(182, 233, 187),
+    };
+    ui.add(egui::Label::new(egui::RichText::new(message).size(13.0).color(color)).truncate())
+        .on_hover_text(message);
 }
 
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
-    ui.label(egui::RichText::new(label).size(13.0).color(muted_text()));
+    ui.label(
+        egui::RichText::new(tr(label))
+            .size(13.0)
+            .color(muted_text()),
+    );
     let width = ui.available_width().clamp(132.0, 180.0);
     ui.add(
         egui::TextEdit::singleline(value)
@@ -1072,10 +1220,14 @@ fn shortcut_row(
     active: &mut Option<ShortcutTarget>,
     target: ShortcutTarget,
 ) {
-    ui.label(egui::RichText::new(label).size(13.0).color(muted_text()));
+    ui.label(
+        egui::RichText::new(tr(label))
+            .size(13.0)
+            .color(muted_text()),
+    );
     let recording = *active == Some(target);
     let text = if recording || value.is_empty() {
-        "请按下快捷键…"
+        tr("请按下快捷键…")
     } else {
         value.as_str()
     };
@@ -1117,10 +1269,17 @@ fn number_row(
     active: &mut Option<egui::Id>,
     last_wheel_change: &mut f64,
 ) {
-    ui.label(egui::RichText::new(label).size(13.0).color(muted_text()));
+    let voice_pause = id_source == "voice_silence_seconds";
+    ui.label(
+        egui::RichText::new(tr(label))
+            .size(13.0)
+            .color(muted_text()),
+    );
     let id = ui.make_persistent_id(id_source);
     let selected = *active == Some(id);
-    let text = if step < 1.0 {
+    let text = if voice_pause {
+        format!("{value:.1}")
+    } else if step < 1.0 {
         format!("{value:.2}")
     } else {
         format!("{value:.0}")
@@ -1149,18 +1308,43 @@ fn number_row(
         response.request_focus();
     }
     if *active == Some(id) {
-        let (wheel, now) = ui.input(|input| (input.smooth_scroll_delta().y, input.time));
-
-        // 每隔 0.15 秒最多调整一次
-        if wheel != 0.0 && now - *last_wheel_change >= 0.03 {
-            let direction = if wheel > 0.0 { 1.0 } else { -1.0 };
-
-            *value = (*value + direction * step).clamp(*range.start(), *range.end());
+        let (wheel, now) = ui.input(|input| {
+            let wheel = if voice_pause {
+                // 平滑滚动带有惯性，同一次滚轮动作可能跨多帧造成连续跳值。
+                input
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                        _ => None,
+                    })
+                    .sum()
+            } else {
+                input.smooth_scroll_delta().y
+            };
+            (wheel, input.time)
+        });
+        let cooldown = if voice_pause { 0.2 } else { 0.03 };
+        if wheel != 0.0 && now - *last_wheel_change >= cooldown {
+            if voice_pause {
+                *value = step_voice_pause(*value, wheel, &range);
+            } else {
+                let direction = if wheel > 0.0 { 1.0 } else { -1.0 };
+                *value = (*value + direction * step).clamp(*range.start(), *range.end());
+            }
 
             *last_wheel_change = now;
         }
     }
     ui.end_row();
+}
+
+fn step_voice_pause(current: f32, wheel: f32, range: &std::ops::RangeInclusive<f32>) -> f32 {
+    let current_tenths = (current * 10.0).round() as i32;
+    let min_tenths = (*range.start() * 10.0).round() as i32;
+    let max_tenths = (*range.end() * 10.0).round() as i32;
+    let direction = if wheel > 0.0 { 1 } else { -1 };
+    (current_tenths + direction).clamp(min_tenths, max_tenths) as f32 / 10.0
 }
 
 fn usize_number_row(
@@ -1172,7 +1356,11 @@ fn usize_number_row(
     active: &mut Option<egui::Id>,
     last_wheel_change: &mut f64,
 ) {
-    ui.label(egui::RichText::new(label).size(13.0).color(muted_text()));
+    ui.label(
+        egui::RichText::new(tr(label))
+            .size(13.0)
+            .color(muted_text()),
+    );
     let id = ui.make_persistent_id(id_source);
     let selected = *active == Some(id);
     let width = ui.available_width().clamp(132.0, 180.0);
@@ -1230,6 +1418,16 @@ pub(crate) fn shortcut_pressed(context: &egui::Context, configured: &str) -> boo
     })
 }
 
+pub(crate) fn shortcut_released(context: &egui::Context, configured: &str) -> bool {
+    let key_name = configured.rsplit('+').next().unwrap_or(configured);
+    context.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(event, egui::Event::Key { key, pressed: false, .. }
+                if key.name().eq_ignore_ascii_case(key_name))
+        })
+    })
+}
+
 fn is_modifier_key(key: egui::Key) -> bool {
     matches!(
         key,
@@ -1281,12 +1479,13 @@ fn shortcut_text(key: egui::Key, modifiers: egui::Modifiers) -> Result<String, S
     shortcut
         .parse::<HotKey>()
         .map(|_| shortcut)
-        .map_err(|_| format!("不支持这个按键：{}", key.name()))
+        .map_err(|_| i18n::message("不支持这个按键：{key}", &[("key", key.name())]))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::shortcut_text;
+    use super::{SettingsPanel, shortcut_text, step_voice_pause};
+    use crate::UiConfig;
     use eframe::egui;
 
     #[test]
@@ -1300,5 +1499,69 @@ mod tests {
             shortcut_text(egui::Key::Enter, modifiers).unwrap(),
             "ctrl+alt+Enter"
         );
+    }
+
+    #[test]
+    fn voice_pause_wheel_changes_one_tenth_per_event() {
+        let range = 0.2..=3.0;
+        assert_eq!(step_voice_pause(0.6, 120.0, &range), 0.7);
+        assert_eq!(step_voice_pause(0.6, -120.0, &range), 0.5);
+        assert_eq!(step_voice_pause(3.0, 120.0, &range), 3.0);
+        assert_eq!(step_voice_pause(0.2, -120.0, &range), 0.2);
+    }
+
+    #[test]
+    fn actions_footer_stays_near_viewport_bottom() {
+        let context = egui::Context::default();
+        let mut panel = SettingsPanel::new(UiConfig::default());
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                panel.show(ui);
+            },
+        );
+        output.textures_delta.clear();
+        let footer = context
+            .memory(|memory| memory.area_rect(egui::Id::new("settings_actions_footer")))
+            .expect("settings footer area");
+        assert!(
+            footer.top() > 480.0,
+            "footer should be fixed below scroll content"
+        );
+        assert!(footer.bottom() <= 600.0);
+
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(egui::pos2(400.0, 300.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -320.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                panel.show(ui);
+            },
+        );
+        output.textures_delta.clear();
+        let after_scroll = context
+            .memory(|memory| memory.area_rect(egui::Id::new("settings_actions_footer")))
+            .expect("settings footer after scroll");
+        assert_eq!(footer.min, after_scroll.min);
+        assert_eq!(footer.max, after_scroll.max);
     }
 }

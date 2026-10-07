@@ -22,7 +22,9 @@ pub(crate) const WORD_EDITOR_FONT_FAMILY: &str = "word_editor_chinese";
 
 use crate::ai::{self, AiCandidate, TranslationDirection};
 use crate::components::ocr_selection::{OcrSelection, SelectionAction};
-use crate::components::settings::{AiKeyUpdate, SettingsPanel, shortcut_pressed};
+use crate::components::settings::{
+    AiKeyUpdate, SettingsPanel, shortcut_pressed, shortcut_released,
+};
 use crate::components::voice_overlay::VoiceOverlay;
 use crate::domain::ai_word_save;
 use crate::domain::continuous_input::ContinuousInput;
@@ -48,15 +50,20 @@ pub(crate) struct UiConfig {
     pub(crate) continuous_input: bool,
     pub(crate) ai_translation: bool,
     pub(crate) ai_auto_save: bool,
+    #[serde(alias = "ai_korean_honorific")]
+    pub(crate) ai_polite_mode: bool,
     pub(crate) ocr_auto_translate: bool,
     pub(crate) voice_auto_copy_first: bool,
     pub(crate) voice_aion2_manual_paste: bool,
     pub(crate) voice_keep_input: bool,
+    pub(crate) voice_hold_to_talk: bool,
+    pub(crate) voice_silence_seconds: f32,
     pub(crate) voice_backend: String,
     pub(crate) voice_language: String,
     pub(crate) clear_on_focus_return: bool,
     pub(crate) translation_language: String,
     pub(crate) source_language: String,
+    pub(crate) ui_language: String,
     pub(crate) text_color: String,
     pub(crate) selected_color: String,
     pub(crate) selected_text_color: String,
@@ -73,15 +80,19 @@ impl Default for UiConfig {
             continuous_input: false,
             ai_translation: false,
             ai_auto_save: true,
+            ai_polite_mode: false,
             ocr_auto_translate: true,
             voice_auto_copy_first: true,
             voice_aion2_manual_paste: false,
             voice_keep_input: false,
-            voice_backend: "whisper".to_string(),
+            voice_hold_to_talk: false,
+            voice_silence_seconds: 0.6,
+            voice_backend: "sensevoice".to_string(),
             voice_language: "auto".to_string(),
             clear_on_focus_return: false,
             translation_language: String::new(),
             source_language: "auto".to_string(),
+            ui_language: "zh-CN".to_string(),
             text_color: "#24272E".to_string(),
             selected_color: "#A9CEFF".to_string(),
             selected_text_color: "#0B57D0".to_string(),
@@ -182,14 +193,24 @@ impl UiConfig {
         self.results.font_size = self.results.font_size.clamp(8.0, 72.0);
         self.results.corner_radius = self.results.corner_radius.clamp(0.0, 100.0);
         self.results.max_visible_results = self.results.max_visible_results.clamp(1, 100);
+        if !self.voice_silence_seconds.is_finite() {
+            self.voice_silence_seconds = 0.6;
+        }
+        self.voice_silence_seconds = self.voice_silence_seconds.clamp(0.2, 3.0);
+        self.voice_silence_seconds = (self.voice_silence_seconds * 10.0).round() / 10.0;
         self.gap = self.gap.clamp(0.0, 40.0);
         self.selected_opacity = self.selected_opacity.clamp(0.0, 1.0);
         self.translation_language =
             translation_language::normalize_language_code(&self.translation_language);
         self.source_language = translation_language::normalize_source_code(&self.source_language);
+        self.ui_language = crate::i18n::UiLanguage::from_code(&self.ui_language)
+            .code()
+            .to_string();
         self.voice_language = translation_language::normalize_source_code(&self.voice_language);
-        if !cfg!(feature = "windows-speech") || self.voice_backend != "windows" {
-            self.voice_backend = "whisper".to_string();
+        if !matches!(self.voice_backend.as_str(), "sensevoice" | "whisper")
+            && !(cfg!(feature = "windows-speech") && self.voice_backend == "windows")
+        {
+            self.voice_backend = "sensevoice".to_string();
         }
         self
     }
@@ -854,12 +875,12 @@ impl OcrPreview {
     }
 }
 
-fn translate_ocr_recognized(recognized: &str, target: &str) -> Result<String> {
+fn translate_ocr_recognized(recognized: &str, target: &str, polite_mode: bool) -> Result<String> {
     let key = credentials::load_key()
         .context("读取 DeepSeek API Key 失败")?
         .filter(|key| !key.trim().is_empty())
         .context("未配置 DeepSeek API Key")?;
-    ai::translate_ocr_text(recognized, target, &key)
+    ai::translate_ocr_text(recognized, target, &key, polite_mode)
 }
 
 fn ocr_translation_target(enabled: bool, source: &str) -> Option<String> {
@@ -891,6 +912,7 @@ struct MatchApp {
     ai_state: AiState,
     ocr_state: OcrState,
     voice_session: Option<VoiceSession>,
+    voice_hold_active: bool,
     voice_overlay: Option<VoiceOverlay>,
     voice_translation: Option<(u64, Receiver<Result<AiCandidate>>)>,
     voice_pending: VecDeque<(u64, String)>,
@@ -982,6 +1004,7 @@ impl MatchApp {
             ai_state: AiState::Idle,
             ocr_state: OcrState::Idle,
             voice_session: None,
+            voice_hold_active: false,
             voice_overlay: None,
             voice_translation: None,
             voice_pending: VecDeque::new(),
@@ -1264,8 +1287,10 @@ impl MatchApp {
                         &self.config.source_language,
                     ) {
                         let (sender, receiver) = mpsc::channel();
+                        let polite_mode = self.config.ai_polite_mode;
                         std::thread::spawn(move || {
-                            let _ = sender.send(translate_ocr_recognized(&text, &target));
+                            let _ =
+                                sender.send(translate_ocr_recognized(&text, &target, polite_mode));
                         });
                         preview.translating = Some(receiver);
                         preview.display = Some(("正在翻译…".to_string(), false));
@@ -1338,6 +1363,9 @@ impl MatchApp {
 
     fn toggle_voice(&mut self, context: &egui::Context) {
         if let Some(session) = &mut self.voice_session {
+            if self.voice_hold_active {
+                return;
+            }
             session.stop();
             session.trace.record(0, "manual_stop_requested", None, "ok");
             if let Some(overlay) = &mut self.voice_overlay {
@@ -1360,14 +1388,26 @@ impl MatchApp {
         self.voice_last_logged_drawn_original_id = 0;
         self.voice_active_utterance_id = 0;
         let mut overlay = VoiceOverlay::new(self.voice_work_area(context));
+        let hold_to_talk = self.config.voice_hold_to_talk;
+        overlay.status = if hold_to_talk {
+            "请按住快捷键说话，松开后停止录音".to_string()
+        } else {
+            format!(
+                "请说话；停顿约 {:.1} 秒后自动识别",
+                self.config.voice_silence_seconds
+            )
+        };
         match voice::start(
-            self.config.voice_keep_input,
+            self.config.voice_keep_input || hold_to_talk,
+            hold_to_talk,
             &self.config.voice_language,
             &self.config.voice_backend,
+            self.config.voice_silence_seconds,
         ) {
             Ok(session) => {
                 self.voice_trace = Some(session.trace.clone());
                 self.voice_session = Some(session);
+                self.voice_hold_active = hold_to_talk;
                 self.system_tray.set_status("语音识别正在录音");
             }
             Err(error) => {
@@ -1378,6 +1418,20 @@ impl MatchApp {
         }
         self.voice_overlay = Some(overlay);
         context.request_repaint();
+    }
+
+    fn stop_held_voice(&mut self) {
+        if !self.voice_hold_active {
+            return;
+        }
+        self.voice_hold_active = false;
+        if let Some(session) = &mut self.voice_session {
+            session.stop();
+            session.trace.record(0, "hold_released", None, "ok");
+            if let Some(overlay) = &mut self.voice_overlay {
+                overlay.status = "已松开快捷键，正在处理最后一句…".to_string();
+            }
+        }
     }
 
     fn poll_voice(&mut self, context: &egui::Context) {
@@ -1460,6 +1514,7 @@ impl MatchApp {
                 },
                 VoiceEvent::Stopped(error) => {
                     self.voice_session = None;
+                    self.voice_hold_active = false;
                     if let Some(trace) = &self.voice_trace {
                         trace.record(
                             0,
@@ -1537,7 +1592,11 @@ impl MatchApp {
                     let input_started = Instant::now();
                     // 翻译完成时再选目标，允许持续录音期间切换到另一个输入窗口。
                     let typed = VoiceInputTarget::capture().map_or(Ok(None), |target| {
-                        target.type_if_active(&translated, self.config.voice_aion2_manual_paste)
+                        target.type_if_active(
+                            &translated,
+                            self.config.voice_aion2_manual_paste,
+                            self.config.voice_hold_to_talk,
+                        )
                     });
                     if let Some(trace) = &self.voice_trace {
                         trace.record(
@@ -1747,7 +1806,11 @@ impl MatchApp {
             }
             let input_started = Instant::now();
             let typed = VoiceInputTarget::capture().map_or(Ok(None), |target| {
-                target.type_if_active(&output, self.config.voice_aion2_manual_paste)
+                target.type_if_active(
+                    &output,
+                    self.config.voice_aion2_manual_paste,
+                    self.config.voice_hold_to_talk,
+                )
             });
             if let Some(trace) = &self.voice_trace {
                 trace.record(
@@ -1848,6 +1911,7 @@ impl MatchApp {
         let source = query.to_string();
         let source_language = self.active_source_language.clone();
         let target_language = self.config.translation_language.clone();
+        let polite_mode = self.config.ai_polite_mode;
         let reverse_language = if self.config.source_language == "auto" {
             "cn".to_string()
         } else {
@@ -1869,6 +1933,7 @@ impl MatchApp {
                 target_language,
                 reverse_language,
                 key,
+                polite_mode,
             );
             if let Some(trace) = &trace {
                 trace.record(
@@ -2464,6 +2529,7 @@ impl MatchApp {
         let source = self.input.trim().to_owned();
         let source_language = self.active_source_language.clone();
         let language = self.config.translation_language.clone();
+        let polite_mode = self.config.ai_polite_mode;
         let reverse_language = if self.config.source_language == "auto" {
             "cn".to_string()
         } else {
@@ -2477,6 +2543,7 @@ impl MatchApp {
                 language,
                 reverse_language,
                 key,
+                polite_mode,
             ));
         });
         self.ai_state = AiState::Loading(receiver);
@@ -2700,7 +2767,13 @@ impl eframe::App for MatchApp {
         let mut toggle_voice = self.settings_open
             && !recording_shortcut
             && shortcut_pressed(context, &self.config.hotkeys.voice);
+        let mut release_voice =
+            self.settings_open && shortcut_released(context, &self.config.hotkeys.voice);
         for event in GlobalHotKeyEvent::receiver().try_iter() {
+            if event.id == self.voice_hotkey.id() && event.state == HotKeyState::Released {
+                release_voice = true;
+                continue;
+            }
             if event.state != HotKeyState::Pressed || recording_shortcut {
                 continue;
             }
@@ -2724,6 +2797,9 @@ impl eframe::App for MatchApp {
             self.begin_ocr_capture(context);
         } else if toggle_voice {
             self.toggle_voice(context);
+        }
+        if release_voice {
+            self.stop_held_voice();
         }
         if let Some(overlay) = &self.voice_overlay {
             overlay.show(context);
@@ -3201,6 +3277,14 @@ fn configure_fonts(context: &egui::Context) {
                 r"C:\Windows\Fonts\simhei.ttf",
             ][..],
         ),
+        (
+            "system_japanese",
+            &[
+                r"C:\Windows\Fonts\YuGothM.ttc",
+                r"C:\Windows\Fonts\meiryo.ttc",
+                r"C:\Windows\Fonts\msgothic.ttc",
+            ][..],
+        ),
     ];
 
     let mut installed = Vec::new();
@@ -3311,15 +3395,19 @@ mod tests {
         assert_eq!(config.results.max_visible_results, 8);
         assert!(!config.continuous_input);
         assert!(config.ai_auto_save);
+        assert!(!config.ai_polite_mode);
         assert!(config.ocr_auto_translate);
         assert!(config.voice_auto_copy_first);
         assert!(!config.voice_aion2_manual_paste);
         assert!(!config.voice_keep_input);
-        assert_eq!(config.voice_backend, "whisper");
+        assert!(!config.voice_hold_to_talk);
+        assert_eq!(config.voice_silence_seconds, 0.6);
+        assert_eq!(config.voice_backend, "sensevoice");
         assert_eq!(config.voice_language, "auto");
         assert!(!config.clear_on_focus_return);
         assert!(config.translation_language.is_empty());
         assert_eq!(config.source_language, "auto");
+        assert_eq!(config.ui_language, "zh-CN");
     }
 
     #[cfg(not(feature = "windows-speech"))]
@@ -3329,7 +3417,32 @@ mod tests {
             voice_backend: "windows".to_string(),
             ..UiConfig::default()
         };
+        assert_eq!(config.normalized().voice_backend, "sensevoice");
+    }
+
+    #[test]
+    fn saved_whisper_backend_remains_available() {
+        let config = UiConfig {
+            voice_backend: "whisper".to_string(),
+            ..UiConfig::default()
+        };
         assert_eq!(config.normalized().voice_backend, "whisper");
+    }
+
+    #[test]
+    fn voice_pause_setting_is_clamped_and_old_configs_use_default() {
+        let old: UiConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.voice_silence_seconds, 0.6);
+        let short = UiConfig {
+            voice_silence_seconds: 0.01,
+            ..UiConfig::default()
+        };
+        assert_eq!(short.normalized().voice_silence_seconds, 0.2);
+        let long = UiConfig {
+            voice_silence_seconds: 9.0,
+            ..UiConfig::default()
+        };
+        assert_eq!(long.normalized().voice_silence_seconds, 3.0);
     }
 
     #[test]
@@ -3337,8 +3450,36 @@ mod tests {
         let config: UiConfig = serde_json::from_str(r#"{"ai_translation":true}"#).unwrap();
         assert!(config.ai_translation);
         assert!(config.ai_auto_save);
+        assert!(!config.ai_polite_mode);
         assert!(config.ocr_auto_translate);
         assert_eq!(config.source_language, "auto");
+        assert_eq!(config.ui_language, "zh-CN");
+    }
+
+    #[test]
+    fn ui_language_is_persisted_without_changing_translation_direction() {
+        let config: UiConfig = serde_json::from_str(
+            r#"{"ui_language":"ko","source_language":"cn","translation_language":"ja"}"#,
+        )
+        .unwrap();
+        let normalized = config.normalized();
+        assert_eq!(normalized.ui_language, "ko");
+        assert_eq!(normalized.source_language, "cn");
+        assert_eq!(normalized.translation_language, "ja");
+        let saved = serde_json::to_value(normalized).unwrap();
+        assert_eq!(saved["ui_language"], "ko");
+
+        let invalid: UiConfig = serde_json::from_str(r#"{"ui_language":"xx"}"#).unwrap();
+        assert_eq!(invalid.normalized().ui_language, "zh-CN");
+    }
+
+    #[test]
+    fn former_korean_honorific_setting_migrates_to_general_polite_mode() {
+        let config: UiConfig = serde_json::from_str(r#"{"ai_korean_honorific":true}"#).unwrap();
+        assert!(config.ai_polite_mode);
+        let saved = serde_json::to_value(config).unwrap();
+        assert_eq!(saved["ai_polite_mode"], true);
+        assert!(saved.get("ai_korean_honorific").is_none());
     }
 
     #[test]
@@ -3353,7 +3494,9 @@ mod tests {
         assert!(config.voice_auto_copy_first);
         assert!(!config.voice_aion2_manual_paste);
         assert!(!config.voice_keep_input);
-        assert_eq!(config.voice_backend, "whisper");
+        assert!(!config.voice_hold_to_talk);
+        assert_eq!(config.voice_silence_seconds, 0.6);
+        assert_eq!(config.voice_backend, "sensevoice");
         assert_eq!(config.voice_language, "auto");
         assert_eq!(config.hotkeys.voice, "ctrl+alt+v");
     }

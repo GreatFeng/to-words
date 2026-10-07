@@ -23,7 +23,7 @@ impl VoiceOverlay {
             monitor_work_area,
             original: String::new(),
             result: String::new(),
-            status: "请说话；停顿约一秒后自动识别".to_string(),
+            status: "请说话；停顿约 0.6 秒后自动识别".to_string(),
             original_utterance_id: 0,
             drawn_original_id: Arc::new(AtomicU64::new(0)),
             border_suppressed: Arc::new(AtomicBool::new(false)),

@@ -3,6 +3,7 @@
 //! 面板加载可合并的词库文件、保存用户勾选状态，并调用领域层完成去重和合并。
 //! `WordMergePanel` 同时维护操作提示与“合并后重新加载词库”的请求状态。
 
+use crate::i18n::{self, tr};
 use crate::ui_theme;
 use crate::word_merge::{list_word_library_files, merge_selected_word_files};
 use eframe::egui;
@@ -59,19 +60,19 @@ impl WordMergePanel {
                 }
                 ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new("TO WORDS / MERGE")
+                    egui::RichText::new(tr("TO WORDS / MERGE"))
                         .monospace()
                         .size(11.0)
                         .color(ui_theme::muted_text()),
                 );
                 ui.label(
-                    egui::RichText::new("选择要合并的词库")
+                    egui::RichText::new(tr("选择要合并的词库"))
                         .size(27.0)
                         .strong()
                         .color(ui_theme::primary_text()),
                 );
                 ui.label(
-                    egui::RichText::new("勾选一个或多个来源文件，内容将写入当前语言词库。")
+                    egui::RichText::new(tr("勾选一个或多个来源文件，内容将写入当前语言词库。"))
                         .size(13.0)
                         .color(ui_theme::muted_text()),
                 );
@@ -103,10 +104,12 @@ impl WordMergePanel {
                     .filter(|candidate| candidate.selected)
                     .count();
                 ui.label(
-                    egui::RichText::new(format!(
-                        "词库目录中共有 {} 个可选文件，已选择 {} 个",
-                        self.candidates.len(),
-                        selected_count
+                    egui::RichText::new(i18n::message(
+                        "词库目录中共有 {total} 个可选文件，已选择 {selected} 个",
+                        &[
+                            ("total", &self.candidates.len().to_string()),
+                            ("selected", &selected_count.to_string()),
+                        ],
                     ))
                     .size(12.0)
                     .color(ui_theme::muted_text()),
@@ -130,7 +133,7 @@ impl WordMergePanel {
                                     ui.add_space(20.0);
                                     ui.centered_and_justified(|ui| {
                                         ui.label(
-                                            egui::RichText::new("没有其他可合并的 JSON 词库")
+                                            egui::RichText::new(tr("没有其他可合并的 JSON 词库"))
                                                 .color(ui_theme::muted_text()),
                                         );
                                     });
@@ -148,7 +151,7 @@ impl WordMergePanel {
                         .add_enabled(
                             enabled,
                             egui::Button::new(
-                                egui::RichText::new("合并所选词库")
+                                egui::RichText::new(tr("合并所选词库"))
                                     .size(14.0)
                                     .strong()
                                     .color(egui::Color32::WHITE),
@@ -183,7 +186,13 @@ impl WordMergePanel {
             }
             Err(error) => {
                 self.candidates.clear();
-                self.message = Some((format!("无法读取词库目录：{error:#}"), true));
+                self.message = Some((
+                    i18n::message(
+                        "无法读取词库目录：{error}",
+                        &[("error", &format!("{error:#}"))],
+                    ),
+                    true,
+                ));
             }
         }
     }
@@ -199,19 +208,24 @@ impl WordMergePanel {
             Ok(report) => {
                 self.reload_requested = true;
                 self.message = Some((
-                    format!(
-                        "已合并 {} 个词库：新增 {} 项，跳过重复 {} 项，覆盖冲突 {} 项，当前共 {} 项。",
-                        report.source_files,
-                        report.added,
-                        report.duplicates,
-                        report.conflicts,
-                        report.total
+                    i18n::message(
+                        "已合并 {files} 个词库：新增 {added} 项，跳过重复 {duplicates} 项，覆盖冲突 {conflicts} 项，当前共 {total} 项。",
+                        &[
+                            ("files", &report.source_files.to_string()),
+                            ("added", &report.added.to_string()),
+                            ("duplicates", &report.duplicates.to_string()),
+                            ("conflicts", &report.conflicts.to_string()),
+                            ("total", &report.total.to_string()),
+                        ],
                     ),
                     false,
                 ));
             }
             Err(error) => {
-                self.message = Some((format!("词库合并失败：{error:#}"), true));
+                self.message = Some((
+                    i18n::message("词库合并失败：{error}", &[("error", &format!("{error:#}"))]),
+                    true,
+                ));
             }
         }
     }
@@ -226,7 +240,7 @@ fn target_card(ui: &mut egui::Ui, file_name: &str) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
-                egui::RichText::new("合并目标")
+                egui::RichText::new(tr("合并目标"))
                     .size(11.0)
                     .color(ui_theme::muted_text()),
             );
@@ -265,7 +279,7 @@ fn secondary_button(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response
     ui.add_sized(
         [width, 34.0],
         egui::Button::new(
-            egui::RichText::new(text)
+            egui::RichText::new(tr(text))
                 .size(13.0)
                 .strong()
                 .color(ui_theme::primary_text()),

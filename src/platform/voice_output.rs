@@ -93,6 +93,7 @@ impl VoiceInputTarget {
         self,
         text: &str,
         aion2_manual_paste: bool,
+        wait_for_shortcut_release: bool,
     ) -> Result<Option<VoiceInputMethod>> {
         if text.is_empty() || !self.is_active() {
             return Ok(None);
@@ -113,6 +114,15 @@ impl VoiceInputTarget {
             }
             anyhow::bail!("Aion2 尚未接入可用的文本服务；不会发送模拟 Ctrl+V");
         }
+        if wait_for_shortcut_release {
+            let started = std::time::Instant::now();
+            while modifiers_pressed() && started.elapsed() < std::time::Duration::from_millis(400) {
+                if !self.is_active() {
+                    return Ok(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         if modifiers_pressed() {
             return Ok(None);
         }
@@ -128,6 +138,7 @@ impl VoiceInputTarget {
         self,
         _text: &str,
         _aion2_manual_paste: bool,
+        _wait_for_shortcut_release: bool,
     ) -> Result<Option<VoiceInputMethod>> {
         Ok(None)
     }

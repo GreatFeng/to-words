@@ -12,6 +12,7 @@ mod ai;
 mod app;
 mod components;
 mod domain;
+mod i18n;
 mod platform;
 mod ui;
 

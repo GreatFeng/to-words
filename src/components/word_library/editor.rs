@@ -4,6 +4,7 @@
 //! 本文件按“数据加载与校验、表格分页编辑、搜索定位、批量导入导出、保存反馈”
 //! 组织代码；表格每页最多展示 `TABLE_PAGE_SIZE` 条，以控制大词库的绘制成本。
 
+use crate::i18n::{self, tr};
 use crate::{WORD_EDITOR_FONT_FAMILY, prepare_word_library_file, ui_theme, word_library_directory};
 use eframe::egui;
 use std::collections::BTreeMap;
@@ -80,7 +81,13 @@ impl WordEditor {
             Err(error) => {
                 state.rows.clear();
                 state.content.clear();
-                state.message = Some((format!("无法准备词库目录：{error:#}"), true));
+                state.message = Some((
+                    i18n::message(
+                        "无法准备词库目录：{error}",
+                        &[("error", &format!("{error:#}"))],
+                    ),
+                    true,
+                ));
                 return;
             }
         };
@@ -90,7 +97,13 @@ impl WordEditor {
                 match parse_words(&state.content) {
                     Ok(words) => {
                         state.rows = map_to_rows(&words);
-                        state.message = Some((format!("已载入 {} 个词条。", words.len()), false));
+                        state.message = Some((
+                            i18n::message(
+                                "已载入 {count} 个词条。",
+                                &[("count", &words.len().to_string())],
+                            ),
+                            false,
+                        ));
                     }
                     Err(error) => {
                         state.rows.clear();
@@ -102,7 +115,13 @@ impl WordEditor {
             Err(error) => {
                 state.rows.clear();
                 state.content.clear();
-                state.message = Some((format!("无法读取 {file_name}：{error}"), true));
+                state.message = Some((
+                    i18n::message(
+                        "无法读取 {file}：{error}",
+                        &[("file", file_name), ("error", &error.to_string())],
+                    ),
+                    true,
+                ));
             }
         }
     }
@@ -171,27 +190,32 @@ impl WordEditorState {
                 }
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("TO WORDS / LIBRARY")
+                    egui::RichText::new(tr("TO WORDS / LIBRARY"))
                         .monospace()
                         .size(11.0)
                         .color(ui_theme::muted_text()),
                 );
                 ui.label(
-                    egui::RichText::new("词库编辑器")
+                    egui::RichText::new(tr("词库编辑器"))
                         .size(27.0)
                         .strong()
                         .color(ui_theme::primary_text()),
                 );
                 ui.label(
-                    egui::RichText::new("使用结构化表格维护词条，或在高级模式中直接编辑 JSON。")
-                        .size(13.0)
-                        .color(ui_theme::muted_text()),
+                    egui::RichText::new(tr(
+                        "使用结构化表格维护词条，或在高级模式中直接编辑 JSON。",
+                    ))
+                    .size(13.0)
+                    .color(ui_theme::muted_text()),
                 );
                 ui.label(
-                    egui::RichText::new(format!("当前文件：{}", self.file_name))
-                        .monospace()
-                        .size(12.0)
-                        .color(ui_theme::muted_text()),
+                    egui::RichText::new(i18n::message(
+                        "当前文件：{file}",
+                        &[("file", &self.file_name)],
+                    ))
+                    .monospace()
+                    .size(12.0)
+                    .color(ui_theme::muted_text()),
                 );
                 ui.add_space(16.0);
                 self.draw_mode_toolbar(ui);
@@ -297,7 +321,7 @@ impl WordEditorState {
                         ui_theme::pale_green(),
                         ui_theme::green_text(),
                     ),
-                    "将格式化后的 JSON 导出到 word_libraries 词库目录",
+                    tr("将格式化后的 JSON 导出到 word_libraries 词库目录"),
                 )
                 .clicked()
                 {
@@ -331,7 +355,9 @@ impl WordEditorState {
     }
 
     fn draw_table_editor(&mut self, ui: &mut egui::Ui) {
-        ui.label("默认使用 key/value 表格编辑；保存时会自动剔除重复 key 和空白项。");
+        ui.label(tr(
+            "默认使用 key/value 表格编辑；保存时会自动剔除重复 key 和空白项。",
+        ));
         let mut search_changed = false;
         egui::Frame::new()
             .fill(ui_theme::surface())
@@ -342,7 +368,7 @@ impl WordEditorState {
                 search_changed = ui
                     .add(
                         egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text("筛选 key 或 value…")
+                            .hint_text(tr("筛选 key 或 value…"))
                             .font(editor_font(15.0))
                             .desired_width(f32::INFINITY)
                             .frame(egui::Frame::NONE),
@@ -394,14 +420,14 @@ impl WordEditorState {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.add_sized(
                             [key_width, 22.0],
-                            egui::Label::new(egui::RichText::new("Key").strong()),
+                            egui::Label::new(egui::RichText::new(tr("Key")).strong()),
                         );
                         ui.add_sized(
                             [value_width, 22.0],
-                            egui::Label::new(egui::RichText::new("Value").strong()),
+                            egui::Label::new(egui::RichText::new(tr("Value")).strong()),
                         );
-                        ui.add_sized([action_width, 22.0], egui::Label::new("复制"));
-                        ui.add_sized([action_width, 22.0], egui::Label::new("删除"));
+                        ui.add_sized([action_width, 22.0], egui::Label::new(tr("复制")));
+                        ui.add_sized([action_width, 22.0], egui::Label::new(tr("删除")));
                     });
                 });
 
@@ -468,7 +494,7 @@ impl WordEditorState {
         });
         if visible_rows == 0 {
             ui.centered_and_justified(|ui| {
-                ui.label(egui::RichText::new("没有符合筛选条件的词条").weak());
+                ui.label(egui::RichText::new(tr("没有符合筛选条件的词条")).weak());
             });
         } else {
             ui.add_space(10.0);
@@ -478,13 +504,15 @@ impl WordEditorState {
                     self.scroll_table_to_top = true;
                 }
                 ui.label(
-                    egui::RichText::new(format!(
-                        "第 {} / {} 页　{}–{} / {} 条",
-                        self.table_page + 1,
-                        page_count,
-                        page_start + 1,
-                        page_end,
-                        visible_rows
+                    egui::RichText::new(i18n::message(
+                        "第 {page} / {pages} 页　{start}–{end} / {total} 条",
+                        &[
+                            ("page", &(self.table_page + 1).to_string()),
+                            ("pages", &page_count.to_string()),
+                            ("start", &(page_start + 1).to_string()),
+                            ("end", &page_end.to_string()),
+                            ("total", &visible_rows.to_string()),
+                        ],
                     ))
                     .monospace()
                     .size(12.0)
@@ -502,7 +530,7 @@ impl WordEditorState {
     }
 
     fn draw_json_editor(&mut self, ui: &mut egui::Ui) {
-        ui.label("高级模式：直接修改 JSON。key 和 value 都必须是字符串。");
+        ui.label(tr("高级模式：直接修改 JSON。key 和 value 都必须是字符串。"));
         let search_id = egui::Id::new("user_words_search_input");
         let editor_id = egui::Id::new("user_words_json_editor");
         if ui.memory(|memory| memory.has_focus(search_id)) && !self.search_query.is_empty() {
@@ -604,7 +632,7 @@ impl WordEditorState {
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .id(search_id)
-                            .hint_text("搜索中文或韩文…")
+                            .hint_text(tr("搜索文字…"))
                             .font(editor_font(15.0))
                             .desired_width(search_width)
                             .frame(egui::Frame::NONE),
@@ -613,7 +641,7 @@ impl WordEditorState {
                         self.search_from = 0;
                     }
                     search |= ui
-                        .add_sized([88.0, 34.0], egui::Button::new("查找下一个"))
+                        .add_sized([100.0, 34.0], egui::Button::new(tr("查找下一个")))
                         .clicked();
                 });
             });
@@ -638,12 +666,14 @@ impl WordEditorState {
             .inner_margin(egui::Margin::same(18))
             .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("BATCH IMPORT")
+                    egui::RichText::new(tr("BATCH IMPORT"))
                         .monospace()
                         .size(11.0)
                         .color(ui_theme::muted_text()),
                 );
-                ui.label("粘贴 JSON 对象；导入内容会追加到现有表格，重复 key 在保存时去重。");
+                ui.label(tr(
+                    "粘贴 JSON 对象；导入内容会追加到现有表格，重复 key 在保存时去重。",
+                ));
                 ui.add_sized(
                     [
                         ui.available_width(),
@@ -678,9 +708,7 @@ impl WordEditorState {
                         close = true;
                     }
                 });
-                if let Some((message, true)) = &self.message
-                    && message.starts_with("批量导入失败")
-                {
+                if let Some((message, true)) = &self.message {
                     ui.colored_label(ui_theme::red_text(), message);
                 }
             });
@@ -689,11 +717,23 @@ impl WordEditorState {
                 Ok(words) => {
                     let count = words.len();
                     self.rows.extend(map_to_rows(&words));
-                    self.message = Some((format!("已批量导入 {count} 个词条。"), false));
+                    self.message = Some((
+                        i18n::message(
+                            "已批量导入 {count} 个词条。",
+                            &[("count", &count.to_string())],
+                        ),
+                        false,
+                    ));
                     close = true;
                 }
                 Err(error) => {
-                    self.message = Some((format!("批量导入失败，JSON 格式错误：{error}"), true));
+                    self.message = Some((
+                        i18n::message(
+                            "批量导入失败，JSON 格式错误：{error}",
+                            &[("error", &error.to_string())],
+                        ),
+                        true,
+                    ));
                 }
             }
         }
@@ -716,18 +756,20 @@ impl WordEditorState {
             .inner_margin(egui::Margin::same(20))
             .show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("BATCH EXPORT")
+                    egui::RichText::new(tr("BATCH EXPORT"))
                         .monospace()
                         .size(11.0)
                         .color(ui_theme::muted_text()),
                 );
-                ui.label("请输入导出文件名，文件将保存到 word_libraries 词库目录：");
+                ui.label(tr(
+                    "请输入导出文件名，文件将保存到 word_libraries 词库目录：",
+                ));
                 ui.add_space(8.0);
                 let response = ui.add_sized(
                     [ui.available_width(), 36.0],
                     egui::TextEdit::singleline(&mut self.batch_export_file_name)
                         .font(editor_font(15.0))
-                        .hint_text("例如：my_words.json"),
+                        .hint_text(tr("例如：my_words.json")),
                 );
                 export |=
                     response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
@@ -751,11 +793,7 @@ impl WordEditorState {
                         close = true;
                     }
                 });
-                if let Some((message, true)) = &self.message
-                    && (message.starts_with("导出失败")
-                        || message.starts_with("批量导出失败")
-                        || message.starts_with("无法导出"))
-                {
+                if let Some((message, true)) = &self.message {
                     ui.colored_label(ui_theme::red_text(), message);
                 }
             });
@@ -778,26 +816,50 @@ impl WordEditorState {
         let content = match format_words(&words) {
             Ok(content) => content,
             Err(error) => {
-                self.message = Some((format!("批量导出失败：{error}"), true));
+                self.message = Some((
+                    i18n::message("批量导出失败：{error}", &[("error", &error.to_string())]),
+                    true,
+                ));
                 return false;
             }
         };
         let directory = word_library_directory();
         if let Err(error) = fs::create_dir_all(&directory) {
-            self.message = Some((format!("无法创建词库目录：{error}"), true));
+            self.message = Some((
+                i18n::message(
+                    "无法创建词库目录：{error}",
+                    &[("error", &error.to_string())],
+                ),
+                true,
+            ));
             return false;
         }
         let path = directory.join(&file_name);
         match fs::write(&path, content) {
             Ok(()) => {
                 self.message = Some((
-                    format!("已导出 {} 个词条到 {}。", words.len(), path.display()),
+                    i18n::message(
+                        "已导出 {count} 个词条到 {path}。",
+                        &[
+                            ("count", &words.len().to_string()),
+                            ("path", &path.display().to_string()),
+                        ],
+                    ),
                     false,
                 ));
                 true
             }
             Err(error) => {
-                self.message = Some((format!("无法导出到 {}：{error}", path.display()), true));
+                self.message = Some((
+                    i18n::message(
+                        "无法导出到 {path}：{error}",
+                        &[
+                            ("path", &path.display().to_string()),
+                            ("error", &error.to_string()),
+                        ],
+                    ),
+                    true,
+                ));
                 false
             }
         }
@@ -806,7 +868,7 @@ impl WordEditorState {
     fn find_next(&mut self) {
         let query = self.search_query.as_str();
         if query.is_empty() {
-            self.message = Some(("请输入要搜索的中文或韩文。".to_string(), true));
+            self.message = Some((tr("请输入要搜索的文字。").to_string(), true));
             return;
         }
         let from = self.search_from.min(self.content.len());
@@ -816,7 +878,10 @@ impl WordEditorState {
             .or_else(|| self.content[..from].find(query));
         let Some(start) = found else {
             self.search_from = 0;
-            self.message = Some((format!("没有找到“{query}”。"), true));
+            self.message = Some((
+                i18n::message("没有找到“{query}”。", &[("query", query)]),
+                true,
+            ));
             return;
         };
         let end = start + query.len();
@@ -825,14 +890,26 @@ impl WordEditorState {
             self.content[..start].chars().count(),
             self.content[..end].chars().count(),
         ));
-        self.message = Some((format!("已找到“{query}”，继续查找将定位下一处。"), false));
+        self.message = Some((
+            i18n::message(
+                "已找到“{query}”，继续查找将定位下一处。",
+                &[("query", query)],
+            ),
+            false,
+        ));
     }
 
     fn check_format(&mut self) {
         match parse_words(&self.content) {
             Ok(words) => {
                 self.error_line = None;
-                self.message = Some((format!("JSON 格式正确，共 {} 个词条。", words.len()), false));
+                self.message = Some((
+                    i18n::message(
+                        "JSON 格式正确，共 {count} 个词条。",
+                        &[("count", &words.len().to_string())],
+                    ),
+                    false,
+                ));
             }
             Err(error) => self.show_json_error("JSON 格式错误", &error),
         }
@@ -852,19 +929,34 @@ impl WordEditorState {
         let formatted = match format_words(&words) {
             Ok(formatted) => formatted,
             Err(error) => {
-                self.message = Some((format!("格式化失败：{error}"), true));
+                self.message = Some((
+                    i18n::message("格式化失败：{error}", &[("error", &error.to_string())]),
+                    true,
+                ));
                 return false;
             }
         };
         let path = match prepare_word_library_file(&self.file_name) {
             Ok(path) => path,
             Err(error) => {
-                self.message = Some((format!("无法准备词库目录：{error:#}"), true));
+                self.message = Some((
+                    i18n::message(
+                        "无法准备词库目录：{error}",
+                        &[("error", &format!("{error:#}"))],
+                    ),
+                    true,
+                ));
                 return false;
             }
         };
         if let Err(error) = fs::write(&path, &formatted) {
-            self.message = Some((format!("保存 {} 失败：{error}", self.file_name), true));
+            self.message = Some((
+                i18n::message(
+                    "保存 {file} 失败：{error}",
+                    &[("file", &self.file_name), ("error", &error.to_string())],
+                ),
+                true,
+            ));
             return false;
         }
 
@@ -873,12 +965,14 @@ impl WordEditorState {
         self.error_line = None;
         self.reload_requested = true;
         self.message = Some((
-            format!(
-                "已保存 {} 个词条；剔除重复 key {} 项、空 key {} 项、空 value {} 项。",
-                words.len(),
-                removed.duplicates,
-                removed.empty_keys,
-                removed.empty_values
+            i18n::message(
+                "已保存 {count} 个词条；剔除重复 key {duplicates} 项、空 key {empty_keys} 项、空 value {empty_values} 项。",
+                &[
+                    ("count", &words.len().to_string()),
+                    ("duplicates", &removed.duplicates.to_string()),
+                    ("empty_keys", &removed.empty_keys.to_string()),
+                    ("empty_values", &removed.empty_values.to_string()),
+                ],
             ),
             false,
         ));
@@ -891,7 +985,15 @@ impl WordEditorState {
         self.error_line = Some(line);
         self.pending_scroll_char = Some(line_start_char_index(&self.content, line));
         self.message = Some((
-            format!("{prefix}（第 {line} 行，第 {column} 列）：{error}"),
+            i18n::message(
+                "{prefix}（第 {line} 行，第 {column} 列）：{error}",
+                &[
+                    ("prefix", tr(prefix)),
+                    ("line", &line.to_string()),
+                    ("column", &column.to_string()),
+                    ("error", &error.to_string()),
+                ],
+            ),
             true,
         ));
     }
@@ -947,19 +1049,19 @@ fn table_page_bounds(total: usize, requested_page: usize) -> (usize, usize, usiz
 fn normalized_export_file_name(input: &str) -> Result<String, String> {
     let input = input.trim();
     if input.is_empty() {
-        return Err("导出失败：文件名不能为空。".to_string());
+        return Err(tr("导出失败：文件名不能为空。").to_string());
     }
     let path = Path::new(input);
     if path.components().count() != 1
         || path.file_name().and_then(|name| name.to_str()) != Some(input)
     {
-        return Err("导出失败：请只输入文件名，不要包含目录路径。".to_string());
+        return Err(tr("导出失败：请只输入文件名，不要包含目录路径。").to_string());
     }
     if input
         .chars()
         .any(|character| "<>:\"/\\|?*".contains(character))
     {
-        return Err("导出失败：文件名包含 Windows 不允许的字符。".to_string());
+        return Err(tr("导出失败：文件名包含 Windows 不允许的字符。").to_string());
     }
     if input.to_ascii_lowercase().ends_with(".json") {
         Ok(input.to_string())
@@ -1024,7 +1126,7 @@ fn action_button(
     ui.add_sized(
         [112.0, 40.0],
         egui::Button::new(
-            egui::RichText::new(text)
+            egui::RichText::new(tr(text))
                 .size(15.0)
                 .strong()
                 .color(text_color),
@@ -1039,7 +1141,7 @@ fn back_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add_sized(
         [128.0, 34.0],
         egui::Button::new(
-            egui::RichText::new(text)
+            egui::RichText::new(tr(text))
                 .size(13.0)
                 .strong()
                 .color(ui_theme::muted_text()),
@@ -1068,10 +1170,15 @@ fn filled_toolbar_button(
 ) -> egui::Response {
     ui.add_sized(
         [width, 36.0],
-        egui::Button::new(egui::RichText::new(text).size(14.0).strong().color(color))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, ui_theme::border()))
-            .corner_radius(6),
+        egui::Button::new(
+            egui::RichText::new(tr(text))
+                .size(14.0)
+                .strong()
+                .color(color),
+        )
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, ui_theme::border()))
+        .corner_radius(6),
     )
 }
 
@@ -1079,7 +1186,7 @@ fn page_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
     ui.add_enabled(
         enabled,
         egui::Button::new(
-            egui::RichText::new(text)
+            egui::RichText::new(tr(text))
                 .size(12.5)
                 .color(ui_theme::primary_text()),
         )
@@ -1098,10 +1205,15 @@ fn row_action_button(
 ) -> egui::Response {
     ui.add_sized(
         [52.0, 32.0],
-        egui::Button::new(egui::RichText::new(text).size(13.0).strong().color(color))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, ui_theme::border()))
-            .corner_radius(6),
+        egui::Button::new(
+            egui::RichText::new(tr(text))
+                .size(13.0)
+                .strong()
+                .color(color),
+        )
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, ui_theme::border()))
+        .corner_radius(6),
     )
 }
 

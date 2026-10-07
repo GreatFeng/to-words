@@ -1,8 +1,9 @@
-//! 本地语音识别：Windows 麦克风录音，支持 whisper.cpp 与实验版 Windows AI 桥接引擎。
+//! 本地语音识别：Windows 麦克风录音，默认使用 SenseVoice，也支持 Whisper 和实验版 Windows AI。
 //!
 //! 录音始终在后台线程进行。连续两帧检测到语音后开始收集句子，
-//! 约一秒静音后自动提交；保持输入时继续收集下一句。
+//! 约 0.6 秒静音后自动提交；保持输入时继续收集下一句。
 
+use crate::i18n::{self, tr};
 use crate::platform::voice_metrics::VoiceTrace;
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -16,7 +17,6 @@ use std::time::{Duration, Instant};
 const SAMPLE_RATE: usize = 16_000;
 const MAX_SECONDS: usize = 90;
 const MAX_UTTERANCE_SECONDS: usize = 30;
-const SILENCE_SAMPLES: usize = SAMPLE_RATE * 9 / 10;
 const CALIBRATION_FRAMES: usize = 4;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -35,6 +35,7 @@ pub(crate) struct VoiceSession {
 }
 
 enum RecognitionEngine {
+    SenseVoice(PathBuf, PathBuf, PathBuf),
     Whisper(PathBuf, PathBuf),
     #[cfg(feature = "windows-speech")]
     Windows(PathBuf),
@@ -49,18 +50,48 @@ impl VoiceSession {
 
 pub(crate) fn engine_status(backend: &str) -> String {
     match selected_engine(backend) {
-        Ok(RecognitionEngine::Whisper(_, model)) => format!(
-            "whisper.cpp 模型：{}",
-            model
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("未知模型")
+        Ok(RecognitionEngine::SenseVoice(_, model, _)) => i18n::message(
+            "SenseVoice 模型：{model}",
+            &[(
+                "model",
+                model
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(tr("未知模型")),
+            )],
+        ),
+        Ok(RecognitionEngine::Whisper(_, model)) => i18n::message(
+            "whisper.cpp 模型：{model}",
+            &[(
+                "model",
+                model
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(tr("未知模型")),
+            )],
         ),
         #[cfg(feature = "windows-speech")]
         Ok(RecognitionEngine::Windows(_)) => {
-            "Windows 本地识别桥接程序已找到；需以 MSIX 身份运行并安装系统语音模型".to_string()
+            tr("Windows 本地识别桥接程序已找到；需以 MSIX 身份运行并安装系统语音模型").to_string()
         }
-        Err(error) => format!("语音识别尚未就绪：{error}"),
+        Err(error) => {
+            let detail = error.to_string();
+            let detail = if let Some(path) = detail.strip_prefix("缺少 SenseVoice 文件：") {
+                i18n::message("缺少 SenseVoice 文件：{path}", &[("path", path)])
+            } else if let Some(path) =
+                detail.strip_prefix("缺少多语言模型，请将 ggml-base.bin 放在 ")
+            {
+                i18n::message(
+                    "缺少多语言模型，请将 ggml-base.bin 放在 {path}",
+                    &[("path", path)],
+                )
+            } else if let Some(path) = detail.strip_prefix("缺少 ") {
+                i18n::message("缺少文件：{path}", &[("path", path)])
+            } else {
+                detail
+            };
+            i18n::message("语音识别尚未就绪：{error}", &[("error", &detail)])
+        }
     }
 }
 
@@ -85,13 +116,23 @@ pub(crate) fn prepare_windows_model() -> Result<String> {
             windows_bridge_error(&output)
         );
     }
-    Ok("Windows 本地语音模型已就绪".to_string())
+    Ok(tr("Windows 本地语音模型已就绪").to_string())
 }
 
-pub(crate) fn start(keep_input: bool, language: &str, backend: &str) -> Result<VoiceSession> {
+pub(crate) fn start(
+    keep_input: bool,
+    push_to_talk: bool,
+    language: &str,
+    backend: &str,
+    silence_seconds: f32,
+) -> Result<VoiceSession> {
     let engine = selected_engine(backend)?;
     let language = whisper_language(language).to_string();
     let trace_name = match &engine {
+        RecognitionEngine::SenseVoice(_, model, _) => model
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("sensevoice"),
         RecognitionEngine::Whisper(_, model) => model
             .file_name()
             .and_then(|name| name.to_str())
@@ -121,6 +162,7 @@ pub(crate) fn start(keep_input: bool, language: &str, backend: &str) -> Result<V
         let (segment_sender, segment_receiver) = mpsc::channel::<(u64, Vec<i16>)>();
         let asr_sender = sender.clone();
         let asr_trace = worker_trace.clone();
+        let asr_stop = Arc::clone(&worker_stop);
         let transcriber = std::thread::spawn(move || {
             for (utterance_id, samples) in segment_receiver {
                 let asr_started = Instant::now();
@@ -133,6 +175,11 @@ pub(crate) fn start(keep_input: bool, language: &str, backend: &str) -> Result<V
                     Some(asr_started.elapsed()),
                     if result.is_ok() { "ok" } else { "error" },
                 );
+                if push_to_talk {
+                    while !asr_stop.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
                 let _ = asr_sender.send(VoiceEvent::Utterance(utterance_id, result));
             }
         });
@@ -141,7 +188,7 @@ pub(crate) fn start(keep_input: bool, language: &str, backend: &str) -> Result<V
         let recorder = std::thread::spawn(move || {
             record_microphone(recorder_stop, audio_sender, keep_input, recorder_trace)
         });
-        let mut gate = SpeechGate::default();
+        let mut gate = SpeechGate::new(silence_seconds, !push_to_talk);
         let mut auto_stopped = false;
         let mut heard_speech = false;
         let mut utterance_id = 0;
@@ -207,7 +254,12 @@ pub(crate) fn start(keep_input: bool, language: &str, backend: &str) -> Result<V
             .map_err(|_| "麦克风录音线程意外终止".to_string())
             .and_then(|result| result.map_err(|error| format!("{error:#}")));
         // 手动停止时还没等到静音，仍提交最后一句；自动停止已经提交过，不再重复识别。
-        if !auto_stopped && let Some(segment) = gate.take_active() {
+        let min_final_samples = if push_to_talk {
+            SAMPLE_RATE / 5
+        } else {
+            SAMPLE_RATE / 2
+        };
+        if !auto_stopped && let Some(segment) = gate.take_active(min_final_samples) {
             worker_trace.speech_end(utterance_id, Duration::ZERO);
             worker_trace.record(utterance_id, "manual_segment", None, "ok");
             worker_trace.record(
@@ -245,7 +297,6 @@ pub(crate) fn start(keep_input: bool, language: &str, backend: &str) -> Result<V
     })
 }
 
-#[derive(Default)]
 struct SpeechGate {
     noise_floor: f32,
     calibration: [f32; CALIBRATION_FRAMES],
@@ -254,6 +305,8 @@ struct SpeechGate {
     candidate_frames: u8,
     active: bool,
     silent_samples: usize,
+    silence_threshold_samples: usize,
+    submit_on_silence: bool,
     preroll: Vec<i16>,
     segment: Vec<i16>,
 }
@@ -270,6 +323,27 @@ struct CompletedSegment {
 }
 
 impl SpeechGate {
+    fn new(silence_seconds: f32, submit_on_silence: bool) -> Self {
+        let silence_seconds = if silence_seconds.is_finite() {
+            silence_seconds.clamp(0.2, 3.0)
+        } else {
+            0.6
+        };
+        Self {
+            noise_floor: 0.0,
+            calibration: [0.0; CALIBRATION_FRAMES],
+            calibrated_frames: 0,
+            speech_peak: 0.0,
+            candidate_frames: 0,
+            active: false,
+            silent_samples: 0,
+            silence_threshold_samples: (silence_seconds * SAMPLE_RATE as f32).round() as usize,
+            submit_on_silence,
+            preroll: Vec::new(),
+            segment: Vec::new(),
+        }
+    }
+
     fn push(&mut self, chunk: &[i16]) -> GateUpdate {
         let mean_square = chunk
             .iter()
@@ -327,10 +401,11 @@ impl SpeechGate {
         } else {
             self.silent_samples = 0;
         }
-        if self.silent_samples >= SILENCE_SAMPLES
+        if (self.submit_on_silence && self.silent_samples >= self.silence_threshold_samples)
             || self.segment.len() >= SAMPLE_RATE * MAX_UTTERANCE_SECONDS
         {
-            let ended_by_silence = self.silent_samples >= SILENCE_SAMPLES;
+            let ended_by_silence =
+                self.submit_on_silence && self.silent_samples >= self.silence_threshold_samples;
             let trailing_silence =
                 Duration::from_millis((self.silent_samples as u64 * 1000) / SAMPLE_RATE as u64);
             // 留一小段尾部静音，避免截断最后的字音。
@@ -360,8 +435,8 @@ impl SpeechGate {
         }
     }
 
-    fn take_active(&mut self) -> Option<Vec<i16>> {
-        if self.active && self.segment.len() >= SAMPLE_RATE / 2 {
+    fn take_active(&mut self, min_samples: usize) -> Option<Vec<i16>> {
+        if self.active && self.segment.len() >= min_samples {
             Some(std::mem::take(&mut self.segment))
         } else {
             None
@@ -371,6 +446,10 @@ impl SpeechGate {
 
 fn selected_engine(backend: &str) -> Result<RecognitionEngine> {
     match backend {
+        "sensevoice" => {
+            let (engine, model, vad) = sensevoice_files()?;
+            Ok(RecognitionEngine::SenseVoice(engine, model, vad))
+        }
         "whisper" => {
             let (engine, model) = engine_files()?;
             Ok(RecognitionEngine::Whisper(engine, model))
@@ -398,6 +477,9 @@ fn transcribe_selected(
     language: &str,
 ) -> Result<String> {
     match engine {
+        RecognitionEngine::SenseVoice(executable, model, vad) => {
+            transcribe_sensevoice(executable, model, vad, samples)
+        }
         RecognitionEngine::Whisper(executable, model) => {
             transcribe(executable, model, samples, language)
         }
@@ -457,8 +539,79 @@ fn windows_bridge_error(output: &std::process::Output) -> String {
     }
 }
 
+fn sensevoice_files() -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let base = crate::project_directory()
+        .join("assets")
+        .join("voice")
+        .join("funasr");
+    sensevoice_files_in(&base)
+}
+
+fn sensevoice_files_in(base: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let executable = base.join("llama-funasr-sensevoice.exe");
+    let model = base.join("sensevoice-small-q8.gguf");
+    let vad = base.join("fsmn-vad.gguf");
+    for path in [&executable, &model, &vad] {
+        if !path.is_file() {
+            bail!("缺少 SenseVoice 文件：{}", path.display());
+        }
+    }
+    Ok((executable, model, vad))
+}
+
+fn transcribe_sensevoice(
+    executable: &Path,
+    model: &Path,
+    vad: &Path,
+    samples: &[i16],
+) -> Result<String> {
+    let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let wav = std::env::temp_dir().join(format!(
+        "to_words_sensevoice_{}_{}.wav",
+        std::process::id(),
+        temp_id
+    ));
+    let result = (|| {
+        write_wav(&wav, samples)?;
+        let mut command = Command::new(executable);
+        command
+            .arg("-m")
+            .arg(model)
+            .arg("--vad")
+            .arg(vad)
+            .arg("-a")
+            .arg(&wav)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(directory) = executable.parent() {
+            command.current_dir(directory);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let output = command.output().context("无法启动 SenseVoice 识别程序")?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "SenseVoice 识别失败（{}）：{}",
+                output.status,
+                detail.trim()
+            );
+        }
+        let text = String::from_utf8(output.stdout).context("SenseVoice 输出不是 UTF-8")?;
+        Ok(text.trim().to_owned())
+    })();
+    let _ = fs::remove_file(&wav);
+    result
+}
+
 fn engine_files() -> Result<(PathBuf, PathBuf)> {
-    let base = crate::project_directory().join("assets").join("voice");
+    let base = crate::project_directory()
+        .join("assets")
+        .join("voice")
+        .join("whisper");
     let engine = base.join("whisper-cli.exe");
     if !engine.is_file() {
         bail!("缺少 {}", engine.display());
@@ -510,6 +663,9 @@ fn transcribe(engine: &Path, model: &Path, samples: &[i16], language: &str) -> R
             .arg("--no-prints")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        if let Some(directory) = engine.parent() {
+            command.current_dir(directory);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -700,8 +856,8 @@ fn record_microphone(
 #[cfg(test)]
 mod tests {
     use super::{
-        SAMPLE_RATE, SpeechGate, engine_files, transcribe, whisper_language, whisper_thread_count,
-        write_wav,
+        SAMPLE_RATE, SpeechGate, engine_files, sensevoice_files_in, transcribe, whisper_language,
+        whisper_thread_count, write_wav,
     };
 
     #[test]
@@ -719,6 +875,16 @@ mod tests {
     }
 
     #[test]
+    fn sensevoice_reports_missing_model_file() {
+        let missing = std::env::temp_dir().join(format!(
+            "to_words_missing_sensevoice_{}",
+            std::process::id()
+        ));
+        let error = sensevoice_files_in(&missing).unwrap_err().to_string();
+        assert!(error.contains("llama-funasr-sensevoice.exe"));
+    }
+
+    #[test]
     #[ignore = "requires the local whisper.cpp binary and model"]
     fn benchmark_local_engine_startup() {
         let (engine, model) = engine_files().unwrap();
@@ -729,8 +895,8 @@ mod tests {
     }
 
     #[test]
-    fn voice_gate_ends_after_about_one_second_of_silence() {
-        let mut gate = SpeechGate::default();
+    fn voice_gate_ends_after_six_tenths_of_a_second_of_silence() {
+        let mut gate = SpeechGate::new(0.6, true);
         let silence = vec![0_i16; SAMPLE_RATE / 10];
         let speech = vec![2_000_i16; SAMPLE_RATE / 10];
         for _ in 0..4 {
@@ -741,19 +907,55 @@ mod tests {
         for _ in 0..5 {
             assert!(gate.push(&speech).completed.is_none());
         }
-        for _ in 0..8 {
+        for _ in 0..5 {
             assert!(gate.push(&silence).completed.is_none());
         }
         let completed = gate.push(&silence).completed.unwrap();
         assert!(completed.samples.len() >= SAMPLE_RATE / 2);
+        assert_eq!(completed.trailing_silence.as_millis(), 600);
         assert_eq!(completed.reason, "silence");
         assert!(!gate.push(&speech).started);
         assert!(gate.push(&speech).started);
     }
 
     #[test]
+    fn configured_voice_silence_threshold_is_used() {
+        assert_eq!(
+            SpeechGate::new(1.2, true).silence_threshold_samples,
+            SAMPLE_RATE * 12 / 10
+        );
+        assert_eq!(
+            SpeechGate::new(0.1, true).silence_threshold_samples,
+            SAMPLE_RATE / 5
+        );
+        assert_eq!(
+            SpeechGate::new(f32::NAN, true).silence_threshold_samples,
+            SAMPLE_RATE * 6 / 10
+        );
+    }
+
+    #[test]
+    fn push_to_talk_keeps_recording_through_a_pause_until_release() {
+        let mut gate = SpeechGate::new(0.6, false);
+        let silence = vec![0_i16; SAMPLE_RATE / 10];
+        let speech = vec![2_000_i16; SAMPLE_RATE / 10];
+        for _ in 0..4 {
+            gate.push(&silence);
+        }
+        gate.push(&speech);
+        assert!(gate.push(&speech).started);
+        for _ in 0..5 {
+            gate.push(&speech);
+        }
+        for _ in 0..10 {
+            assert!(gate.push(&silence).completed.is_none());
+        }
+        assert!(gate.take_active(SAMPLE_RATE / 5).is_some());
+    }
+
+    #[test]
     fn steady_background_noise_does_not_prevent_auto_submit() {
-        let mut gate = SpeechGate::default();
+        let mut gate = SpeechGate::new(0.6, true);
         let noise = vec![700_i16; SAMPLE_RATE / 10];
         let speech = vec![2_000_i16; SAMPLE_RATE / 10];
         for _ in 0..10 {
@@ -764,7 +966,7 @@ mod tests {
         for _ in 0..5 {
             assert!(gate.push(&speech).completed.is_none());
         }
-        for _ in 0..8 {
+        for _ in 0..5 {
             assert!(gate.push(&noise).completed.is_none());
         }
         assert!(gate.push(&noise).completed.is_some());
@@ -772,7 +974,7 @@ mod tests {
 
     #[test]
     fn noise_after_quiet_start_counts_as_silence_after_speech() {
-        let mut gate = SpeechGate::default();
+        let mut gate = SpeechGate::new(0.6, true);
         let quiet = vec![0_i16; SAMPLE_RATE / 10];
         let noise = vec![700_i16; SAMPLE_RATE / 10];
         let speech = vec![2_000_i16; SAMPLE_RATE / 10];
@@ -784,7 +986,7 @@ mod tests {
         for _ in 0..5 {
             gate.push(&speech);
         }
-        for _ in 0..8 {
+        for _ in 0..5 {
             assert!(gate.push(&noise).completed.is_none());
         }
         assert!(gate.push(&noise).completed.is_some());
@@ -792,7 +994,7 @@ mod tests {
 
     #[test]
     fn fluctuating_background_noise_still_ends_utterance() {
-        let mut gate = SpeechGate::default();
+        let mut gate = SpeechGate::new(0.6, true);
         let low_noise = vec![650_i16; SAMPLE_RATE / 10];
         let high_noise = vec![750_i16; SAMPLE_RATE / 10];
         let speech = vec![2_000_i16; SAMPLE_RATE / 10];
@@ -812,7 +1014,7 @@ mod tests {
         for _ in 0..5 {
             gate.push(&speech);
         }
-        for index in 0..8 {
+        for index in 0..5 {
             assert!(
                 gate.push(if index % 2 == 0 {
                     &low_noise
@@ -828,7 +1030,7 @@ mod tests {
 
     #[test]
     fn long_utterance_reports_timeout_instead_of_silence() {
-        let mut gate = SpeechGate::default();
+        let mut gate = SpeechGate::new(0.6, true);
         let quiet = vec![0_i16; SAMPLE_RATE / 10];
         let speech = vec![2_000_i16; SAMPLE_RATE / 10];
         for _ in 0..4 {

@@ -241,24 +241,30 @@ fn find_tesseract() -> std::path::PathBuf {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn engine_status() -> String {
+    use crate::i18n::{self, tr};
     let executable = find_tesseract();
     match list_languages(&executable) {
-        Ok(languages) => format!(
-            "本地 OCR：{} · 已安装语言：{}",
-            executable.display(),
-            if languages.is_empty() {
-                "无".to_string()
-            } else {
-                languages.join("、")
-            }
+        Ok(languages) => i18n::message(
+            "本地 OCR：{path} · 已安装语言：{languages}",
+            &[
+                ("path", &executable.display().to_string()),
+                (
+                    "languages",
+                    &if languages.is_empty() {
+                        tr("无").to_string()
+                    } else {
+                        languages.join("、")
+                    },
+                ),
+            ],
         ),
-        Err(_) => "本地 OCR：未找到 Tesseract，请先安装或设置 TESSERACT_EXE。".to_string(),
+        Err(_) => tr("本地 OCR：未找到 Tesseract，请先安装或设置 TESSERACT_EXE。").to_string(),
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn engine_status() -> String {
-    "屏幕 OCR 目前仅支持 Windows。".to_string()
+    crate::i18n::tr("屏幕 OCR 目前仅支持 Windows。").to_string()
 }
 
 #[cfg(target_os = "windows")]

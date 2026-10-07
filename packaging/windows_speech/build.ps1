@@ -45,9 +45,16 @@ try {
     Copy-Item -LiteralPath 'target\release\to_words.exe' -Destination $stage
     Copy-Item -LiteralPath 'ui_config.json' -Destination $stage
     Copy-Item -LiteralPath 'assets\icons\to_words_tray_32.png' -Destination $icons
-    Get-ChildItem -LiteralPath 'assets\voice' -File |
-        Where-Object { $_.Extension -in '.exe', '.dll', '.bin' -and $_.Name -ne 'to_words_windows_speech.exe' } |
-        Copy-Item -Destination $voice
+    foreach ($engineName in @('funasr', 'whisper')) {
+        $source = Join-Path 'assets\voice' $engineName
+        if (Test-Path -LiteralPath $source -PathType Container) {
+            $destination = Join-Path $voice $engineName
+            New-Item -ItemType Directory -Path $destination | Out-Null
+            Get-ChildItem -LiteralPath $source -File |
+                Where-Object { $_.Extension -in '.exe', '.dll', '.bin', '.gguf' } |
+                Copy-Item -Destination $destination
+        }
+    }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'AppxManifest.xml') -Destination $identity
 
     $toWordsExe = Join-Path $stage 'to_words.exe'

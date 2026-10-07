@@ -24,11 +24,17 @@ cargo run
 
 快捷键均可在设置页面重新录制。
 
+### 设置界面语言
+
+`ui_language` 独立于 `source_language` 和 `translation_language`，默认 `zh-CN`，还支持 `en`、`ko`、`ja`。设置首页、词库编辑与合并页面共用 `src/i18n.rs` 的本地化入口；译文存放在 `assets/i18n/*.json` 并编译进程序。新增界面文字时以中文原文为键，同步补齐三份译文，动态文字使用命名占位符（如 `{count}`）。词库内容与文件命名不会随界面语言变化。
+
 ### 本地语音识别
 
-语音模块见 `src/platform/voice.rs`，使用 Windows `waveIn` 以 16 kHz 单声道录音，并调用随程序发布的 `whisper-cli.exe` 和多语言 GGML 模型。录音/停顿检测与语音识别使用独立线程，上一句识别时仍能检测下一句，识别任务按语句顺序处理；每 100 毫秒分析一帧音量，开头约 0.4 秒估计背景噪音，说话中根据语音峰值动态判断停顿，检测到约 0.9 秒停顿后只识别完整句子一次，不再每四秒重复启动模型。设置项 `voice_keep_input` 默认 `false`；开启后，每句自动提交并继续监听，直到再次按快捷键结束。语音活动检测仍是音量阈值启发式算法，持续人声或音乐等复杂噪声可能需要手动停止。悬浮文字由 `src/components/voice_overlay.rs` 的独立透明、置顶、鼠标穿透视口绘制，始终位于屏幕底部；最终结果显示约 1 秒后消失，即使保持语音输入也不会一直占据屏幕，下一句开始时清空旧文字。`src/platform/voice_output.rs` 在每条结果产生时捕获当前外部前台窗口，发送前再次确认窗口未变化；临时写入剪贴板后通过扫描码按下 Ctrl+V 并跨帧保持按键，然后恢复原剪贴板；非文本剪贴板或无法备份时退回 Unicode 按键事件。`src/platform/voice_overlay_window.rs` 会尽量移除 Windows 添加的原生边框，并设置不激活窗口样式。主窗口更新后显式请求子视口重绘，确保识别原文在 AI 请求尚未完成时先出现。资源放置和发布要求见 [assets/voice/README.md](../assets/voice/README.md)。
+语音模块见 `src/platform/voice.rs`，使用 Windows `waveIn` 以 16 kHz 单声道录音，默认调用随程序发布的 SenseVoice CLI、SenseVoice GGUF 模型与 FSMN VAD；也可选择 `whisper-cli.exe` 和多语言 GGML 模型。录音/停顿检测与语音识别使用独立线程，上一句识别时仍能检测下一句，识别任务按语句顺序处理；每 100 毫秒分析一帧音量，开头约 0.4 秒估计背景噪音，说话中根据语音峰值动态判断停顿，检测到约 0.6 秒停顿后只识别完整句子一次，不再每四秒重复启动模型。设置项 `voice_keep_input` 默认 `false`；开启后，每句自动提交并继续监听，直到再次按快捷键结束。语音活动检测仍是音量阈值启发式算法，持续人声或音乐等复杂噪声可能需要手动停止。悬浮文字由 `src/components/voice_overlay.rs` 的独立透明、置顶、鼠标穿透视口绘制，始终位于屏幕底部；最终结果显示约 1 秒后消失，即使保持语音输入也不会一直占据屏幕，下一句开始时清空旧文字。`src/platform/voice_output.rs` 在每条结果产生时捕获当前外部前台窗口，发送前再次确认窗口未变化；临时写入剪贴板后通过扫描码按下 Ctrl+V 并跨帧保持按键，然后恢复原剪贴板；非文本剪贴板或无法备份时退回 Unicode 按键事件。`src/platform/voice_overlay_window.rs` 会尽量移除 Windows 添加的原生边框，并设置不激活窗口样式。主窗口更新后显式请求子视口重绘，确保识别原文在 AI 请求尚未完成时先出现。资源放置和发布要求见 [assets/voice/README.md](../assets/voice/README.md)。
 
 Whisper CLI 的计算线程数自动取可用逻辑处理器数与 8 的较小值（查询失败则用 4）。实测同一段 4.5 秒中文录音，4 线程约 1.18 秒、8 线程约 0.75 秒，文字相同；更激进的解码参数虽然略快，但会丢失标点，因此没有启用。启用耗时诊断时，日志中的 `asr_threads` 会记录实际线程数。
+
+`voice_silence_seconds` 默认 `0.6`，读取配置后限制在 `0.2..=3.0`，按 16 kHz 采样数控制自动提交。`voice_hold_to_talk` 默认 `false`：启用后全局语音快捷键的 Pressed 开始录音，Released 停止；按住期间不按静音阈值自动提交，最后一段在松开后交给识别线程，并短暂等待快捷键修饰键松开再输入结果。此模式优先于 `voice_keep_input`。`ai_polite_mode` 默认 `false`，对查询框、语音及 OCR 的 AI 翻译结果添加按目标语言选择的礼貌表达提示；正向、反向均适用，不改写本地词库匹配结果。旧配置字段 `ai_korean_honorific` 作为反序列化别名继续读取。
 
 最终文字先按现有 `WordIndex` 在 key/value 两列搜索；命中时输入 key，多条命中默认输入第一条。设置项 `voice_auto_copy_first=false` 时，多条结果会交给现有查询框选择（手动选择沿用查询框的复制流程）。未命中时，仅在启用 `ai_translation`、配置目标语言和 DeepSeek API Key 后调用现有双向翻译，再输入译文，并异步保存到对应词库。窗口变化或输入被系统拒绝时跳过输入，避免写入错误窗口。设置项通过 `hotkeys.voice` 配置快捷键，默认 `ctrl+alt+v`；`voice_language` 默认 `auto`，可指定 Whisper 的识别语言。模型优先级为 medium → small → base → tiny。
 
@@ -224,7 +230,7 @@ user_words (1).json
 
 ### Windows 本地语音识别（实验版）
 
-普通构建仅启用 `whisper.cpp`；Windows 本地识别实验代码保留在仓库工作区，通过 `windows-speech` Cargo feature 才会编译和显示设置选项，`packaging/windows_speech/build.ps1` 会显式启用该 feature。两种引擎共用现有录音、停顿检测、词库优先查询和结果输入流程。语音 AI 译文会异步写入对应的 `word_libraries/user_words_<原始语言>_<目标语言>.json`；相同 key/value 不重复写，冲突 key 不覆盖原词条。Whisper 仍是默认引擎。
+普通构建提供 SenseVoice（默认）和 `whisper.cpp`；Windows 本地识别实验代码保留在仓库工作区，通过 `windows-speech` Cargo feature 才会编译和显示设置选项，`packaging/windows_speech/build.ps1` 会显式启用该 feature。这些引擎共用现有录音、停顿检测、词库优先查询和结果输入流程。语音 AI 译文会异步写入对应的 `word_libraries/user_words_<原始语言>_<目标语言>.json`；相同 key/value 不重复写，冲突 key 不覆盖原词条。
 
 Windows 路线使用 `windows_speech_bridge/` 的 .NET 8 桥接程序和微软实验版 `Microsoft.Windows.AI.Speech`。当前文档没有公开的识别语言设置方式；对日语等语言可能返回英语译文，因此用户需要在自己的机器上验证结果。桥接程序要求 Windows 11 24H2+、WinAppSDK 实验版语音 API、已安装的本地语音模型，以及带 `systemAIModels` 权限的 MSIX 包身份。桥接程序使用 Windows App SDK 自包含发布，避免另外安装匹配的实验版 Windows App Runtime；这与 .NET 自包含发布是两个不同的选项。普通 `cargo run` 没有包身份，不能直接测试 Windows 选项。
 
