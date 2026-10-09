@@ -157,22 +157,21 @@ pub(crate) fn recognize_selection(
     };
 
     let rgb = screen.crop(region)?;
+    let (rgb, width, height) = prepare_ocr_image(rgb, region.width, region.height)?;
     let mut png = Vec::new();
     PngEncoder::new(&mut png)
-        .write_image(&rgb, region.width, region.height, ColorType::Rgb8.into())
+        .write_image(&rgb, width, height, ColorType::Rgb8.into())
         .context("无法编码截图")?;
 
     let executable = find_tesseract();
     let available = list_languages(&executable)?;
-    let languages = choose_languages(&available, source, target);
-    if languages.is_empty() {
-        bail!("没有可用的 OCR 语言包；请安装 Tesseract，并添加中文、韩文或英文语言包");
-    }
+    let language = choose_language(&available, source, target)?;
+    let psm = page_segmentation_mode(region);
 
     // CREATE_NO_WINDOW：发布版没有控制台，避免 OCR 子进程闪出命令行窗口。
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut child = Command::new(&executable)
-        .args(["stdin", "stdout", "-l", &languages.join("+"), "--psm", "6"])
+        .args(["stdin", "stdout", "-l", language, "--psm", psm])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -198,6 +197,93 @@ pub(crate) fn recognize_selection(
         bail!("所选区域未识别到文字，请尝试框选更清晰的区域");
     }
     Ok(text)
+}
+
+/// Tesseract 4/5 对浅底深字更稳；只对小选区做轻量处理，避免大图膨胀。
+fn prepare_ocr_image(rgb: Vec<u8>, width: u32, height: u32) -> Result<(Vec<u8>, u32, u32)> {
+    use image::{Rgb, RgbImage, imageops::FilterType};
+
+    let mut image = RgbImage::from_raw(width, height, rgb).context("OCR 截图数据不完整")?;
+    if width > 2048 || height > 2048 {
+        return Ok((image.into_raw(), width, height));
+    }
+
+    if dark_background(&image) {
+        for pixel in image.pixels_mut() {
+            for channel in &mut pixel.0 {
+                *channel = 255 - *channel;
+            }
+        }
+    }
+
+    // 仅给确实很小的截图放大；对普通小字无条件放大会改变笔画，反而可能误识别。
+    if height < 24 {
+        image = image::imageops::resize(
+            &image,
+            width.saturating_mul(2),
+            height.saturating_mul(2),
+            FilterType::CatmullRom,
+        );
+    }
+
+    // 紧贴边界的字可能被分割器漏掉；反色后再加白边，避免产生黑色外框。
+    const BORDER: u32 = 10;
+    let mut padded = RgbImage::from_pixel(
+        image.width() + BORDER * 2,
+        image.height() + BORDER * 2,
+        Rgb([255, 255, 255]),
+    );
+    image::imageops::replace(&mut padded, &image, BORDER.into(), BORDER.into());
+    let (width, height) = padded.dimensions();
+    Ok((padded.into_raw(), width, height))
+}
+
+fn dark_background(image: &image::RgbImage) -> bool {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let step_x = (width / 16).max(1);
+    let step_y = (height / 16).max(1);
+    let mut brightness = 0u64;
+    let mut samples = 0u64;
+    for x in (0..width).step_by(step_x as usize) {
+        for y in [0, height - 1] {
+            let pixel = image.get_pixel(x, y);
+            brightness += u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]);
+            samples += 3;
+        }
+    }
+    for y in (0..height).step_by(step_y as usize) {
+        for x in [0, width - 1] {
+            let pixel = image.get_pixel(x, y);
+            brightness += u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]);
+            samples += 3;
+        }
+    }
+    if brightness / samples >= 110 {
+        return false;
+    }
+    // 深色边框包着白色面板时，不能只看四周，否则会把黑字白底误反色。
+    let mut interior_brightness = 0u64;
+    let mut interior_samples = 0u64;
+    for y in (0..height).step_by(step_y as usize) {
+        for x in (0..width).step_by(step_x as usize) {
+            let pixel = image.get_pixel(x, y);
+            interior_brightness += u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]);
+            interior_samples += 3;
+        }
+    }
+    interior_brightness / interior_samples < 160
+}
+
+fn page_segmentation_mode(region: CaptureRegion) -> &'static str {
+    if region.height <= 64 && region.width >= region.height {
+        "7" // 单行文字
+    } else {
+        "6" // 多行文字块
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -352,39 +438,84 @@ fn list_languages(executable: &std::path::Path) -> Result<Vec<String>> {
         .collect())
 }
 
-fn choose_languages(available: &[String], source: &str, target: &str) -> Vec<String> {
-    let mut preferred = Vec::new();
-    for code in [source, target, "cn", "ko", "en", "ja"] {
-        let lang = match code {
-            "cn" => "chi_sim",
-            "zh_tw" => "chi_tra",
-            "ko" => "kor",
-            "ja" => "jpn",
-            "en" => "eng",
-            "fr" => "fra",
-            "de" => "deu",
-            "es" => "spa",
-            "pt" => "por",
-            "it" => "ita",
-            "ru" => "rus",
-            "uk" => "ukr",
-            "auto" | "" => continue,
-            _ => continue,
-        };
-        if available.iter().any(|item| item == lang) && !preferred.contains(&lang) {
-            preferred.push(lang);
-        }
+fn tesseract_language(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "cn" => "chi_sim",
+        "zh_tw" => "chi_tra",
+        "ko" => "kor",
+        "ja" => "jpn",
+        "en" => "eng",
+        "fr" => "fra",
+        "de" => "deu",
+        "es" => "spa",
+        "pt" => "por",
+        "it" => "ita",
+        "ru" => "rus",
+        "uk" => "ukr",
+        "ar" => "ara",
+        "he" => "heb",
+        "fa" => "fas",
+        "hi" => "hin",
+        "ur" => "urd",
+        "bn" => "ben",
+        "ta" => "tam",
+        "te" => "tel",
+        "th" => "tha",
+        "vi" => "vie",
+        "id" => "ind",
+        "ms" => "msa",
+        "fil" => "fil",
+        "tr" => "tur",
+        "pl" => "pol",
+        "nl" => "nld",
+        "sv" => "swe",
+        "no" => "nor",
+        "da" => "dan",
+        "fi" => "fin",
+        "cs" => "ces",
+        "sk" => "slk",
+        "hu" => "hun",
+        "ro" => "ron",
+        "bg" => "bul",
+        "el" => "ell",
+        "sw" => "swa",
+        "km" => "khm",
+        "lo" => "lao",
+        "my" => "mya",
+        "mn" => "mon",
+        "kk" => "kaz",
+        "uz" => "uzb",
+        _ => return None,
+    })
+}
+
+fn choose_language<'a>(available: &'a [String], source: &str, target: &str) -> Result<&'a str> {
+    // 目标语言由用户明确指定时不能静默换用别的模型，否则短词容易被识别成别的文字系统。
+    if !target.is_empty() {
+        let language = tesseract_language(target)
+            .with_context(|| format!("目标语言 {target} 暂无对应的 Tesseract OCR 模型"))?;
+        return available
+            .iter()
+            .find(|item| item.as_str() == language)
+            .map(String::as_str)
+            .with_context(|| {
+                format!("缺少目标语言的 OCR 语言包：{language}.traineddata，请先安装")
+            });
     }
-    if preferred.is_empty() {
-        preferred.extend(
-            available
-                .iter()
-                .map(String::as_str)
-                .filter(|lang| *lang != "osd")
-                .take(2),
-        );
+    if let Some(language) = tesseract_language(source) {
+        return available
+            .iter()
+            .find(|item| item.as_str() == language)
+            .map(String::as_str)
+            .with_context(|| format!("请安装原始语言的 {language}.traineddata OCR 语言包"));
     }
-    preferred.into_iter().take(4).map(str::to_owned).collect()
+    available
+        .iter()
+        .find(|item| item.as_str() == "chi_sim")
+        .or_else(|| available.iter().find(|item| item.as_str() == "eng"))
+        .or_else(|| available.iter().find(|item| item.as_str() != "osd"))
+        .map(String::as_str)
+        .context("没有可用的 OCR 语言包；请安装 Tesseract 的文字识别语言包")
 }
 
 #[cfg(target_os = "windows")]
@@ -467,7 +598,10 @@ fn capture_rgb(region: CaptureRegion) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureRegion, CapturedScreen, MonitorBounds, choose_languages, selected_region};
+    use super::{
+        CaptureRegion, CapturedScreen, MonitorBounds, choose_language, page_segmentation_mode,
+        prepare_ocr_image, selected_region, tesseract_language,
+    };
 
     #[test]
     fn crops_from_original_snapshot_instead_of_new_screen_capture() {
@@ -537,11 +671,73 @@ mod tests {
     }
 
     #[test]
-    fn prefers_configured_and_installed_language_packs() {
+    fn uses_only_the_selected_target_language_pack() {
         let available = ["eng".into(), "kor".into(), "chi_sim".into()];
+        assert_eq!(choose_language(&available, "auto", "ko").unwrap(), "kor");
+        assert_eq!(choose_language(&available, "cn", "ko").unwrap(), "kor");
+        assert_eq!(choose_language(&available, "ko", "").unwrap(), "kor");
+        assert_eq!(choose_language(&available, "auto", "").unwrap(), "chi_sim");
+        assert_eq!(tesseract_language("ja"), Some("jpn"));
+        assert_eq!(tesseract_language("ar"), Some("ara"));
+        for language in crate::translation_language::LANGUAGES {
+            assert!(
+                tesseract_language(language.code).is_some(),
+                "missing OCR model for {}",
+                language.code
+            );
+        }
+        assert!(
+            choose_language(&["eng".into()], "auto", "ko")
+                .unwrap_err()
+                .to_string()
+                .contains("kor.traineddata")
+        );
+    }
+
+    #[test]
+    fn dark_text_and_white_text_are_normalized_without_changing_the_original() {
+        let mut dark = vec![24u8; 8 * 8 * 3];
+        let center = (4 * 8 + 4) * 3;
+        dark[center..center + 3].fill(255);
+        let untouched = dark.clone();
+        let (prepared, width, height) = prepare_ocr_image(dark, 8, 8).unwrap();
+        assert_eq!((width, height), (36, 36));
+        assert_eq!(untouched[center], 255);
+        assert_eq!(&prepared[..3], &[255, 255, 255]);
+        assert!(prepared[((18 * width + 18) * 3) as usize] < 80);
+
+        let mut light = vec![255u8; 8 * 8 * 3];
+        light[center..center + 3].fill(0);
+        let (prepared, _, _) = prepare_ocr_image(light, 8, 8).unwrap();
+        assert!(prepared[((18 * width + 18) * 3) as usize] < 80);
+
+        let mut framed = vec![24u8; 12 * 12 * 3];
+        for y in 1..11 {
+            for x in 1..11 {
+                let pixel = (y * 12 + x) * 3;
+                framed[pixel..pixel + 3].fill(255);
+            }
+        }
+        assert!(!super::dark_background(
+            &image::RgbImage::from_raw(12, 12, framed).unwrap()
+        ));
+    }
+
+    #[test]
+    fn short_selection_uses_single_line_segmentation() {
+        let region = CaptureRegion {
+            x: 0,
+            y: 0,
+            width: 90,
+            height: 43,
+        };
+        assert_eq!(page_segmentation_mode(region), "7");
         assert_eq!(
-            choose_languages(&available, "cn", "ko"),
-            ["chi_sim", "kor", "eng"]
+            page_segmentation_mode(CaptureRegion {
+                height: 120,
+                ..region
+            }),
+            "6"
         );
     }
 }

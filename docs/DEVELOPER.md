@@ -22,7 +22,9 @@ cargo run
 - `Ctrl + Alt + V`：开始或结束本地语音识别
 - `Ctrl + Backspace`：查询框为空时清空全部组合内容
 
-快捷键均可在设置页面重新录制。
+快捷键均可在设置页面重新录制。键盘组合仍交由 `global-hotkey` 注册；鼠标左、右、中键与标准 X1/X2 侧键由 `src/platform/mouse_hotkey.rs` 的 Windows 低级鼠标钩子观察。`src/platform/extra_mouse_buttons.rs` 以后台非独占 DirectInput 读取 `DIMOUSESTATE2` 的第 6～8 键，前五键不重复派发；此路径仅在驱动真正公开这些逻辑按键时有效。`src/domain/shortcut.rs` 统一解析与去重。监听不拦截原始点击，按键录制会忽略打开录制按钮的那次点击。G HUB 若把不同物理侧键都映射为 X1/X2，则应在驱动中改成不同键盘快捷键后录制，程序无法从相同逻辑事件还原物理按键。
+
+G502 LIGHTSPEED 的 11 个可编程功能不等于 Windows 上报 11 个鼠标按键。DPI/G-Shift 等无独立鼠标事件的功能需通过 G HUB 映射为不同键盘快捷键；录制路径支持 F13～F24，并保留按键松开事件以适配按住说话。设置页有折叠说明，翻译键写在 `assets/i18n`；不要假定 `Mouse6`～`Mouse8` 在 G502 上一定由驱动公开。
 
 ### 设置界面语言
 
@@ -36,7 +38,11 @@ Whisper CLI 的计算线程数自动取可用逻辑处理器数与 8 的较小�
 
 `voice_silence_seconds` 默认 `0.6`，读取配置后限制在 `0.2..=3.0`，按 16 kHz 采样数控制自动提交。`voice_hold_to_talk` 默认 `false`：启用后全局语音快捷键的 Pressed 开始录音，Released 停止；按住期间不按静音阈值自动提交，最后一段在松开后交给识别线程，并短暂等待快捷键修饰键松开再输入结果。此模式优先于 `voice_keep_input`。`ai_polite_mode` 默认 `false`，对查询框、语音及 OCR 的 AI 翻译结果添加按目标语言选择的礼貌表达提示；正向、反向均适用，不改写本地词库匹配结果。旧配置字段 `ai_korean_honorific` 作为反序列化别名继续读取。
 
-最终文字先按现有 `WordIndex` 在 key/value 两列搜索；命中时输入 key，多条命中默认输入第一条。设置项 `voice_auto_copy_first=false` 时，多条结果会交给现有查询框选择（手动选择沿用查询框的复制流程）。未命中时，仅在启用 `ai_translation`、配置目标语言和 DeepSeek API Key 后调用现有双向翻译，再输入译文，并异步保存到对应词库。窗口变化或输入被系统拒绝时跳过输入，避免写入错误窗口。设置项通过 `hotkeys.voice` 配置快捷键，默认 `ctrl+alt+v`；`voice_language` 默认 `auto`，可指定 Whisper 的识别语言。模型优先级为 medium → small → base → tiny。
+最终文字先按现有 `WordIndex` 在 key/value 两列搜索；命中时输入 key，多条命中默认输入第一条。设置项 `voice_auto_copy_first=false` 时，多条结果会交给现有查询框选择（手动选择沿用查询框的复制流程）。未命中时，仅在启用 `ai_translation`、配置目标语言和 DeepSeek API Key 后调用现有双向翻译，再立即输入译文；入库则交由后台缓存审核。窗口变化或输入被系统拒绝时跳过输入，避免写入错误窗口。设置项通过 `hotkeys.voice` 配置快捷键，默认 `ctrl+alt+v`；`voice_language` 默认 `auto`，可指定 Whisper 的识别语言。模型优先级为 medium → small → base → tiny。
+
+语音自动入库由 `src/domain/voice_word_cache.rs` 管理，待审核记录持久化到程序目录的 `to_words.db`（被 Git 忽略，不含录音或 API Key），重启后继续审核；旧版 `voice_word_cache.json` 只读迁入。空串、几乎全符号、异常连续重复字符、已知无语音/低可信标记以及两分钟内相同识别文本直接跳过；模型若仅返回普通文本而不提供可信度，不能额外推断数值置信度。缓存满 20 条或距上次审核约 1 小时触发，单次最多处理 100 条，AI 每批审核 10 条并使用同一录音会话内相邻语句作上下文。`normal` 写入对应词库后清缓存，`error` 直接移除，`uncertain` 留存，只有相邻上下文变化才重新审核；无新依据 7 天后清理。网络/凭据/词库写入失败时保留待处理记录，下次再试；已有冲突 key 不被覆盖。审核请求只发送识别文本、已有译文和相邻语句，可能产生额外 API 费用。查询框手动翻译及 OCR 路径不经过此缓存。
+
+显式配置的 `source_language` 与 `translation_language` 相同时，语音路径在词库查询前直接输出识别原文，不读取 API Key、不调用 AI、不保存词条；OCR 路径仍复制识别原文，但不启动翻译。`auto` 不被视为与目标语言相同。
 
 耗时诊断默认关闭，不创建或续写日志。需要临时诊断时可用 `cargo run --features voice-metrics` 启用；`src/platform/voice_metrics.rs` 会向程序目录的 `logs/voice_metrics.jsonl` 追加 JSON Lines。`session_id` 和 `utterance_id` 用于关联同一次录音与句子；`since_session_ms` 是从该次录音开始算起的时间，`duration_ms` 是当前阶段耗时。重点看 `speech_end_estimated` → `vad_complete`（停顿判断）、`audio_segment.duration_ms`（实际送入模型的音频长度，非处理耗时）、`asr_completed`（本地 Whisper）、`overlay_original_drawn`（原文绘制回调已执行）、`lookup_completed`（词库）、`credential_load`、`ai_request_completed`（整个 AI 调用）及 `text_input`。`vad_complete.result=max_duration` 表示没有检测到停顿、达到 30 秒上限才提交；此时真实说话结束时间未知，不会填写 `finished.duration_ms`。正常停顿时该总耗时是估算的说话结束到输入或失败的时间；`overlay_hide_scheduled` 和 `overlay_hidden` 对应完成后的 1 秒停留时间。日志不记录用户文字、音频或密钥，`result` 只记录固定状态或模型文件名。
 
@@ -51,6 +57,8 @@ Whisper CLI 的计算线程数自动取可用逻辑处理器数与 8 的较小�
 OCR 需要预先安装 [Tesseract OCR](https://github.com/tesseract-ocr/tesseract)。程序会自动寻找系统安装记录、常见安装目录、`PATH` 以及程序旁的 `tesseract.exe`；也可通过 `TESSERACT_EXE` 环境变量指定完整路径。设置页的快捷键模块会显示找到的程序和已安装语言包。
 
 识别哪种文字，就需要相应的 [Tesseract 语言包](https://github.com/tesseract-ocr/tessdata_fast)：简体中文 `chi_sim`、繁体中文 `chi_tra`、韩文 `kor`、日文 `jpn`、英文 `eng`。只有英文包时，无法可靠识别中文或韩文。
+
+`src/platform/ocr.rs` 会优先将已配置的目标语言一对一映射到 Tesseract 模型，不再把中、韩、英、日模型拼接识别；目标语言包缺失时明确报错。未选择目标语言时才回退到显式原始语言，最后回退到单个已安装模型。选区在内存中依据边缘亮度判断是否为浅字深底：必要时反色为深字浅底，再给小选区加 10 像素白边；只有高度小于 24 像素时才放大两倍，避免普通小字无条件放大后笔画失真。高度不超过 64 像素的横向选区使用 `--psm 7`，其余保留 `--psm 6`。这些处理参考 [Tesseract 图像质量指南](https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html)，不会更改截图原件或强行改写识别文字。
 
 安装语言包：
 进入上方链接，打开所需的 `*.traineddata` 文件并点击「Download raw file」，把文件原名放到 `tesseract.exe` 旁边的 `tessdata` 文件夹。
@@ -101,7 +109,7 @@ OCR 需要预先安装 [Tesseract OCR](https://github.com/tesseract-ocr/tesserac
 
 ## 词库格式
 
-用户词库统一存放在程序目录下的 `word_libraries` 文件夹。未选择目标语言时使用 `word_libraries/user_words.json`。key 是复制内容，value 是对应的说明或翻译：
+用户词库保存在程序目录下的 `to_words.db`。`word_libraries` 中的 JSON 文件仅供旧版首次迁移和手动导入/导出。未选择目标语言时使用数据库中名为 `user_words.json` 的词库。key 是复制内容，value 是对应的说明或翻译：
 
 ```json
 {
@@ -116,21 +124,25 @@ OCR 需要预先安装 [Tesseract OCR](https://github.com/tesseract-ocr/tesserac
 
 设置页面分别选择“原始语言”和“目标语言”。原始语言默认“自动检测”，会根据查询框输入切换相应词库；短且无法可靠判断的文字会沿用当前词库。
 
-- 未选择目标语言：使用 `word_libraries/user_words.json`
-- 简体中文 → 韩语：使用 `word_libraries/user_words_cn_ko.json`，兼容已有词库
-- 英语 → 韩语：使用 `word_libraries/user_words_en_ko.json`
+- 未选择目标语言：使用数据库词库 `user_words.json`
+- 简体中文 → 韩语：使用数据库词库 `user_words_cn_ko.json`，兼容已有词库
+- 英语 → 韩语：使用数据库词库 `user_words_en_ko.json`
 
-对应文件不存在时会在 `word_libraries` 中自动创建空 JSON 词库（`{}`），已有文件不会被覆盖。自动检测对极短或混合语言输入可能不准确；需要固定词库时可手动选择原始语言。
+对应词库不存在时使用空词库，首次保存后在数据库中创建记录，不再生成 JSON 文件。自动检测对极短或混合语言输入可能不准确；需要固定词库时可手动选择原始语言。
 
-兼容旧版本：程序会把根目录中现有的 `user_words*.json` 复制到 `word_libraries`，不会删除或改写根目录中的原文件。
+兼容旧版本：首次建库会只读导入 `word_libraries` 和程序根目录中的 `user_words*.json`、`ui_config.json` 与待审核语音缓存；原文件不会删除或改写。旧 JSON 没有逐条时间戳，迁入时用文件修改时间作为入库时间。数据库用 `word_entries`、`app_settings`、`voice_cache_state` 和 `app_meta` 分表保存；词条还有读音、来源、更新时间及质量状态。明显错误词条标记为 `quarantined` 并从查询/编辑结果排除，原始 JSON 仍保留。可运行 `to_words.exe --migrate-data` 查看各词库迁入和隔离数量。
+
+`word_entries` 以 `id` 为内部编号，`library_name` 标识语言词库；`key_text` 是最终输出的译文，`value_text` 是原文或说明，`pronunciation` 是 key 的读音/罗马化（旧词条为空，可在编辑器中补充）。`created_at` 与 `updated_at` 是毫秒时间戳，`origin` 区分手工、AI 和旧版导入；`quality_status`/`quality_reason` 记录隔离结果。同一词库内的 key 唯一。`word_libraries` 表还保留没有词条的空语言词库。词库编辑器按 `created_at DESC, id DESC` 展示。
 
 ## 词库编辑器
 
 在设置页面点击“编辑词库”即可在当前设置窗口中进入词库编辑页面；点击“返回设置”可回到设置页。
 
+点击“编辑词库”还会向语音缓存后台线程发送一次强制审核请求，绕过一小时／20 条门槛，但网络审核仍在后台完成。审核通过后刷新未修改的编辑器；若已有未保存的草稿，保留草稿，并在保存时合并审核期间新增到磁盘的 key。词库写入使用进程内互斥锁，避免语音审核和编辑器保存交错覆盖。
+
 结构化表格模式支持：
 
-- 自适应 key/value 两列表格
+- 自适应 key/value/读音表格，默认最新入库在前（时间戳不在表格中显示）
 - 新增、修改、复制和删除词条
 - 新增词条自动插入第一行
 - 根据 key 或 value 筛选
@@ -140,7 +152,7 @@ OCR 需要预先安装 [Tesseract OCR](https://github.com/tesseract-ocr/tesserac
 
 批量导入和批量导出也会在当前窗口内切换，并可返回词库编辑页面，不会再打开新的系统窗口。
 
-批量导出时会先询问文件名，自动补充 `.json` 扩展名，并将文件保存到 `to_words.exe` 所在目录。
+批量导出时会先询问文件名，自动补充 `.json` 扩展名，并将文件保存到程序目录下的 `word_libraries` 文件夹。
 
 保存词库时会：
 
@@ -202,7 +214,7 @@ user_words (1).json
 
 快捷键框点击后直接按下新的组合键。数值项点击后使用鼠标滚轮调整，点击“保存并应用”后立即生效。
 
-配置保存在 `ui_config.json` 中。
+配置保存在 `to_words.db` 的 `app_settings` 表中；API Key 仍在 Windows 凭据管理器。
 
 ### DeepSeek AI 补充翻译
 
@@ -228,22 +240,7 @@ user_words (1).json
 
 ## 构建发布版本
 
-### Windows 本地语音识别（实验版）
-
-普通构建提供 SenseVoice（默认）和 `whisper.cpp`；Windows 本地识别实验代码保留在仓库工作区，通过 `windows-speech` Cargo feature 才会编译和显示设置选项，`packaging/windows_speech/build.ps1` 会显式启用该 feature。这些引擎共用现有录音、停顿检测、词库优先查询和结果输入流程。语音 AI 译文会异步写入对应的 `word_libraries/user_words_<原始语言>_<目标语言>.json`；相同 key/value 不重复写，冲突 key 不覆盖原词条。
-
-Windows 路线使用 `windows_speech_bridge/` 的 .NET 8 桥接程序和微软实验版 `Microsoft.Windows.AI.Speech`。当前文档没有公开的识别语言设置方式；对日语等语言可能返回英语译文，因此用户需要在自己的机器上验证结果。桥接程序要求 Windows 11 24H2+、WinAppSDK 实验版语音 API、已安装的本地语音模型，以及带 `systemAIModels` 权限的 MSIX 包身份。桥接程序使用 Windows App SDK 自包含发布，避免另外安装匹配的实验版 Windows App Runtime；这与 .NET 自包含发布是两个不同的选项。普通 `cargo run` 没有包身份，不能直接测试 Windows 选项。
-
-开发/发布准备：
-
-1. 安装 .NET 8 或更新版本的 SDK（本项目已用 10.0.401 编译桥接程序）、Windows SDK，并取得与 `packaging/windows_speech/AppxManifest.xml` 中 `Publisher` 一致的代码签名证书。生产发布应使用受信任的生产证书，不要把 `.pfx` 私钥提交到仓库。
-2. 运行 `powershell -ExecutionPolicy Bypass -File packaging/windows_speech/build.ps1`。脚本会构建 Rust 主程序和 .NET 桥接程序，把它们与配置/模型资源放入一个新的 `target/to_words_msix_stage_<时间>` 目录，将身份嵌入两个 EXE，并生成**未签名**的稀疏 MSIX 身份包。它不会复制你的词库，也不会安装证书或自动注册 MSIX。发布时保留桥接程序发布输出的**全部文件**，不仅是 `.exe`。
-3. 用 `signtool.exe` 对 `.msix` 签名。清单中的包名、Publisher、Application Id 必须和两个 EXE 内嵌清单完全一致。每次升级身份包应递增清单 Version。已有用户的 `word_libraries` 要单独保留并合并，不要用空目录覆盖。
-4. 自签名证书仅限开发测试。安装 MSIX 前，须经管理员同意将**公钥证书**导入 `Cert:\LocalMachine\TrustedPeople`；仅导入 `Cert:\CurrentUser\Root` 或 `Cert:\CurrentUser\TrustedPeople` 仍可能报 `0x800B0109`。这项信任会影响本机所有用户，测试完应移除对应证书。生产发布应使用受信任的正式签名方式，不应要求用户信任开发证书。
-5. 将签名后的身份包和发布目录一起部署，并以发布目录作为外部位置注册：`Add-AppxPackage -Path <身份包绝对路径> -ExternalLocation <发布目录绝对路径>`。这是微软的 *packaging with external location*（稀疏 MSIX）方案：保留程序目录和用户词库的现有行为，但身份包本身**不是**包含所有程序文件的独立安装器。不要把外部位置放在普通用户不可写的 `Program Files` 中，除非另行迁移配置和词库存储。
-6. 启动该发布目录中的程序，在设置里选 Windows 引擎，点击“准备 Windows 语音模型”并确认。CPU 设备可能通过 Windows Update 首次下载模型，等待就绪后再尝试语音快捷键。
-
-若本机只有 .NET Runtime、没有 .NET SDK，`build.ps1` 会在构建前停止。未签名的 MSIX 身份包不能直接安装；签名与实机识别验证是发布前的必要步骤。
+程序提供 SenseVoice（默认）和 `whisper.cpp` 两种本地识别引擎，共用录音、停顿检测、词库优先查询和结果输入流程。语音 AI 译文在缓存审核通过后写入 `to_words.db` 对应语言词库；相同 key/value 不重复写，冲突 key 不覆盖原词条。
 
 ```powershell
 cargo build --release
@@ -255,15 +252,12 @@ cargo build --release
 target\release\to_words.exe
 ```
 
-发布时请将程序和词库放在同一目录，建议同时携带配置文件：
+升级时请将程序和用户数据库放在同一目录：
 
 ```text
 to_words.exe
-ui_config.json
-word_libraries\
-  user_words.json
+to_words.db
+word_libraries\  # 可选：待合并或待导入的旧 JSON
 ```
 
-如果使用多语言词库，请把相应文件放入 `word_libraries`，例如韩语对应 `word_libraries/user_words_cn_ko.json`。
-
-如果缺少 `ui_config.json`，程序会使用默认设置。
+首次安装若没有 `to_words.db`，程序会创建空数据库并使用默认设置；从旧版升级时把原有 JSON 文件一并放入程序目录，由程序首次启动迁入。迁移完成后备份 `to_words.db` 即可保留词库、设置和待审核语音缓存。

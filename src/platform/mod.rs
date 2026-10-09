@@ -4,6 +4,8 @@
 //! 放在这一层，避免平台相关代码扩散到界面和领域模块。
 
 pub(crate) mod credentials;
+pub(crate) mod extra_mouse_buttons;
+pub(crate) mod mouse_hotkey;
 pub(crate) mod ocr;
 pub(crate) mod system_tray;
 pub(crate) mod voice;

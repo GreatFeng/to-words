@@ -3,7 +3,8 @@
 //! 本模块负责识别程序目录及 `word_libraries` 中的词库，校验待合并文件必须位于
 //! 允许目录内，并使用有序映射去除重复项、统计冲突，最后安全写入目标词库。
 
-use crate::{prepare_word_library_file, project_directory, word_library_directory};
+use crate::domain::{ai_word_save, storage};
+use crate::{project_directory, word_library_directory};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,54 +18,41 @@ pub(crate) struct MergeReport {
     pub(crate) total: usize,
 }
 
-pub(crate) fn organize_legacy_word_files() -> Result<usize> {
-    let root = project_directory();
-    let directory = word_library_directory();
-    fs::create_dir_all(&directory)
-        .with_context(|| format!("无法创建词库目录：{}", directory.display()))?;
-
-    let mut copied = 0;
-    for entry in
-        fs::read_dir(&root).with_context(|| format!("无法读取程序目录：{}", root.display()))?
-    {
-        let path = entry?.path();
-        if !path.is_file() || !is_legacy_word_file(&path) {
-            continue;
-        }
-        let Some(file_name) = path.file_name() else {
-            continue;
-        };
-        let target = directory.join(file_name);
-        if !target.exists() {
-            fs::copy(&path, &target).with_context(|| {
-                format!("无法复制旧词库 {}：{}", path.display(), target.display())
-            })?;
-            copied += 1;
-        }
-    }
-    Ok(copied)
-}
-
 pub(crate) fn list_word_library_files(target_file_name: &str) -> Result<Vec<String>> {
-    organize_legacy_word_files()?;
     let directory = word_library_directory();
-    let mut files = fs::read_dir(&directory)
-        .with_context(|| format!("无法读取词库目录：{}", directory.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-        })
-        .filter_map(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_owned)
-        })
-        .filter(|file_name| !file_name.eq_ignore_ascii_case(target_file_name))
-        .collect::<Vec<_>>();
+    fs::create_dir_all(&directory)?;
+    let mut files = storage::list_library_names()?;
+    files.extend(
+        fs::read_dir(&directory)
+            .with_context(|| format!("无法读取词库目录：{}", directory.display()))?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            })
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .filter(|file_name| !file_name.eq_ignore_ascii_case(target_file_name))
+            .collect::<Vec<_>>(),
+    );
+    files.extend(
+        fs::read_dir(project_directory())?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_file() && is_legacy_word_file(path))
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            }),
+    );
+    files.retain(|name| !name.eq_ignore_ascii_case(target_file_name));
     files.sort_by_key(|file_name| file_name.to_ascii_lowercase());
+    files.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     Ok(files)
 }
 
@@ -79,29 +67,33 @@ pub(crate) fn merge_selected_word_files(
         bail!("目标词库文件名无效");
     }
 
-    let target = prepare_word_library_file(target_file_name)?;
     let directory = word_library_directory();
-    let mut sources = Vec::with_capacity(source_file_names.len());
+    let mut imports = Vec::with_capacity(source_file_names.len());
     for file_name in source_file_names {
         if !is_safe_file_name(file_name) || file_name.eq_ignore_ascii_case(target_file_name) {
             bail!("合并来源文件名无效：{file_name}");
         }
-        let path = directory.join(file_name);
-        if !path.is_file() {
+        let preferred = directory.join(file_name);
+        let path = if preferred.is_file() {
+            preferred
+        } else {
+            project_directory().join(file_name)
+        };
+        let words = if path.is_file() {
+            read_words(&path)?
+        } else if storage::list_library_names()?
+            .iter()
+            .any(|name| name == file_name)
+        {
+            storage::load_word_map(file_name)?
+        } else {
             bail!("找不到要合并的词库：{file_name}");
-        }
-        sources.push(path);
+        };
+        imports.push(words);
     }
 
-    let mut merged = if target.exists() {
-        read_words(&target)?
-    } else {
-        BTreeMap::new()
-    };
-    let imports = sources
-        .iter()
-        .map(|path| read_words(path).map(|words| (path, words)))
-        .collect::<Result<Vec<_>>>()?;
+    let _guard = ai_word_save::lock_word_library();
+    let mut merged = storage::load_word_map(target_file_name)?;
     let mut report = MergeReport {
         source_files: imports.len(),
         added: 0,
@@ -110,11 +102,11 @@ pub(crate) fn merge_selected_word_files(
         total: 0,
     };
 
-    for (_, words) in imports {
+    for words in imports {
         for (key, value) in words {
             let key = key.trim().to_owned();
             let value = value.trim().to_owned();
-            if key.is_empty() || value.is_empty() {
+            if storage::obvious_error_reason(target_file_name, &key, &value).is_some() {
                 continue;
             }
             match merged.get(&key) {
@@ -126,9 +118,7 @@ pub(crate) fn merge_selected_word_files(
         }
     }
 
-    let formatted = serde_json::to_string_pretty(&merged).context("无法格式化合并后的词库")?;
-    fs::write(&target, format!("{formatted}\n"))
-        .with_context(|| format!("无法写入目标词库：{}", target.display()))?;
+    storage::save_word_map(target_file_name, &merged)?;
     report.total = merged.len();
     Ok(report)
 }

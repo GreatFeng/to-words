@@ -8,9 +8,8 @@ use anyhow::{Context, Result, bail};
 use eframe::egui;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -28,17 +27,20 @@ use crate::components::settings::{
 use crate::components::voice_overlay::VoiceOverlay;
 use crate::domain::ai_word_save;
 use crate::domain::continuous_input::ContinuousInput;
+use crate::domain::shortcut::MouseButton;
+use crate::domain::shortcut::Shortcut;
+use crate::domain::storage;
+use crate::domain::voice_word_cache::{self, VoiceCacheRequest, VoiceWordCache};
 use crate::domain::word_index::{SearchHit, WordEntry, WordIndex};
 use crate::platform::credentials;
+use crate::platform::extra_mouse_buttons::ExtraMouseButtons;
+use crate::platform::mouse_hotkey::MouseHotkeyListener;
 use crate::platform::ocr::{self, CaptureRegion, CapturedScreen, MonitorBounds};
 use crate::platform::system_tray::{SystemTray, TrayAction};
 use crate::platform::voice::{self, VoiceEvent, VoiceSession};
 use crate::platform::voice_metrics::VoiceTrace;
 use crate::platform::voice_output::{VoiceInputMethod, VoiceInputTarget, input_error_trace_code};
 use crate::{translation_language, ui_theme};
-
-#[derive(Debug, Deserialize)]
-struct UserWords(HashMap<String, String>);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -207,9 +209,7 @@ impl UiConfig {
             .code()
             .to_string();
         self.voice_language = translation_language::normalize_source_code(&self.voice_language);
-        if !matches!(self.voice_backend.as_str(), "sensevoice" | "whisper")
-            && !(cfg!(feature = "windows-speech") && self.voice_backend == "windows")
-        {
+        if !matches!(self.voice_backend.as_str(), "sensevoice" | "whisper") {
             self.voice_backend = "sensevoice".to_string();
         }
         self
@@ -241,21 +241,10 @@ impl UiConfig {
     }
 }
 
-pub(crate) fn project_file_path(file_name: &str) -> PathBuf {
-    let working_dir_path = PathBuf::from(file_name);
-    if working_dir_path.exists() {
-        return working_dir_path;
-    }
-
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(file_name)))
-        .unwrap_or(working_dir_path)
-}
-
 pub(crate) fn project_directory() -> PathBuf {
     let working_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if working_directory.join("ui_config.json").exists()
+        || working_directory.join(storage::DATABASE_FILE).exists()
         || working_directory.join("user_words.json").exists()
         || working_directory.join("word_libraries").exists()
     {
@@ -272,118 +261,110 @@ pub(crate) fn word_library_directory() -> PathBuf {
     project_directory().join("word_libraries")
 }
 
-pub(crate) fn prepare_word_library_file(file_name: &str) -> Result<PathBuf> {
-    let directory = word_library_directory();
-    fs::create_dir_all(&directory)
-        .with_context(|| format!("无法创建词库目录：{}", display_path(&directory)))?;
-    let target = directory.join(file_name);
-    let legacy = project_directory().join(file_name);
-    if !target.exists() && legacy.exists() && legacy != target {
-        fs::copy(&legacy, &target)
-            .with_context(|| format!("无法把旧词库复制到词库目录：{}", display_path(&legacy)))?;
-    }
-    ensure_word_library_file(&target)?;
-    Ok(target)
-}
-
-fn ensure_word_library_file(target: &Path) -> Result<()> {
-    if !target.exists() {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(target)
-        {
-            Ok(mut file) => file
-                .write_all(b"{}\n")
-                .with_context(|| format!("无法初始化词库：{}", display_path(target)))?,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("无法创建词库：{}", display_path(target)));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn load_user_words(config: &UiConfig, source: &str) -> Result<WordIndex> {
     let file_name = translation_language::word_file_name(source, &config.translation_language);
-    let path = prepare_word_library_file(&file_name)?;
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("无法读取文件：{}", display_path(&path)))?;
-    let parsed: UserWords = serde_json::from_str(&content)
-        .with_context(|| format!("{} 解析失败，请检查 JSON 格式", display_path(&path)))?;
-    Ok(WordIndex::from_map(parsed.0))
+    Ok(WordIndex::from_map(
+        storage::load_word_map(&file_name)?.into_iter().collect(),
+    ))
 }
 
 fn load_ui_config() -> Result<UiConfig> {
-    let path = project_file_path("ui_config.json");
-    if !path.exists() {
+    let Some(content) = storage::load_setting("ui_config")? else {
         return Ok(UiConfig::default());
-    }
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("无法读取文件：{}", display_path(&path)))?;
-    let config: UiConfig = serde_json::from_str(&content)
-        .with_context(|| format!("{} 解析失败，请检查 JSON 格式", display_path(&path)))?;
+    };
+    let config: UiConfig = serde_json::from_str(&content).context("数据库中的 UI 设置格式错误")?;
     Ok(config.normalized())
 }
 
 fn save_ui_config(config: &UiConfig) -> Result<()> {
-    let path = project_file_path("ui_config.json");
     let content = serde_json::to_string_pretty(config).context("无法生成 UI 配置")?;
-    fs::write(&path, format!("{content}\n"))
-        .with_context(|| format!("无法写入文件：{}", display_path(&path)))
+    storage::save_setting("ui_config", &content)
 }
 
-fn parse_hotkeys(config: &UiConfig) -> Result<(HotKey, HotKey, HotKey, HotKey)> {
-    let popup = config
-        .hotkeys
-        .popup
-        .parse::<HotKey>()
-        .with_context(|| format!("查询框快捷键格式无效：{}", config.hotkeys.popup))?;
-    let settings = config
-        .hotkeys
-        .settings
-        .parse::<HotKey>()
-        .with_context(|| format!("设置面板快捷键格式无效：{}", config.hotkeys.settings))?;
-    let clear_composed = config
-        .hotkeys
-        .clear_composed
-        .parse::<HotKey>()
-        .with_context(|| {
-            format!(
-                "清空组合内容快捷键格式无效：{}",
-                config.hotkeys.clear_composed
-            )
-        })?;
-    let ocr = config
-        .hotkeys
-        .ocr
-        .parse::<HotKey>()
-        .with_context(|| format!("OCR 快捷键格式无效：{}", config.hotkeys.ocr))?;
-    let voice = config
-        .hotkeys
-        .voice
-        .parse::<HotKey>()
-        .with_context(|| format!("语音识别快捷键格式无效：{}", config.hotkeys.voice))?;
-    if popup.id() == settings.id()
-        || popup.id() == clear_composed.id()
-        || settings.id() == clear_composed.id()
-        || ocr.id() == popup.id()
-        || ocr.id() == settings.id()
-        || ocr.id() == clear_composed.id()
-        || [popup.id(), settings.id(), clear_composed.id(), ocr.id()].contains(&voice.id())
-    {
-        bail!("快捷键不能使用相同的组合");
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HotkeyBindings {
+    popup: Shortcut,
+    settings: Shortcut,
+    clear_composed: Shortcut,
+    ocr: Shortcut,
+    voice: Shortcut,
+}
+
+impl HotkeyBindings {
+    fn global_keyboard_keys(self) -> Vec<HotKey> {
+        [self.popup, self.settings, self.ocr, self.voice]
+            .into_iter()
+            .filter_map(Shortcut::keyboard)
+            .collect()
     }
-    Ok((popup, settings, ocr, voice))
+
+    fn uses_extra_mouse_button(self) -> bool {
+        [
+            self.popup,
+            self.settings,
+            self.clear_composed,
+            self.ocr,
+            self.voice,
+        ]
+        .into_iter()
+        .filter_map(Shortcut::mouse)
+        .any(|shortcut| {
+            matches!(
+                shortcut.button,
+                MouseButton::Extra6 | MouseButton::Extra7 | MouseButton::Extra8
+            )
+        })
+    }
 }
 
-fn display_path(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
+fn parse_hotkeys(config: &UiConfig) -> Result<HotkeyBindings> {
+    let parse = |label: &str, value: &str| {
+        value
+            .parse::<Shortcut>()
+            .map_err(|error| anyhow::anyhow!("{label}快捷键格式无效：{value}：{error}"))
+    };
+    let popup = parse("查询框", &config.hotkeys.popup)?;
+    let settings = parse("设置面板", &config.hotkeys.settings)?;
+    let clear_composed = parse("清空组合内容", &config.hotkeys.clear_composed)?;
+    let ocr = parse("OCR", &config.hotkeys.ocr)?;
+    let voice = parse("语音识别", &config.hotkeys.voice)?;
+    let bindings = HotkeyBindings {
+        popup,
+        settings,
+        clear_composed,
+        ocr,
+        voice,
+    };
+    let all = [popup, settings, clear_composed, ocr, voice];
+    for (index, shortcut) in all.iter().enumerate() {
+        if all[index + 1..].contains(shortcut) {
+            bail!("快捷键不能使用相同的组合");
+        }
+    }
+    Ok(bindings)
+}
+
+fn register_global_keyboard_hotkeys(
+    manager: &GlobalHotKeyManager,
+    bindings: HotkeyBindings,
+) -> Result<()> {
+    let mut registered = Vec::new();
+    for (label, binding) in [
+        ("查询框", bindings.popup),
+        ("设置面板", bindings.settings),
+        ("OCR", bindings.ocr),
+        ("语音识别", bindings.voice),
+    ] {
+        if let Some(key) = binding.keyboard() {
+            if let Err(error) = manager.register(key) {
+                let _ = manager.unregister_all(&registered);
+                return Err(error)
+                    .with_context(|| format!("{label}快捷键注册失败，可能已被其他程序占用"));
+            }
+            registered.push(key);
+        }
+    }
+    Ok(())
 }
 
 fn parse_hex_color(color: &str, opacity: f32) -> Result<egui::Color32> {
@@ -812,53 +793,140 @@ struct OcrPreview {
     display: Option<(String, bool)>,
 }
 
-struct VoiceSaveRequest {
-    candidate: AiCandidate,
-    config: UiConfig,
-    active_source_language: String,
+enum VoiceSaveRequest {
+    Candidate(VoiceCacheRequest),
+    ReviewNow,
 }
 
 struct VoiceSaveEvent {
     library_name: String,
     saved: Result<()>,
-    refreshed_words: Option<Result<WordIndex>>,
 }
 
 fn start_voice_save_worker() -> (mpsc::Sender<VoiceSaveRequest>, Receiver<VoiceSaveEvent>) {
     let (request_sender, request_receiver) = mpsc::channel::<VoiceSaveRequest>();
     let (event_sender, event_receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        for request in request_receiver {
-            let library_name = translation_language::word_file_name(
-                &request.candidate.source_language_code,
-                &request.candidate.language_code,
-            );
-            let active_library_name = translation_language::word_file_name(
-                &request.active_source_language,
-                &request.config.translation_language,
-            );
-            let saved = ai_word_save::save_candidate(&request.candidate);
-            let refreshed_words = if saved.is_ok() && library_name == active_library_name {
-                Some(load_user_words(
-                    &request.config,
-                    &request.active_source_language,
-                ))
-            } else {
-                None
+        let path = storage::database_path();
+        let mut cache = match VoiceWordCache::load(path) {
+            Ok(cache) => cache,
+            Err(error) => {
+                let _ = event_sender.send(VoiceSaveEvent {
+                    library_name: String::new(),
+                    saved: Err(error),
+                });
+                return;
+            }
+        };
+        // 重新启动时也审核上次遗留的缓存；平时一小时或满 20 条触发。
+        let mut last_review = if cache.pending_len() > 0 {
+            Instant::now() - voice_word_cache::REVIEW_INTERVAL
+        } else {
+            Instant::now()
+        };
+        loop {
+            let mut force_review = false;
+            match request_receiver.recv_timeout(Duration::from_secs(30)) {
+                Ok(VoiceSaveRequest::Candidate(request)) => {
+                    if let Err(error) = cache.enqueue(request) {
+                        let _ = event_sender.send(VoiceSaveEvent {
+                            library_name: String::new(),
+                            saved: Err(error),
+                        });
+                    }
+                }
+                Ok(VoiceSaveRequest::ReviewNow) => force_review = true,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if let Err(error) = cache.expire_uncertain() {
+                let _ = event_sender.send(VoiceSaveEvent {
+                    library_name: String::new(),
+                    saved: Err(error),
+                });
+            }
+            if !voice_review_due(
+                cache.reviewable_len(),
+                cache.pending_len(),
+                force_review,
+                last_review.elapsed(),
+            ) {
+                continue;
+            }
+            last_review = Instant::now();
+            let key = match credentials::load_key() {
+                Ok(Some(key)) if !key.trim().is_empty() => key,
+                Ok(_) => {
+                    if force_review {
+                        let _ = event_sender.send(VoiceSaveEvent {
+                            library_name: String::new(),
+                            saved: Err(anyhow::anyhow!(
+                                "未配置 DeepSeek API Key，语音缓存暂未审核"
+                            )),
+                        });
+                    }
+                    continue; // 没有 Key 时保留缓存，不丢弃待审核数据。
+                }
+                Err(error) => {
+                    let _ = event_sender.send(VoiceSaveEvent {
+                        library_name: String::new(),
+                        saved: Err(error.context("读取语音词库审核用 API Key 失败")),
+                    });
+                    continue;
+                }
             };
-            if event_sender
-                .send(VoiceSaveEvent {
-                    library_name,
-                    saved,
-                    refreshed_words,
-                })
-                .is_err()
-            {
-                break;
+            // 单次定时任务最多审核 100 条；始终在后台线程运行。
+            for _ in 0..10 {
+                let before = cache.reviewable_len();
+                if before == 0 {
+                    break;
+                }
+                match cache.review_once(&key) {
+                    Ok(saved) => {
+                        let mut libraries = Vec::new();
+                        for candidate in saved {
+                            let name = translation_language::word_file_name(
+                                &candidate.source_language_code,
+                                &candidate.language_code,
+                            );
+                            if !libraries.contains(&name) {
+                                libraries.push(name);
+                            }
+                        }
+                        for library_name in libraries {
+                            let _ = event_sender.send(VoiceSaveEvent {
+                                library_name,
+                                saved: Ok(()),
+                            });
+                        }
+                        if cache.reviewable_len() >= before {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = event_sender.send(VoiceSaveEvent {
+                            library_name: String::new(),
+                            saved: Err(error),
+                        });
+                        break;
+                    }
+                }
             }
         }
     });
     (request_sender, event_receiver)
+}
+
+fn voice_review_due(
+    reviewable: usize,
+    pending: usize,
+    force_review: bool,
+    elapsed: Duration,
+) -> bool {
+    reviewable > 0
+        && (force_review
+            || pending >= voice_word_cache::REVIEW_THRESHOLD
+            || elapsed >= voice_word_cache::REVIEW_INTERVAL)
 }
 
 impl OcrPreview {
@@ -883,8 +951,12 @@ fn translate_ocr_recognized(recognized: &str, target: &str, polite_mode: bool) -
     ai::translate_ocr_text(recognized, target, &key, polite_mode)
 }
 
-fn ocr_translation_target(enabled: bool, source: &str) -> Option<String> {
-    enabled.then(|| {
+fn same_language_no_translation(source: &str, target: &str) -> bool {
+    !target.is_empty() && source != "auto" && source == target
+}
+
+fn ocr_translation_target(enabled: bool, source: &str, target: &str) -> Option<String> {
+    (enabled && !same_language_no_translation(source, target)).then(|| {
         if source == "auto" {
             "cn".to_string()
         } else {
@@ -895,10 +967,12 @@ fn ocr_translation_target(enabled: bool, source: &str) -> Option<String> {
 
 struct MatchApp {
     hotkey_manager: GlobalHotKeyManager,
-    popup_hotkey: HotKey,
-    settings_hotkey: HotKey,
-    ocr_hotkey: HotKey,
-    voice_hotkey: HotKey,
+    hotkeys: HotkeyBindings,
+    mouse_hotkeys: Option<MouseHotkeyListener>,
+    mouse_hotkey_error: Option<String>,
+    extra_mouse_buttons: Option<ExtraMouseButtons>,
+    extra_mouse_attempted: bool,
+    mouse_bindings_active_at: Instant,
     hotkeys_suspended: bool,
     system_tray: SystemTray,
     config: UiConfig,
@@ -921,6 +995,8 @@ struct MatchApp {
     voice_save_results: Receiver<VoiceSaveEvent>,
     voice_last_logged_drawn_original_id: u64,
     voice_active_utterance_id: u64,
+    voice_session_id: u64,
+    voice_context: VecDeque<(u64, String)>,
     last_ai_candidate: Option<AiCandidate>,
     last_query: String,
     selected: usize,
@@ -944,29 +1020,17 @@ impl MatchApp {
         configure_style(context);
 
         let config = load_ui_config().unwrap_or_default();
-        let (popup_hotkey, settings_hotkey, ocr_hotkey, voice_hotkey) = parse_hotkeys(&config)?;
+        let hotkeys = parse_hotkeys(&config)?;
+        let (mouse_hotkeys, mouse_hotkey_error) = match MouseHotkeyListener::new() {
+            Ok(listener) => (Some(listener), None),
+            Err(error) => (None, Some(format!("鼠标快捷键监听不可用：{error:#}"))),
+        };
         let manager = GlobalHotKeyManager::new().context("无法初始化全局快捷键")?;
-        manager
-            .register(popup_hotkey)
-            .with_context(|| format!("无法注册 {}，可能已被其他程序占用", config.hotkeys.popup))?;
-        if let Err(error) = manager.register(settings_hotkey) {
-            let _ = manager.unregister(popup_hotkey);
-            return Err(error).with_context(|| {
-                format!("无法注册 {}，可能已被其他程序占用", config.hotkeys.settings)
-            });
-        }
-        if let Err(error) = manager.register(ocr_hotkey) {
-            let _ = manager.unregister_all(&[popup_hotkey, settings_hotkey]);
-            return Err(error)
-                .with_context(|| format!("无法注册 {}，可能已被其他程序占用", config.hotkeys.ocr));
-        }
-        if let Err(error) = manager.register(voice_hotkey) {
-            let _ = manager.unregister_all(&[popup_hotkey, settings_hotkey, ocr_hotkey]);
-            return Err(error).with_context(|| {
-                format!("无法注册 {}，可能已被其他程序占用", config.hotkeys.voice)
-            });
-        }
+        register_global_keyboard_hotkeys(&manager, hotkeys)?;
         let system_tray = SystemTray::new()?;
+        if let Some(error) = &mouse_hotkey_error {
+            system_tray.set_status(error);
+        }
         let (voice_save_requests, voice_save_results) = start_voice_save_worker();
         let active_source_language = if config.source_language == "auto" {
             "cn".to_string()
@@ -987,10 +1051,12 @@ impl MatchApp {
 
         Ok(Self {
             hotkey_manager: manager,
-            popup_hotkey,
-            settings_hotkey,
-            ocr_hotkey,
-            voice_hotkey,
+            hotkeys,
+            mouse_hotkeys,
+            mouse_hotkey_error,
+            extra_mouse_buttons: None,
+            extra_mouse_attempted: false,
+            mouse_bindings_active_at: Instant::now(),
             hotkeys_suspended: false,
             system_tray,
             config,
@@ -1013,6 +1079,11 @@ impl MatchApp {
             voice_save_results,
             voice_last_logged_drawn_original_id: 0,
             voice_active_utterance_id: 0,
+            voice_session_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64,
+            voice_context: VecDeque::new(),
             last_ai_candidate: None,
             last_query: String::new(),
             selected: 0,
@@ -1108,6 +1179,9 @@ impl MatchApp {
         self.ocr_state = OcrState::Idle;
         self.settings_panel
             .open(&self.config, &self.active_source_language);
+        if let Some(error) = &self.mouse_hotkey_error {
+            self.settings_panel.set_result(Err(error.clone()));
+        }
         self.is_open = true;
         self.settings_open = true;
 
@@ -1285,6 +1359,7 @@ impl MatchApp {
                     if let Some(target) = ocr_translation_target(
                         self.config.ocr_auto_translate,
                         &self.config.source_language,
+                        &self.config.translation_language,
                     ) {
                         let (sender, receiver) = mpsc::channel();
                         let polite_mode = self.config.ai_polite_mode;
@@ -1387,6 +1462,8 @@ impl MatchApp {
         self.voice_trace = None;
         self.voice_last_logged_drawn_original_id = 0;
         self.voice_active_utterance_id = 0;
+        self.voice_session_id = self.voice_session_id.wrapping_add(1);
+        self.voice_context.clear();
         let mut overlay = VoiceOverlay::new(self.voice_work_area(context));
         let hold_to_talk = self.config.voice_hold_to_talk;
         overlay.status = if hold_to_talk {
@@ -1443,10 +1520,8 @@ impl MatchApp {
                         &self.active_source_language,
                         &self.config.translation_language,
                     );
-                    if event.library_name == active_library_name
-                        && let Some(refreshed) = event.refreshed_words
-                    {
-                        match refreshed {
+                    if event.library_name == active_library_name {
+                        match load_user_words(&self.config, &self.active_source_language) {
                             Ok(words) => {
                                 self.words = words;
                                 self.word_load_error = None;
@@ -1454,14 +1529,25 @@ impl MatchApp {
                                 self.matches.clear();
                             }
                             Err(error) => self.system_tray.set_status(&format!(
-                                "AI 译文已保存，但重新加载词库失败：{error:#}"
+                                "审核后的语音词条已保存，但重新加载词库失败：{error:#}"
                             )),
                         }
                     }
+                    if let Err(error) = self
+                        .settings_panel
+                        .refresh_word_editor_after_external_save(&event.library_name)
+                    {
+                        self.system_tray.set_status(&format!(
+                            "审核词条已保存，但词库编辑器刷新失败：{error:#}"
+                        ));
+                    }
                 }
-                Err(error) => self
-                    .system_tray
-                    .set_status(&format!("保存语音 AI 译文到词库失败：{error:#}")),
+                Err(error) => {
+                    self.settings_panel
+                        .show_word_editor_review_error(&format!("{error:#}"));
+                    self.system_tray
+                        .set_status(&format!("语音词库缓存或审核失败：{error:#}"));
+                }
             }
         }
         let mut events = Vec::new();
@@ -1579,11 +1665,26 @@ impl MatchApp {
                     }
                     if self
                         .voice_save_requests
-                        .send(VoiceSaveRequest {
+                        .send(VoiceSaveRequest::Candidate(VoiceCacheRequest {
+                            previous: self
+                                .voice_context
+                                .iter()
+                                .position(|(id, _)| *id == utterance_id)
+                                .and_then(|index| index.checked_sub(1))
+                                .and_then(|index| self.voice_context.get(index))
+                                .map(|(_, text)| text.clone()),
+                            next: self
+                                .voice_context
+                                .iter()
+                                .position(|(id, _)| *id == utterance_id)
+                                .and_then(|index| self.voice_context.get(index + 1))
+                                .map(|(_, text)| text.clone())
+                                .or_else(|| {
+                                    self.voice_pending.front().map(|(_, text)| text.clone())
+                                }),
                             candidate,
-                            config: self.config.clone(),
-                            active_source_language: self.active_source_language.clone(),
-                        })
+                            session_id: self.voice_session_id,
+                        }))
                         .is_err()
                     {
                         self.system_tray
@@ -1708,12 +1809,17 @@ impl MatchApp {
             trace.record(utterance_id, "lookup_started", None, "ok");
         }
         let query = text.trim();
-        if query.is_empty() || query == "[BLANK_AUDIO]" {
+        if voice_word_cache::is_obviously_bad(query) {
             if let Some(trace) = &self.voice_trace {
                 trace.finish(utterance_id, "empty_transcript");
             }
             self.finish_voice_error_for(utterance_id, "没有识别到清晰的语音，请重试".to_string());
             return;
+        }
+        self.voice_context
+            .push_back((utterance_id, query.to_owned()));
+        if self.voice_context.len() > 20 {
+            self.voice_context.pop_front();
         }
         if utterance_id == self.voice_active_utterance_id
             && let Some(overlay) = &mut self.voice_overlay
@@ -1721,6 +1827,21 @@ impl MatchApp {
             overlay.original = query.to_string();
             overlay.result.clear();
             overlay.status = "正在查询本地词库…".to_string();
+        }
+        if same_language_no_translation(
+            &self.config.source_language,
+            &self.config.translation_language,
+        ) {
+            if let Some(trace) = &self.voice_trace {
+                trace.record(
+                    utterance_id,
+                    "translation_skipped_same_language",
+                    Some(lookup_started.elapsed()),
+                    "ok",
+                );
+            }
+            self.finish_voice_original(utterance_id, query);
+            return;
         }
         if self.config.source_language == "auto"
             && let Some(detected) = translation_language::detect_source_language(query)
@@ -1954,6 +2075,53 @@ impl MatchApp {
         }
     }
 
+    fn finish_voice_original(&mut self, utterance_id: u64, text: &str) {
+        let started = Instant::now();
+        let typed = VoiceInputTarget::capture().map_or(Ok(None), |target| {
+            target.type_if_active(
+                text,
+                self.config.voice_aion2_manual_paste,
+                self.config.voice_hold_to_talk,
+            )
+        });
+        if let Some(trace) = &self.voice_trace {
+            trace.record(
+                utterance_id,
+                "text_input",
+                Some(started.elapsed()),
+                match &typed {
+                    Ok(Some(VoiceInputMethod::Paste)) => "paste_sent",
+                    Ok(Some(VoiceInputMethod::Unicode)) => "unicode_sent",
+                    Ok(Some(VoiceInputMethod::ManualPaste)) => "manual_paste_ready",
+                    #[cfg(feature = "tsf-notepad-prototype")]
+                    Ok(Some(VoiceInputMethod::TextService)) => "text_service_queued",
+                    Ok(None) => "skipped",
+                    Err(error) => input_error_trace_code(error),
+                },
+            );
+            trace.finish(
+                utterance_id,
+                match &typed {
+                    Ok(Some(_)) => "original_input_sent",
+                    Ok(None) => "input_skipped",
+                    Err(_) => "input_error",
+                },
+            );
+        }
+        match typed {
+            Ok(Some(method)) => {
+                self.finish_voice_status_for(utterance_id, voice_original_status(method));
+            }
+            Ok(None) => self.finish_voice_status_for(
+                utterance_id,
+                "当前窗口不可用或焦点已变化，未输入识别原文",
+            ),
+            Err(error) => {
+                self.finish_voice_status_for(utterance_id, &format!("识别原文输入失败：{error:#}"))
+            }
+        }
+    }
+
     fn finish_voice_status(&mut self, status: &str) {
         self.system_tray.set_status(status);
         if let Some(overlay) = &mut self.voice_overlay {
@@ -1999,7 +2167,25 @@ impl MatchApp {
 
     fn apply_settings(&mut self, config: UiConfig, key_update: &AiKeyUpdate) -> Result<()> {
         let config = config.normalized();
-        let (new_popup, new_settings, new_ocr, new_voice) = parse_hotkeys(&config)?;
+        let new_hotkeys = parse_hotkeys(&config)?;
+        if self.mouse_hotkeys.is_none()
+            && [
+                new_hotkeys.popup,
+                new_hotkeys.settings,
+                new_hotkeys.clear_composed,
+                new_hotkeys.ocr,
+                new_hotkeys.voice,
+            ]
+            .into_iter()
+            .any(|shortcut| shortcut.mouse().is_some())
+        {
+            bail!("鼠标快捷键监听不可用，无法启用鼠标按键绑定");
+        }
+        if new_hotkeys.uses_extra_mouse_button() && self.extra_mouse_buttons.is_none() {
+            bail!(
+                "当前鼠标扩展键监听不可用；第 6～8 键需由驱动提供 DirectInput 按键，或在鼠标驱动中映射成独立键盘快捷键"
+            );
+        }
         let new_source = if config.source_language == "auto" {
             self.active_source_language.clone()
         } else {
@@ -2015,64 +2201,31 @@ impl MatchApp {
                 credentials::delete_key().context("删除 DeepSeek API Key 失败")?
             }
         }
-        let old_hotkeys = [
-            self.popup_hotkey,
-            self.settings_hotkey,
-            self.ocr_hotkey,
-            self.voice_hotkey,
-        ];
-        let shortcuts_changed = new_popup != self.popup_hotkey
-            || new_settings != self.settings_hotkey
-            || new_ocr != self.ocr_hotkey
-            || new_voice != self.voice_hotkey;
+        let old_keyboard_keys = self.hotkeys.global_keyboard_keys();
+        let new_keyboard_keys = new_hotkeys.global_keyboard_keys();
+        let keyboard_changed = old_keyboard_keys != new_keyboard_keys;
 
-        if shortcuts_changed {
+        if keyboard_changed {
             self.hotkey_manager
-                .unregister_all(&old_hotkeys)
+                .unregister_all(&old_keyboard_keys)
                 .context("无法取消注册原快捷键")?;
-
-            if let Err(error) = self.hotkey_manager.register(new_popup) {
-                let _ = self.hotkey_manager.register_all(&old_hotkeys);
-                return Err(error).context("查询框快捷键注册失败，可能已被其他程序占用");
-            }
-            if let Err(error) = self.hotkey_manager.register(new_settings) {
-                let _ = self.hotkey_manager.unregister(new_popup);
-                let _ = self.hotkey_manager.register_all(&old_hotkeys);
-                return Err(error).context("设置面板快捷键注册失败，可能已被其他程序占用");
-            }
-            if let Err(error) = self.hotkey_manager.register(new_ocr) {
-                let _ = self
-                    .hotkey_manager
-                    .unregister_all(&[new_popup, new_settings]);
-                let _ = self.hotkey_manager.register_all(&old_hotkeys);
-                return Err(error).context("OCR 快捷键注册失败，可能已被其他程序占用");
-            }
-            if let Err(error) = self.hotkey_manager.register(new_voice) {
-                let _ = self
-                    .hotkey_manager
-                    .unregister_all(&[new_popup, new_settings, new_ocr]);
-                let _ = self.hotkey_manager.register_all(&old_hotkeys);
-                return Err(error).context("语音识别快捷键注册失败，可能已被其他程序占用");
+            if let Err(error) = register_global_keyboard_hotkeys(&self.hotkey_manager, new_hotkeys)
+            {
+                let _ = self.hotkey_manager.register_all(&old_keyboard_keys);
+                return Err(error);
             }
         }
 
         if let Err(error) = save_ui_config(&config) {
-            if shortcuts_changed {
-                let _ = self.hotkey_manager.unregister_all(&[
-                    new_popup,
-                    new_settings,
-                    new_ocr,
-                    new_voice,
-                ]);
-                let _ = self.hotkey_manager.register_all(&old_hotkeys);
+            if keyboard_changed {
+                let _ = self.hotkey_manager.unregister_all(&new_keyboard_keys);
+                let _ = self.hotkey_manager.register_all(&old_keyboard_keys);
             }
             return Err(error);
         }
 
-        self.popup_hotkey = new_popup;
-        self.settings_hotkey = new_settings;
-        self.ocr_hotkey = new_ocr;
-        self.voice_hotkey = new_voice;
+        self.hotkeys = new_hotkeys;
+        self.mouse_bindings_active_at = Instant::now();
         self.config = config;
         self.words = new_words;
         self.active_source_language = new_source;
@@ -2086,12 +2239,7 @@ impl MatchApp {
 
     fn sync_shortcut_recording(&mut self) {
         let should_suspend = self.settings_open && self.settings_panel.is_recording_shortcut();
-        let hotkeys = [
-            self.popup_hotkey,
-            self.settings_hotkey,
-            self.ocr_hotkey,
-            self.voice_hotkey,
-        ];
+        let hotkeys = self.hotkeys.global_keyboard_keys();
 
         if should_suspend && !self.hotkeys_suspended {
             match self.hotkey_manager.unregister_all(&hotkeys) {
@@ -2336,25 +2484,9 @@ impl MatchApp {
                 && !input.modifiers.shift
                 && !input.modifiers.command
         });
-        if self.input.is_empty()
-            && !self.continuous_input.is_empty()
-            && (clear_composed || undo_composed)
+        if (clear_composed && self.change_composed(context, true))
+            || (undo_composed && self.change_composed(context, false))
         {
-            if clear_composed {
-                self.continuous_input.clear();
-            } else {
-                self.continuous_input.undo();
-            }
-            if self.copied_since_focus {
-                context.copy_text(self.continuous_input.clipboard_text().to_owned());
-            }
-            if self.continuous_input.is_empty() {
-                self.copied_since_focus = false;
-                self.left_after_copy = false;
-            }
-            self.message = None;
-            self.request_input_focus = true;
-            self.resize_window(context);
             return;
         }
         if context.input(|input| input.key_pressed(egui::Key::ArrowLeft)) && self.result_page > 0 {
@@ -2401,6 +2533,28 @@ impl MatchApp {
                 self.request_input_focus = true;
             }
         }
+    }
+
+    fn change_composed(&mut self, context: &egui::Context, clear_all: bool) -> bool {
+        if !self.input.is_empty() || self.continuous_input.is_empty() {
+            return false;
+        }
+        if clear_all {
+            self.continuous_input.clear();
+        } else {
+            self.continuous_input.undo();
+        }
+        if self.copied_since_focus {
+            context.copy_text(self.continuous_input.clipboard_text().to_owned());
+        }
+        if self.continuous_input.is_empty() {
+            self.copied_since_focus = false;
+            self.left_after_copy = false;
+        }
+        self.message = None;
+        self.request_input_focus = true;
+        self.resize_window(context);
+        true
     }
 
     fn handle_unmatched_enter(&mut self, context: &egui::Context) {
@@ -2757,6 +2911,24 @@ impl eframe::App for MatchApp {
         self.poll_ocr(context);
         self.poll_voice(context);
         let recording_shortcut = self.settings_open && self.settings_panel.is_recording_shortcut();
+        let extra_needed = recording_shortcut || self.hotkeys.uses_extra_mouse_button();
+        if extra_needed && !self.extra_mouse_attempted {
+            if let Some(window) = frame.winit_window() {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(handle) = window.window_handle() {
+                    self.extra_mouse_attempted = true;
+                    if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                        match ExtraMouseButtons::new(handle.hwnd.get()) {
+                            Ok(listener) => self.extra_mouse_buttons = Some(listener),
+                            Err(error) if self.hotkeys.uses_extra_mouse_button() => self
+                                .system_tray
+                                .set_status(&format!("鼠标扩展键监听不可用：{error:#}")),
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+        }
         // 设置窗口拥有焦点时，部分环境不会把组合键送到全局热键通道。
         // 同时读取 egui 的本地按键事件，并与全局事件合并，避免重复打开。
         let mut open_query = self.settings_open
@@ -2770,21 +2942,76 @@ impl eframe::App for MatchApp {
         let mut release_voice =
             self.settings_open && shortcut_released(context, &self.config.hotkeys.voice);
         for event in GlobalHotKeyEvent::receiver().try_iter() {
-            if event.id == self.voice_hotkey.id() && event.state == HotKeyState::Released {
+            if Some(event.id) == self.hotkeys.voice.keyboard_id()
+                && event.state == HotKeyState::Released
+            {
                 release_voice = true;
                 continue;
             }
             if event.state != HotKeyState::Pressed || recording_shortcut {
                 continue;
             }
-            if event.id == self.popup_hotkey.id() {
+            if Some(event.id) == self.hotkeys.popup.keyboard_id() {
                 open_query = true;
-            } else if event.id == self.settings_hotkey.id() {
+            } else if Some(event.id) == self.hotkeys.settings.keyboard_id() {
                 open_settings = true;
-            } else if event.id == self.ocr_hotkey.id() {
+            } else if Some(event.id) == self.hotkeys.ocr.keyboard_id() {
                 open_ocr = true;
-            } else if event.id == self.voice_hotkey.id() {
+            } else if Some(event.id) == self.hotkeys.voice.keyboard_id() {
                 toggle_voice = true;
+            }
+        }
+        let mut mouse_events = Vec::new();
+        if let Some(extra) = &mut self.extra_mouse_buttons {
+            if extra_needed {
+                mouse_events.extend(extra.poll());
+            } else {
+                extra.reset();
+            }
+        }
+        while let Some(event) = self
+            .mouse_hotkeys
+            .as_ref()
+            .and_then(MouseHotkeyListener::try_recv)
+        {
+            mouse_events.push(event);
+        }
+        for event in mouse_events {
+            if recording_shortcut {
+                self.settings_panel.capture_mouse_shortcut(event);
+                continue;
+            }
+            if event.occurred_at < self.mouse_bindings_active_at {
+                continue;
+            }
+            if self
+                .hotkeys
+                .voice
+                .mouse()
+                .is_some_and(|shortcut| shortcut.button == event.button)
+                && !event.pressed
+            {
+                release_voice = true;
+                continue;
+            }
+            if !event.pressed {
+                continue;
+            }
+            let matches = |binding: Shortcut| {
+                binding
+                    .mouse()
+                    .is_some_and(|shortcut| shortcut.matches(event.button, event.modifiers))
+            };
+            if matches(self.hotkeys.popup) {
+                open_query = true;
+            } else if matches(self.hotkeys.settings) {
+                open_settings = true;
+            } else if matches(self.hotkeys.ocr) {
+                open_ocr = true;
+            } else if matches(self.hotkeys.voice) {
+                toggle_voice = true;
+            } else if matches(self.hotkeys.clear_composed) && self.is_open && !self.settings_open {
+                self.change_composed(context, true);
             }
         }
         if open_query {
@@ -2805,7 +3032,9 @@ impl eframe::App for MatchApp {
             overlay.show(context);
         }
 
-        let repaint_interval = if self.settings_panel.has_open_dialog() {
+        let repaint_interval = if recording_shortcut || self.hotkeys.uses_extra_mouse_button() {
+            Duration::from_millis(8)
+        } else if self.settings_panel.has_open_dialog() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(40)
@@ -2903,7 +3132,17 @@ impl eframe::App for MatchApp {
                 self.hide(ui.ctx());
                 return;
             }
-            if let Some((config, key_update)) = self.settings_panel.show(ui) {
+            let settings_result = self.settings_panel.show(ui);
+            if self.settings_panel.take_word_editor_review_requested()
+                && self
+                    .voice_save_requests
+                    .send(VoiceSaveRequest::ReviewNow)
+                    .is_err()
+            {
+                self.system_tray
+                    .set_status("语音词库审核线程已停止，无法审核缓存");
+            }
+            if let Some((config, key_update)) = settings_result {
                 let result = self
                     .apply_settings(config, &key_update)
                     .map_err(|error| format!("{error:#}"));
@@ -3166,6 +3405,16 @@ fn voice_input_status(ai_result: bool, method: VoiceInputMethod) -> &'static str
     }
 }
 
+fn voice_original_status(method: VoiceInputMethod) -> &'static str {
+    match method {
+        VoiceInputMethod::Paste => "识别原文已发送 Ctrl+V（目标是否接收需实测）",
+        VoiceInputMethod::Unicode => "识别原文改用 Unicode 输入（剪贴板不可用）",
+        VoiceInputMethod::ManualPaste => "识别原文已复制；请在 Aion2 按 Ctrl+V",
+        #[cfg(feature = "tsf-notepad-prototype")]
+        VoiceInputMethod::TextService => "识别原文已交给记事本文本服务（原型）",
+    }
+}
+
 fn search_voice_words<'a>(words: &WordIndex, query: &'a str) -> (Vec<SearchHit>, &'a str) {
     let hits = words.search(query, "", &[]);
     if !hits.is_empty() {
@@ -3340,7 +3589,19 @@ fn configure_style(context: &egui::Context) {
 pub(crate) fn run() -> eframe::Result {
     let defaults = UiConfig::default();
     let initial_size = [defaults.input.width, defaults.input.height];
+    let icon = image::load_from_memory(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/to_words_window_256.png"
+    )))
+    .expect("窗口图标应在构建时生成")
+    .to_rgba8();
+    let (icon_width, icon_height) = icon.dimensions();
     let viewport = egui::ViewportBuilder::default()
+        .with_icon(egui::IconData {
+            rgba: icon.into_raw(),
+            width: icon_width,
+            height: icon_height,
+        })
         .with_position([-10_000.0, -10_000.0])
         .with_inner_size(initial_size)
         .with_resizable(false)
@@ -3373,9 +3634,18 @@ pub(crate) fn run() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        PopupAnchor, UiConfig, parse_hex_color, parse_hotkeys, popup_position, take_query_separator,
+        PopupAnchor, UiConfig, parse_hex_color, parse_hotkeys, popup_position,
+        take_query_separator, voice_review_due,
     };
     use eframe::egui;
+    use std::time::Duration;
+
+    #[test]
+    fn opening_word_editor_can_force_voice_cache_review_before_threshold() {
+        assert!(!voice_review_due(1, 1, false, Duration::from_secs(10)));
+        assert!(voice_review_due(1, 1, true, Duration::from_secs(10)));
+        assert!(!voice_review_due(0, 20, true, Duration::from_secs(10)));
+    }
 
     #[test]
     fn dropdown_background_is_opaque_while_main_panel_stays_transparent() {
@@ -3410,9 +3680,8 @@ mod tests {
         assert_eq!(config.ui_language, "zh-CN");
     }
 
-    #[cfg(not(feature = "windows-speech"))]
     #[test]
-    fn default_build_ignores_saved_windows_speech_backend() {
+    fn removed_windows_speech_backend_falls_back_to_sensevoice() {
         let config = UiConfig {
             voice_backend: "windows".to_string(),
             ..UiConfig::default()
@@ -3549,11 +3818,21 @@ mod tests {
 
     #[test]
     fn disabled_ocr_translation_does_not_request_translation() {
-        use super::ocr_translation_target;
+        use super::{ocr_translation_target, same_language_no_translation};
 
-        assert_eq!(ocr_translation_target(false, "ko"), None);
-        assert_eq!(ocr_translation_target(true, "auto").as_deref(), Some("cn"));
-        assert_eq!(ocr_translation_target(true, "ja").as_deref(), Some("ja"));
+        assert!(same_language_no_translation("ko", "ko"));
+        assert!(!same_language_no_translation("auto", "ko"));
+        assert!(!same_language_no_translation("ko", ""));
+        assert_eq!(ocr_translation_target(false, "ko", "cn"), None);
+        assert_eq!(ocr_translation_target(true, "ko", "ko"), None);
+        assert_eq!(
+            ocr_translation_target(true, "auto", "ko").as_deref(),
+            Some("cn")
+        );
+        assert_eq!(
+            ocr_translation_target(true, "ja", "ko").as_deref(),
+            Some("ja")
+        );
     }
 
     #[test]
@@ -3577,26 +3856,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_word_library_is_created_without_replacing_existing_content() {
-        use super::ensure_word_library_file;
-        use std::fs;
-        let path = std::env::temp_dir().join(format!(
-            "to_words_create_{}_{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        ensure_word_library_file(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
-        fs::write(&path, r#"{"안녕":"你好"}"#).unwrap();
-        ensure_word_library_file(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"안녕":"你好"}"#);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn parses_configured_hex_color_and_opacity() {
         let color = parse_hex_color("#E8E8E8", 0.20).unwrap();
         let [red, green, blue, alpha] = color.to_srgba_unmultiplied();
@@ -3609,13 +3868,13 @@ mod tests {
     #[test]
     fn default_hotkeys_are_distinct_and_valid() {
         let config = UiConfig::default();
-        let (popup, settings, ocr, voice) = parse_hotkeys(&config).unwrap();
-        assert_ne!(popup.id(), settings.id());
-        assert_ne!(ocr.id(), popup.id());
-        assert_ne!(ocr.id(), settings.id());
-        assert_ne!(voice.id(), popup.id());
-        assert_ne!(voice.id(), settings.id());
-        assert_ne!(voice.id(), ocr.id());
+        let hotkeys = parse_hotkeys(&config).unwrap();
+        assert_ne!(hotkeys.popup, hotkeys.settings);
+        assert_ne!(hotkeys.ocr, hotkeys.popup);
+        assert_ne!(hotkeys.ocr, hotkeys.settings);
+        assert_ne!(hotkeys.voice, hotkeys.popup);
+        assert_ne!(hotkeys.voice, hotkeys.settings);
+        assert_ne!(hotkeys.voice, hotkeys.ocr);
         assert_eq!(config.hotkeys.popup, "ctrl+alt+enter");
         assert_eq!(config.hotkeys.settings, "ctrl+alt+s");
         assert_eq!(config.hotkeys.clear_composed, "ctrl+backspace");
@@ -3663,6 +3922,20 @@ mod tests {
     fn duplicate_voice_hotkey_is_rejected() {
         let mut config = UiConfig::default();
         config.hotkeys.voice = config.hotkeys.popup.clone();
+        assert!(parse_hotkeys(&config).is_err());
+    }
+
+    #[test]
+    fn mouse_side_button_can_be_bound_and_duplicates_are_rejected() {
+        let mut config = UiConfig::default();
+        config.hotkeys.popup = "ctrl+MouseX1".to_string();
+        config.hotkeys.voice = "MouseX2".to_string();
+        let hotkeys = parse_hotkeys(&config).unwrap();
+        assert!(hotkeys.popup.mouse().is_some());
+        assert!(hotkeys.voice.mouse().is_some());
+        assert_eq!(hotkeys.global_keyboard_keys().len(), 2);
+
+        config.hotkeys.ocr = "ctrl+mousex1".to_string();
         assert!(parse_hotkeys(&config).is_err());
     }
 

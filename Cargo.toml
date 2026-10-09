@@ -7,16 +7,21 @@ edition = "2024"
 name = "to_words"
 path = "src/main.rs"
 
+# On the current Windows/MSVC toolchain, rustc 1.97.1 crashes while compiling
+# this binary at optimization levels 2/3. Keep dependencies at the normal level.
+[profile.release.package.hotkey_word_match]
+opt-level = 1
+
 [features]
 default = []
 voice-metrics = []
-windows-speech = []
 tsf-notepad-prototype = []
 
 [dependencies]
 global-hotkey = "0.8.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 anyhow = "1.0"
 eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -25,9 +30,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3.6.1"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.21"
 windows = { version = "0.59", features = [
+    "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Security_Credentials",
     "Win32_System_Com",
@@ -43,8 +52,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_Media_Audio",
     "Win32_System_Diagnostics",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Registry",
+    "Win32_Storage_FileSystem",
 ] }

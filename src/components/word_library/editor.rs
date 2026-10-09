@@ -4,8 +4,10 @@
 //! 本文件按“数据加载与校验、表格分页编辑、搜索定位、批量导入导出、保存反馈”
 //! 组织代码；表格每页最多展示 `TABLE_PAGE_SIZE` 条，以控制大词库的绘制成本。
 
+use crate::domain::ai_word_save;
+use crate::domain::storage::{self, StoredWord};
 use crate::i18n::{self, tr};
-use crate::{WORD_EDITOR_FONT_FAMILY, prepare_word_library_file, ui_theme, word_library_directory};
+use crate::{WORD_EDITOR_FONT_FAMILY, ui_theme, word_library_directory};
 use eframe::egui;
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,6 +17,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 const TABLE_PAGE_SIZE: usize = 50;
 // 保证打开编辑器时可以同时看到多行词条，而不是为了操作栏过度压缩表格区域。
 const MIN_EDITOR_VIEWPORT_HEIGHT: f32 = 220.0;
+// 为表格下方的分页/间距、保存/取消与状态消息留出空间。
+const TABLE_EDITOR_BOTTOM_RESERVE: f32 = 178.0;
 
 #[derive(Clone, Default)]
 pub(crate) struct WordEditor {
@@ -28,10 +32,13 @@ enum EditorMode {
     AdvancedJson,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct WordRow {
     key: String,
     value: String,
+    pronunciation: String,
+    created_at: i64,
+    created_at_label: String,
 }
 
 #[derive(Default)]
@@ -41,6 +48,9 @@ struct WordEditorState {
     mode: EditorMode,
     rows: Vec<WordRow>,
     content: String,
+    baseline_words: BTreeMap<String, String>,
+    baseline_rows: Vec<WordRow>,
+    baseline_content: String,
     message: Option<(String, bool)>,
     search_query: String,
     search_from: usize,
@@ -75,50 +85,20 @@ impl WordEditor {
         state.batch_export_open = false;
         state.scroll_table_to_top = false;
         state.table_page = 0;
+        state.baseline_words.clear();
+        state.baseline_rows.clear();
+        state.baseline_content.clear();
 
-        let path = match prepare_word_library_file(file_name) {
-            Ok(path) => path,
-            Err(error) => {
-                state.rows.clear();
-                state.content.clear();
-                state.message = Some((
-                    i18n::message(
-                        "无法准备词库目录：{error}",
-                        &[("error", &format!("{error:#}"))],
-                    ),
-                    true,
-                ));
-                return;
-            }
-        };
-        match fs::read_to_string(&path) {
-            Ok(content) => {
-                state.content = content;
-                match parse_words(&state.content) {
-                    Ok(words) => {
-                        state.rows = map_to_rows(&words);
-                        state.message = Some((
-                            i18n::message(
-                                "已载入 {count} 个词条。",
-                                &[("count", &words.len().to_string())],
-                            ),
-                            false,
-                        ));
-                    }
-                    Err(error) => {
-                        state.rows.clear();
-                        state.mode = EditorMode::AdvancedJson;
-                        state.show_json_error("现有词库格式错误，已进入高级编辑模式", &error);
-                    }
-                }
-            }
+        let _guard = ai_word_save::lock_word_library();
+        match storage::list_words_newest(file_name) {
+            Ok(records) => state.set_loaded_records(records),
             Err(error) => {
                 state.rows.clear();
                 state.content.clear();
                 state.message = Some((
                     i18n::message(
                         "无法读取 {file}：{error}",
-                        &[("file", file_name), ("error", &error.to_string())],
+                        &[("file", file_name), ("error", &format!("{error:#}"))],
                     ),
                     true,
                 ));
@@ -136,6 +116,35 @@ impl WordEditor {
     pub(crate) fn take_reload_requested(&self) -> bool {
         let mut state = self.lock();
         std::mem::take(&mut state.reload_requested)
+    }
+
+    /// 后台审核可能在编辑器打开后写入词条。只有未修改的编辑器会自动刷新。
+    /// 已修改的编辑器保留草稿，保存时再合并外部新增的 key。
+    pub(crate) fn refresh_after_external_save(&self, file_name: &str) -> anyhow::Result<()> {
+        let mut state = self.lock();
+        if !state.open || state.file_name != file_name {
+            return Ok(());
+        }
+        let _guard = ai_word_save::lock_word_library();
+        let records = storage::list_words_newest(file_name)?;
+        if state.has_unsaved_changes() {
+            return Ok(());
+        }
+        state.set_loaded_records(records);
+        state.pending_selection = None;
+        state.pending_scroll_char = None;
+        state.error_line = None;
+        Ok(())
+    }
+
+    pub(crate) fn show_review_error(&self, error: &str) {
+        let mut state = self.lock();
+        if state.open {
+            state.message = Some((
+                i18n::message("语音缓存审核失败：{error}", &[("error", error)]),
+                true,
+            ));
+        }
     }
 
     pub(crate) fn show(&self, ui: &mut egui::Ui) {
@@ -178,12 +187,44 @@ impl WordEditor {
 }
 
 impl WordEditorState {
+    fn set_loaded_records(&mut self, records: Vec<StoredWord>) {
+        self.rows = rows_from_stored(records);
+        self.baseline_rows = self.rows.clone();
+        self.baseline_words = clean_rows(&self.rows).0;
+        self.content = format_words(&self.baseline_words).unwrap_or_default();
+        self.baseline_content = self.content.clone();
+        self.message = Some((
+            i18n::message(
+                "已载入 {count} 个词条。",
+                &[("count", &self.rows.len().to_string())],
+            ),
+            false,
+        ));
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        match self.mode {
+            EditorMode::Table => self.rows != self.baseline_rows,
+            EditorMode::AdvancedJson => {
+                parse_words(&self.content).map_or(true, |words| words != self.baseline_words)
+            }
+        }
+    }
+
+    fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.search_from = 0;
+        self.pending_selection = None;
+        self.table_page = 0;
+        self.scroll_table_to_top = true;
+    }
+
     fn draw_editor(&mut self, ui: &mut egui::Ui) -> bool {
         ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
         let mut close = false;
 
         egui::Frame::new()
-            .inner_margin(egui::Margin::same(24))
+            .inner_margin(egui::Margin::symmetric(24, 20))
             .show(ui, |ui| {
                 if back_button(ui, "返回设置").clicked() {
                     close = true;
@@ -245,9 +286,8 @@ impl WordEditorState {
                         egui::Color32::WHITE,
                     )
                     .clicked()
-                        && self.save()
                     {
-                        close = true;
+                        self.save();
                     }
                     if action_button(
                         ui,
@@ -342,7 +382,7 @@ impl WordEditorState {
                 }
                 EditorMode::Table => match parse_words(&self.content) {
                     Ok(words) => {
-                        self.rows = map_to_rows(&words);
+                        self.rows = rows_preserving_metadata(&words, &self.rows);
                         self.error_line = None;
                         self.table_page = 0;
                         self.scroll_table_to_top = true;
@@ -365,22 +405,32 @@ impl WordEditorState {
             .corner_radius(8)
             .inner_margin(egui::Margin::symmetric(10, 5))
             .show(ui, |ui| {
-                search_changed = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .hint_text(tr("筛选 key 或 value…"))
-                            .font(editor_font(15.0))
-                            .desired_width(f32::INFINITY)
-                            .frame(egui::Frame::NONE),
-                    )
-                    .changed();
+                ui.horizontal(|ui| {
+                    let search_id = egui::Id::new("word_table_search_input");
+                    let search_width = (ui.available_width() - 36.0).max(180.0);
+                    search_changed = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .id(search_id)
+                                .hint_text(tr("筛选 key 或 value…"))
+                                .font(editor_font(15.0))
+                                .desired_width(search_width)
+                                .frame(egui::Frame::NONE),
+                        )
+                        .changed();
+                    if clear_search_button(ui, !self.search_query.is_empty()).clicked() {
+                        self.clear_search();
+                        ui.memory_mut(|memory| memory.request_focus(search_id));
+                    }
+                });
             });
         if search_changed {
             self.table_page = 0;
             self.scroll_table_to_top = true;
         }
 
-        let editor_height = (ui.available_height() - 158.0).max(MIN_EDITOR_VIEWPORT_HEIGHT);
+        let editor_height =
+            (ui.available_height() - TABLE_EDITOR_BOTTOM_RESERVE).max(MIN_EDITOR_VIEWPORT_HEIGHT);
         let query = self.search_query.trim();
         let filtered_indices = (!query.is_empty()).then(|| {
             let query = query.to_lowercase();
@@ -389,7 +439,8 @@ impl WordEditorState {
                 .enumerate()
                 .filter_map(|(index, row)| {
                     (row.key.to_lowercase().contains(&query)
-                        || row.value.to_lowercase().contains(&query))
+                        || row.value.to_lowercase().contains(&query)
+                        || row.pronunciation.to_lowercase().contains(&query))
                     .then_some(index)
                 })
                 .collect::<Vec<_>>()
@@ -403,9 +454,10 @@ impl WordEditorState {
         let table_width = (ui.available_width() - 14.0).max(500.0);
         let row_content_width = table_width - 20.0;
         let action_width = 52.0;
-        let field_width = (row_content_width - action_width * 2.0 - 24.0).max(300.0);
-        let key_width = (field_width * 0.38).max(120.0);
-        let value_width = (field_width - key_width).max(180.0);
+        let field_width = (row_content_width - action_width * 2.0 - 40.0).max(300.0);
+        let key_width = (field_width * 0.35).max(110.0);
+        let value_width = (field_width * 0.40).max(125.0);
+        let pronunciation_width = (field_width - key_width - value_width).max(105.0);
         let scroll_to_top = std::mem::take(&mut self.scroll_table_to_top);
 
         ui.scope(|ui| {
@@ -426,6 +478,10 @@ impl WordEditorState {
                             [value_width, 22.0],
                             egui::Label::new(egui::RichText::new(tr("Value")).strong()),
                         );
+                        ui.add_sized(
+                            [pronunciation_width, 22.0],
+                            egui::Label::new(egui::RichText::new(tr("读音")).strong()),
+                        );
                         ui.add_sized([action_width, 22.0], egui::Label::new(tr("复制")));
                         ui.add_sized([action_width, 22.0], egui::Label::new(tr("删除")));
                     });
@@ -438,7 +494,7 @@ impl WordEditorState {
             if scroll_to_top {
                 scroll_area = scroll_area.vertical_scroll_offset(0.0);
             }
-            scroll_area.show_rows(ui, 42.0, page_rows, |ui, visible_range| {
+            let table_viewport = scroll_area.show_rows(ui, 42.0, page_rows, |ui, visible_range| {
                 ui.set_width(table_width);
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for page_index in visible_range {
@@ -467,6 +523,12 @@ impl WordEditorState {
                                         .font(editor_font(15.0))
                                         .margin(egui::Margin::symmetric(8, 5)),
                                 );
+                                ui.add_sized(
+                                    [pronunciation_width, 34.0],
+                                    egui::TextEdit::singleline(&mut row.pronunciation)
+                                        .font(editor_font(14.0))
+                                        .margin(egui::Margin::symmetric(8, 5)),
+                                );
                                 if row_action_button(
                                     ui,
                                     "复制",
@@ -491,12 +553,19 @@ impl WordEditorState {
                         });
                 }
             });
+            if visible_rows == 0 {
+                // 空结果提示只画在已预留的表格视区，不再消耗剩余页面高度。
+                // centered_and_justified 在这里会把底部保存/取消按钮挤出窗口。
+                ui.painter().text(
+                    table_viewport.inner_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    tr("没有符合筛选条件的词条"),
+                    editor_font(14.0),
+                    ui_theme::muted_text(),
+                );
+            }
         });
-        if visible_rows == 0 {
-            ui.centered_and_justified(|ui| {
-                ui.label(egui::RichText::new(tr("没有符合筛选条件的词条")).weak());
-            });
-        } else {
+        if visible_rows != 0 {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if page_button(ui, "上一页", self.table_page > 0).clicked() {
@@ -628,7 +697,7 @@ impl WordEditorState {
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let search_width = (ui.available_width() - 105.0).max(180.0);
+                    let search_width = (ui.available_width() - 141.0).max(180.0);
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .id(search_id)
@@ -639,6 +708,10 @@ impl WordEditorState {
                     );
                     if response.changed() {
                         self.search_from = 0;
+                    }
+                    if clear_search_button(ui, !self.search_query.is_empty()).clicked() {
+                        self.clear_search();
+                        ui.memory_mut(|memory| memory.request_focus(search_id));
                     }
                     search |= ui
                         .add_sized([100.0, 34.0], egui::Button::new(tr("查找下一个")))
@@ -916,7 +989,7 @@ impl WordEditorState {
     }
 
     fn save(&mut self) -> bool {
-        let (words, removed) = match self.mode {
+        let (mut words, removed) = match self.mode {
             EditorMode::Table => clean_rows(&self.rows),
             EditorMode::AdvancedJson => match parse_words(&self.content) {
                 Ok(words) => clean_map(words),
@@ -926,42 +999,79 @@ impl WordEditorState {
                 }
             },
         };
-        let formatted = match format_words(&words) {
-            Ok(formatted) => formatted,
-            Err(error) => {
-                self.message = Some((
-                    i18n::message("格式化失败：{error}", &[("error", &error.to_string())]),
-                    true,
-                ));
-                return false;
-            }
-        };
-        let path = match prepare_word_library_file(&self.file_name) {
-            Ok(path) => path,
+        let _guard = ai_word_save::lock_word_library();
+        let disk_records = match storage::list_words_newest(&self.file_name) {
+            Ok(records) => records,
             Err(error) => {
                 self.message = Some((
                     i18n::message(
-                        "无法准备词库目录：{error}",
-                        &[("error", &format!("{error:#}"))],
+                        "无法读取 {file}：{error}",
+                        &[("file", &self.file_name), ("error", &format!("{error:#}"))],
                     ),
                     true,
                 ));
                 return false;
             }
         };
-        if let Err(error) = fs::write(&path, &formatted) {
+        let disk_words = disk_records
+            .iter()
+            .map(|row| (row.key.clone(), row.value.clone()))
+            .collect();
+        // 后台审核只新增词条；保留编辑期间新增到磁盘的 key，手工草稿优先。
+        merge_external_additions(&mut words, disk_words, &self.baseline_words);
+        let draft_metadata: BTreeMap<_, _> = self
+            .rows
+            .iter()
+            .map(|row| (row.key.trim().to_owned(), row))
+            .collect();
+        let disk_metadata: BTreeMap<_, _> = disk_records
+            .iter()
+            .map(|row| (row.key.as_str(), row))
+            .collect();
+        let records: Vec<_> = words
+            .iter()
+            .map(|(key, value)| {
+                let draft = (self.mode == EditorMode::Table)
+                    .then(|| draft_metadata.get(key))
+                    .flatten()
+                    .copied();
+                let disk = disk_metadata.get(key.as_str()).copied();
+                StoredWord {
+                    key: key.clone(),
+                    value: value.clone(),
+                    pronunciation: draft
+                        .map(|row| row.pronunciation.clone())
+                        .or_else(|| disk.map(|row| row.pronunciation.clone()))
+                        .unwrap_or_default(),
+                    created_at: draft
+                        .map(|row| row.created_at)
+                        .or_else(|| disk.map(|row| row.created_at))
+                        .unwrap_or(0),
+                    created_at_label: draft
+                        .map(|row| row.created_at_label.clone())
+                        .or_else(|| disk.map(|row| row.created_at_label.clone()))
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        if let Err(error) = storage::save_words(&self.file_name, &records) {
             self.message = Some((
                 i18n::message(
                     "保存 {file} 失败：{error}",
-                    &[("file", &self.file_name), ("error", &error.to_string())],
+                    &[("file", &self.file_name), ("error", &format!("{error:#}"))],
                 ),
                 true,
             ));
             return false;
         }
 
-        self.content = formatted;
-        self.rows = map_to_rows(&words);
+        match storage::list_words_newest(&self.file_name) {
+            Ok(reloaded) => self.set_loaded_records(reloaded),
+            Err(error) => {
+                self.message = Some((format!("{error:#}"), true));
+                return false;
+            }
+        }
         self.error_line = None;
         self.reload_requested = true;
         self.message = Some((
@@ -1028,14 +1138,61 @@ fn clean_map(words: BTreeMap<String, String>) -> (BTreeMap<String, String>, Remo
     clean_rows(&rows)
 }
 
+fn rows_from_stored(records: Vec<StoredWord>) -> Vec<WordRow> {
+    records
+        .into_iter()
+        .map(|record| WordRow {
+            key: record.key,
+            value: record.value,
+            pronunciation: record.pronunciation,
+            created_at: record.created_at,
+            created_at_label: record.created_at_label,
+        })
+        .collect()
+}
+
+fn merge_external_additions(
+    draft: &mut BTreeMap<String, String>,
+    disk: BTreeMap<String, String>,
+    baseline: &BTreeMap<String, String>,
+) {
+    for (key, value) in disk {
+        // 基线里已有的词条由用户草稿决定：删除和修改不会被重新写回。
+        if !baseline.contains_key(&key) {
+            draft.entry(key).or_insert(value);
+        }
+    }
+}
+
 fn map_to_rows(words: &BTreeMap<String, String>) -> Vec<WordRow> {
     words
         .iter()
         .map(|(key, value)| WordRow {
             key: key.clone(),
             value: value.clone(),
+            pronunciation: String::new(),
+            created_at: 0,
+            created_at_label: String::new(),
         })
         .collect()
+}
+
+fn rows_preserving_metadata(
+    words: &BTreeMap<String, String>,
+    previous: &[WordRow],
+) -> Vec<WordRow> {
+    let mut remaining = words.clone();
+    let mut rows = Vec::with_capacity(words.len());
+    for old in previous {
+        if let Some(value) = remaining.remove(old.key.trim()) {
+            let mut row = old.clone();
+            row.value = value;
+            rows.push(row);
+        }
+    }
+    let mut added = map_to_rows(&remaining);
+    added.append(&mut rows);
+    added
 }
 
 fn table_page_bounds(total: usize, requested_page: usize) -> (usize, usize, usize, usize) {
@@ -1137,6 +1294,22 @@ fn action_button(
     )
 }
 
+fn clear_search_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    ui_theme::opaque_hover_text(
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(
+                egui::RichText::new("×")
+                    .size(18.0)
+                    .color(ui_theme::muted_text()),
+            )
+            .frame(false)
+            .min_size(egui::vec2(26.0, 22.0)),
+        ),
+        tr("清除搜索"),
+    )
+}
+
 fn back_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add_sized(
         [128.0, 34.0],
@@ -1220,9 +1393,25 @@ fn row_action_button(
 #[cfg(test)]
 mod tests {
     use super::{
-        EditorMode, WordEditorState, WordRow, clean_rows, normalized_export_file_name, parse_words,
-        table_page_bounds,
+        EditorMode, WordEditorState, WordRow, clean_rows, merge_external_additions,
+        normalized_export_file_name, parse_words, rows_preserving_metadata, table_page_bounds,
     };
+    use eframe::egui;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn external_reviewed_words_survive_editor_save_without_restoring_user_deletions() {
+        let baseline = BTreeMap::from([("旧词".into(), "旧解释".into())]);
+        let mut draft = BTreeMap::from([("手工新词".into(), "手工解释".into())]);
+        let disk = BTreeMap::from([
+            ("旧词".into(), "旧解释".into()),
+            ("审核新词".into(), "审核解释".into()),
+        ]);
+        merge_external_additions(&mut draft, disk, &baseline);
+        assert!(!draft.contains_key("旧词"));
+        assert_eq!(draft.get("手工新词").map(String::as_str), Some("手工解释"));
+        assert_eq!(draft.get("审核新词").map(String::as_str), Some("审核解释"));
+    }
 
     #[test]
     fn accepts_string_to_string_word_map() {
@@ -1254,23 +1443,117 @@ mod tests {
     }
 
     #[test]
+    fn clearing_search_resets_filter_and_pagination() {
+        let mut editor = WordEditorState {
+            search_query: "你好".into(),
+            search_from: 12,
+            pending_selection: Some((2, 4)),
+            table_page: 3,
+            ..Default::default()
+        };
+        editor.clear_search();
+        assert!(editor.search_query.is_empty());
+        assert_eq!(editor.search_from, 0);
+        assert!(editor.pending_selection.is_none());
+        assert_eq!(editor.table_page, 0);
+        assert!(editor.scroll_table_to_top);
+    }
+
+    #[test]
+    fn switching_from_advanced_json_keeps_existing_metadata_and_order() {
+        let previous = vec![
+            WordRow {
+                key: "最新".into(),
+                value: "旧译文".into(),
+                pronunciation: "newest".into(),
+                created_at: 200,
+                created_at_label: "新时间".into(),
+            },
+            WordRow {
+                key: "较早".into(),
+                value: "旧译文".into(),
+                pronunciation: "older".into(),
+                created_at: 100,
+                created_at_label: "旧时间".into(),
+            },
+        ];
+        let words = BTreeMap::from([
+            ("最新".into(), "新译文".into()),
+            ("较早".into(), "旧译文".into()),
+        ]);
+        let rows = rows_preserving_metadata(&words, &previous);
+        assert_eq!(rows[0].key, "最新");
+        assert_eq!(rows[0].value, "新译文");
+        assert_eq!(rows[0].pronunciation, "newest");
+        assert_eq!(rows[0].created_at, 200);
+        assert_eq!(rows[1].key, "较早");
+    }
+
+    #[test]
+    fn empty_filtered_table_keeps_editor_actions_in_view() {
+        let context = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let fallback = fonts.families[&egui::FontFamily::Proportional].clone();
+        fonts.families.insert(
+            egui::FontFamily::Name(crate::WORD_EDITOR_FONT_FAMILY.into()),
+            fallback,
+        );
+        context.set_fonts(fonts);
+        let mut editor = WordEditorState {
+            mode: EditorMode::Table,
+            file_name: "user_words.json".to_string(),
+            rows: vec![WordRow {
+                key: "안녕하세요".to_string(),
+                value: "你好".to_string(),
+                ..Default::default()
+            }],
+            search_query: "不存在的词条".to_string(),
+            message: Some(("已载入词条".to_string(), false)),
+            ..Default::default()
+        };
+        let mut used_bottom = 0.0;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                editor.draw_editor(ui);
+                used_bottom = ui.min_rect().bottom();
+            },
+        );
+        output.textures_delta.clear();
+        assert!(
+            used_bottom <= 700.0,
+            "操作按钮应留在编辑窗口内：{used_bottom}"
+        );
+    }
+
+    #[test]
     fn cleans_duplicate_and_empty_rows() {
         let rows = vec![
             WordRow {
                 key: "a".into(),
                 value: "一".into(),
+                ..Default::default()
             },
             WordRow {
                 key: "a".into(),
                 value: "二".into(),
+                ..Default::default()
             },
             WordRow {
                 key: "".into(),
                 value: "空".into(),
+                ..Default::default()
             },
             WordRow {
                 key: "b".into(),
                 value: "".into(),
+                ..Default::default()
             },
         ];
         let (words, removed) = clean_rows(&rows);

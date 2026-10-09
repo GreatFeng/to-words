@@ -11,13 +11,14 @@ hotkey_word_match/
 │  ├─ components/          # 界面组件
 │  │  ├─ settings/         # 设置面板
 │  │  └─ word_library/     # 词库编辑、导入导出和合并界面
-│  ├─ domain/              # 查询索引、连续组合、词库合并及 AI 词条保存
+│  ├─ domain/              # 查询索引、SQLite 持久化、词库合并及 AI 词条保存
 │  ├─ platform/            # 系统托盘、凭据、OCR、麦克风与本地语音识别
 │  ├─ i18n.rs              # 界面语言选择、翻译查找与动态文字插值
 │  ├─ ui/                  # 颜色、间距等统一视觉规范
 │  └─ main.rs              # 程序入口和模块装配
 ├─ tests/                  # 后续跨模块集成测试
-└─ word_libraries/         # 用户词库数据
+├─ to_words.db             # 运行时词库、设置与待审核语音缓存
+└─ word_libraries/         # 旧版 JSON 迁移与手动导入导出
 ```
 
 ## 依赖方向

@@ -7,8 +7,10 @@
 mod glass_footer;
 
 use self::glass_footer::GlassFooter;
+use crate::domain::shortcut::{MouseShortcut, Shortcut};
 use crate::i18n::{self, tr};
 use crate::platform::credentials;
+use crate::platform::mouse_hotkey::MouseButtonEvent;
 use crate::platform::ocr;
 use crate::platform::voice;
 use crate::ui_theme::{
@@ -19,10 +21,6 @@ use crate::word_editor::WordEditor;
 use crate::word_merge_panel::WordMergePanel;
 use crate::{UiConfig, translation_language};
 use eframe::egui;
-use global_hotkey::hotkey::HotKey;
-#[cfg(feature = "windows-speech")]
-use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 const SAVED_MESSAGE_DURATION: Duration = Duration::from_millis(1200);
@@ -72,9 +70,11 @@ pub(crate) struct SettingsPanel {
     message: Option<SettingsMessage>,
     scroll_to_top: bool,
     active_shortcut: Option<ShortcutTarget>,
+    recording_started_at: Option<Instant>,
     active_number: Option<egui::Id>,
     last_wheel_change: f64,
     word_editor: WordEditor,
+    word_editor_review_requested: bool,
     word_merge_panel: WordMergePanel,
     ai_key_input: String,
     ai_key_present: bool,
@@ -82,8 +82,6 @@ pub(crate) struct SettingsPanel {
     active_source_language: String,
     ocr_status: String,
     voice_status: String,
-    windows_prepare_receiver: Option<Receiver<Result<String, String>>>,
-    windows_prepare_confirm: bool,
     glass_footer: GlassFooter,
 }
 
@@ -94,9 +92,11 @@ impl SettingsPanel {
             message: None,
             scroll_to_top: false,
             active_shortcut: None,
+            recording_started_at: None,
             active_number: None,
             last_wheel_change: 0.0,
             word_editor: WordEditor::default(),
+            word_editor_review_requested: false,
             word_merge_panel: WordMergePanel::default(),
             ai_key_input: String::new(),
             ai_key_present: false,
@@ -104,8 +104,6 @@ impl SettingsPanel {
             active_source_language: "cn".to_string(),
             ocr_status: String::new(),
             voice_status: String::new(),
-            windows_prepare_receiver: None,
-            windows_prepare_confirm: false,
             glass_footer: GlassFooter::default(),
         }
     }
@@ -116,12 +114,13 @@ impl SettingsPanel {
         self.active_source_language = active_source_language.to_string();
         self.ocr_status = ocr::engine_status();
         self.voice_status = voice::engine_status(&self.draft.voice_backend);
-        self.windows_prepare_confirm = false;
         self.message = None;
         self.scroll_to_top = false;
         self.active_shortcut = None;
+        self.recording_started_at = None;
         self.active_number = None;
         self.word_editor.close();
+        self.word_editor_review_requested = false;
         self.word_merge_panel.close();
         self.ai_key_input.clear();
         self.remove_ai_key = false;
@@ -141,6 +140,26 @@ impl SettingsPanel {
         self.active_shortcut.is_some()
     }
 
+    pub(crate) fn capture_mouse_shortcut(&mut self, event: MouseButtonEvent) {
+        let Some(target) = self.active_shortcut else {
+            return;
+        };
+        if event.pressed
+            && self
+                .recording_started_at
+                .is_some_and(|at| event.occurred_at >= at)
+        {
+            self.set_recorded_shortcut(
+                target,
+                Ok(MouseShortcut {
+                    button: event.button,
+                    modifiers: event.modifiers,
+                }
+                .to_string()),
+            );
+        }
+    }
+
     pub(crate) fn has_open_dialog(&self) -> bool {
         self.word_editor.is_open() || self.word_merge_panel.is_open()
     }
@@ -149,6 +168,21 @@ impl SettingsPanel {
         let edited = self.word_editor.take_reload_requested();
         let selected_merge = self.word_merge_panel.take_reload_requested();
         edited || selected_merge
+    }
+
+    pub(crate) fn take_word_editor_review_requested(&mut self) -> bool {
+        std::mem::take(&mut self.word_editor_review_requested)
+    }
+
+    pub(crate) fn refresh_word_editor_after_external_save(
+        &mut self,
+        file_name: &str,
+    ) -> anyhow::Result<()> {
+        self.word_editor.refresh_after_external_save(file_name)
+    }
+
+    pub(crate) fn show_word_editor_review_error(&mut self, error: &str) {
+        self.word_editor.show_review_error(error);
     }
 
     pub(crate) fn set_result(&mut self, result: Result<(), String>) {
@@ -171,27 +205,7 @@ impl SettingsPanel {
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> Option<(UiConfig, AiKeyUpdate)> {
         i18n::set_language(&self.draft.ui_language);
         self.expire_message(ui.ctx(), Instant::now());
-        if let Some(receiver) = &self.windows_prepare_receiver {
-            match receiver.try_recv() {
-                Ok(Ok(status)) => {
-                    self.voice_status = tr(&status).to_string();
-                    self.windows_prepare_receiver = None;
-                }
-                Ok(Err(error)) => {
-                    self.voice_status = error;
-                    self.windows_prepare_receiver = None;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.voice_status = tr("Windows 语音模型准备任务已中断").to_string();
-                    self.windows_prepare_receiver = None;
-                }
-                Err(TryRecvError::Empty) => ui
-                    .ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(200)),
-            }
-        }
         if ui.input(|input| input.pointer.any_pressed()) {
-            self.active_shortcut = None;
             self.active_number = None;
         }
 
@@ -249,7 +263,12 @@ impl SettingsPanel {
                                     ui.selectable_value(&mut self.draft.ui_language, code.to_string(), name);
                                 }
                             });
-                        ui.label(egui::RichText::new(tr("界面语言")).size(13.0).color(primary_text()));
+                        let language_label = if self.draft.ui_language == "zh-CN" {
+                            "界面语言（language）"
+                        } else {
+                            tr("界面语言")
+                        };
+                        ui.label(egui::RichText::new(language_label).size(13.0).color(primary_text()));
                         if self.draft.ui_language != previous_language {
                             i18n::set_language(&self.draft.ui_language);
                             self.message = None;
@@ -325,53 +344,16 @@ impl SettingsPanel {
                                         .selected_text(match self.draft.voice_backend.as_str() {
                                             "sensevoice" => tr("SenseVoice（默认）"),
                                             "whisper" => "whisper.cpp",
-                                            "windows" => tr("Windows 本地 AI 识别（实验版）"),
                                             _ => tr("SenseVoice（默认）"),
                                         })
                                         .width(220.0)
                                         .show_ui(ui, |ui| {
                                             ui.selectable_value(&mut self.draft.voice_backend, "sensevoice".to_string(), tr("SenseVoice（默认）"));
                                             ui.selectable_value(&mut self.draft.voice_backend, "whisper".to_string(), "whisper.cpp");
-                                            #[cfg(feature = "windows-speech")]
-                                            ui.selectable_value(&mut self.draft.voice_backend, "windows".to_string(), tr("Windows 本地 AI 识别（实验版）"));
                                         });
-                                    #[cfg(feature = "windows-speech")]
-                                    if self.draft.voice_backend == "windows" {
-                                        help_icon(ui, "需安装带 MSIX 身份的版本；此 API 不等同于 Win+H。微软实验版没有公开的识别语言设置方式，部分非英语语音可能被误译成英语。");
-                                    }
                                 });
                                 if old_backend != self.draft.voice_backend {
                                     self.voice_status = voice::engine_status(&self.draft.voice_backend);
-                                    #[cfg(feature = "windows-speech")]
-                                    {
-                                        self.windows_prepare_confirm = false;
-                                    }
-                                }
-                                #[cfg(feature = "windows-speech")]
-                                if self.draft.voice_backend == "windows" {
-                                    if self.windows_prepare_receiver.is_none()
-                                        && ui.button(tr("准备 Windows 语音模型")).clicked()
-                                    {
-                                        self.windows_prepare_confirm = true;
-                                    }
-                                    if self.windows_prepare_confirm {
-                                        ui.label(tr("首次准备可能通过 Windows Update 下载可选语音模型。是否继续？"));
-                                        ui.horizontal(|ui| {
-                                            if ui.button(tr("确认下载并准备")).clicked() {
-                                                self.windows_prepare_confirm = false;
-                                                self.voice_status = tr("正在准备 Windows 语音模型…").to_string();
-                                                let (sender, receiver) = mpsc::channel();
-                                                std::thread::spawn(move || {
-                                                    let result = voice::prepare_windows_model().map_err(|error| format!("{error:#}"));
-                                                    let _ = sender.send(result);
-                                                });
-                                                self.windows_prepare_receiver = Some(receiver);
-                                            }
-                                            if ui.button(tr("取消")).clicked() {
-                                                self.windows_prepare_confirm = false;
-                                            }
-                                        });
-                                    }
                                 }
                                 ui.add_space(8.0);
                                 ui.label(
@@ -408,10 +390,10 @@ impl SettingsPanel {
                                     });
                                     help_icon(
                                         ui,
-                                        match self.draft.voice_backend.as_str() {
-                                            "whisper" => "经常说同一种语言时，手动指定可减少短句误判。",
-                                            "sensevoice" => "SenseVoice 自动识别语言，不能通过此选项限定；识别语言设置仅用于 Whisper。",
-                                            _ => "Windows 实验版暂不能按此选项限定识别语言；这里的设置仅用于 Whisper。",
+                                        if self.draft.voice_backend == "whisper" {
+                                            "经常说同一种语言时，手动指定可减少短句误判。"
+                                        } else {
+                                            "SenseVoice 自动识别语言，不能通过此选项限定；识别语言设置仅用于 Whisper。"
                                         },
                                     );
                                 });
@@ -686,7 +668,10 @@ impl SettingsPanel {
                 self.ai_key_input.clear();
                 self.remove_ai_key = true;
             }
-            help_icon(ui, "密钥保存在 Windows 凭据管理器，不写入 ui_config.json。未选择目标语言时无法请求翻译。");
+            help_icon(
+                ui,
+                "密钥保存在 Windows 凭据管理器，不写入 to_words.db。未选择目标语言时无法请求翻译。",
+            );
         });
         if self.remove_ai_key {
             ui.label(
@@ -803,6 +788,7 @@ impl SettingsPanel {
     fn open_word_editor(&mut self, context: &egui::Context) {
         let file_name = self.current_word_file_name();
         self.word_editor.open(&file_name);
+        self.word_editor_review_requested = true;
 
         // 只在空间不足时扩大窗口，保留完整表格视区和底部操作栏，也不缩小用户已
         // 经手动调整过的窗口。
@@ -825,6 +811,7 @@ impl SettingsPanel {
                     "显示查询框",
                     &mut self.draft.hotkeys.popup,
                     &mut self.active_shortcut,
+                    &mut self.recording_started_at,
                     ShortcutTarget::Popup,
                 );
                 shortcut_row(
@@ -832,6 +819,7 @@ impl SettingsPanel {
                     "显示设置面板",
                     &mut self.draft.hotkeys.settings,
                     &mut self.active_shortcut,
+                    &mut self.recording_started_at,
                     ShortcutTarget::Settings,
                 );
                 shortcut_row(
@@ -839,6 +827,7 @@ impl SettingsPanel {
                     "框选 OCR 识别",
                     &mut self.draft.hotkeys.ocr,
                     &mut self.active_shortcut,
+                    &mut self.recording_started_at,
                     ShortcutTarget::Ocr,
                 );
                 shortcut_row(
@@ -846,6 +835,7 @@ impl SettingsPanel {
                     "开关语音录音",
                     &mut self.draft.hotkeys.voice,
                     &mut self.active_shortcut,
+                    &mut self.recording_started_at,
                     ShortcutTarget::Voice,
                 );
                 shortcut_row(
@@ -853,8 +843,27 @@ impl SettingsPanel {
                     "清空组合内容",
                     &mut self.draft.hotkeys.clear_composed,
                     &mut self.active_shortcut,
+                    &mut self.recording_started_at,
                     ShortcutTarget::ClearComposed,
                 );
+            });
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new(tr("G502 LIGHTSPEED 扩展键"))
+            .default_open(false)
+            .show(ui, |ui| {
+                for line in [
+                    "后退/前进键若录制为 MouseX1/MouseX2，可直接使用；其他按键只有在驱动提供独立鼠标事件时才能录制为 Mouse6～Mouse8。",
+                    "DPI、G-Shift 等按键可在 G HUB 中分别映射为不同的键盘快捷键，再点击上方对应设置项录制；推荐使用不与其他程序冲突的 F13～F24（若 G HUB 提供）。",
+                    "重新映射会替换该按键原来的 DPI 或 G-Shift 功能。",
+                    "如切换到游戏后快捷键失效，请检查 G HUB 是否切换了配置文件；可将映射配置设为持久配置。",
+                ] {
+                    ui.label(
+                        egui::RichText::new(tr(line))
+                            .size(12.0)
+                            .color(muted_text()),
+                    );
+                    ui.add_space(4.0);
+                }
             });
     }
 
@@ -1080,7 +1089,11 @@ impl SettingsPanel {
             return;
         };
 
-        match shortcut_text(key, physical_modifiers(modifiers)) {
+        self.set_recorded_shortcut(target, shortcut_text(key, physical_modifiers(modifiers)));
+    }
+
+    fn set_recorded_shortcut(&mut self, target: ShortcutTarget, result: Result<String, String>) {
+        match result {
             Ok(shortcut) => {
                 match target {
                     ShortcutTarget::Popup => self.draft.hotkeys.popup = shortcut,
@@ -1090,6 +1103,7 @@ impl SettingsPanel {
                     ShortcutTarget::ClearComposed => self.draft.hotkeys.clear_composed = shortcut,
                 }
                 self.active_shortcut = None;
+                self.recording_started_at = None;
                 self.message = None;
             }
             Err(error) => self.message = Some(SettingsMessage::error(error)),
@@ -1310,6 +1324,7 @@ fn shortcut_row(
     label: &str,
     value: &mut String,
     active: &mut Option<ShortcutTarget>,
+    recording_started_at: &mut Option<Instant>,
     target: ShortcutTarget,
 ) {
     ui.label(
@@ -1319,7 +1334,7 @@ fn shortcut_row(
     );
     let recording = *active == Some(target);
     let text = if recording || value.is_empty() {
-        tr("请按下快捷键…")
+        tr("请按键或鼠标按键…")
     } else {
         value.as_str()
     };
@@ -1346,6 +1361,7 @@ fn shortcut_row(
     if response.clicked() {
         value.clear();
         *active = Some(target);
+        *recording_started_at = Some(Instant::now());
     }
     ui.end_row();
 }
@@ -1569,17 +1585,21 @@ fn shortcut_text(key: egui::Key, modifiers: egui::Modifiers) -> Result<String, S
     parts.push(key.name());
     let shortcut = parts.join("+");
     shortcut
-        .parse::<HotKey>()
+        .parse::<Shortcut>()
         .map(|_| shortcut)
         .map_err(|_| i18n::message("不支持这个按键：{key}", &[("key", key.name())]))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingsPanel, scroll_to_top_visible, shortcut_text, step_voice_pause};
+    use super::{
+        SettingsPanel, ShortcutTarget, scroll_to_top_visible, shortcut_text, step_voice_pause,
+    };
     use crate::UiConfig;
+    use crate::domain::shortcut::{MouseButton, MouseModifiers};
+    use crate::platform::mouse_hotkey::MouseButtonEvent;
     use eframe::egui;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn records_ctrl_alt_enter() {
@@ -1592,6 +1612,41 @@ mod tests {
             shortcut_text(egui::Key::Enter, modifiers).unwrap(),
             "ctrl+alt+Enter"
         );
+    }
+
+    #[test]
+    fn records_g_hub_keyboard_mappings() {
+        assert_eq!(
+            shortcut_text(egui::Key::F13, egui::Modifiers::NONE).unwrap(),
+            "F13"
+        );
+        assert_eq!(
+            shortcut_text(egui::Key::F24, egui::Modifiers::NONE).unwrap(),
+            "F24"
+        );
+    }
+
+    #[test]
+    fn mouse_recording_ignores_the_click_that_started_it() {
+        let mut panel = SettingsPanel::new(UiConfig::default());
+        let started = Instant::now();
+        panel.active_shortcut = Some(ShortcutTarget::Popup);
+        panel.recording_started_at = Some(started);
+        panel.capture_mouse_shortcut(MouseButtonEvent {
+            button: MouseButton::Left,
+            pressed: true,
+            modifiers: MouseModifiers::default(),
+            occurred_at: started - Duration::from_millis(1),
+        });
+        assert!(panel.is_recording_shortcut());
+        panel.capture_mouse_shortcut(MouseButtonEvent {
+            button: MouseButton::X1,
+            pressed: true,
+            modifiers: MouseModifiers::new(true, false, false, false),
+            occurred_at: started + Duration::from_millis(1),
+        });
+        assert_eq!(panel.draft.hotkeys.popup, "ctrl+MouseX1");
+        assert!(!panel.is_recording_shortcut());
     }
 
     #[test]

@@ -37,8 +37,6 @@ pub(crate) struct VoiceSession {
 enum RecognitionEngine {
     SenseVoice(PathBuf, PathBuf, PathBuf),
     Whisper(PathBuf, PathBuf),
-    #[cfg(feature = "windows-speech")]
-    Windows(PathBuf),
 }
 
 impl VoiceSession {
@@ -70,10 +68,6 @@ pub(crate) fn engine_status(backend: &str) -> String {
                     .unwrap_or(tr("未知模型")),
             )],
         ),
-        #[cfg(feature = "windows-speech")]
-        Ok(RecognitionEngine::Windows(_)) => {
-            tr("Windows 本地识别桥接程序已找到；需以 MSIX 身份运行并安装系统语音模型").to_string()
-        }
         Err(error) => {
             let detail = error.to_string();
             let detail = if let Some(path) = detail.strip_prefix("缺少 SenseVoice 文件：") {
@@ -95,30 +89,6 @@ pub(crate) fn engine_status(backend: &str) -> String {
     }
 }
 
-#[cfg(feature = "windows-speech")]
-pub(crate) fn prepare_windows_model() -> Result<String> {
-    let RecognitionEngine::Windows(executable) = selected_engine("windows")? else {
-        unreachable!();
-    };
-    let mut command = Command::new(executable);
-    command.arg("prepare").stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    let output = command
-        .output()
-        .context("无法启动 Windows 语音模型准备程序")?;
-    if !output.status.success() {
-        bail!(
-            "Windows 语音模型准备失败：{}",
-            windows_bridge_error(&output)
-        );
-    }
-    Ok(tr("Windows 本地语音模型已就绪").to_string())
-}
-
 pub(crate) fn start(
     keep_input: bool,
     push_to_talk: bool,
@@ -137,8 +107,6 @@ pub(crate) fn start(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("unknown_model"),
-        #[cfg(feature = "windows-speech")]
-        RecognitionEngine::Windows(_) => "windows_ai_speech",
     };
     let trace = VoiceTrace::new(trace_name)?;
     trace.record(
@@ -454,19 +422,6 @@ fn selected_engine(backend: &str) -> Result<RecognitionEngine> {
             let (engine, model) = engine_files()?;
             Ok(RecognitionEngine::Whisper(engine, model))
         }
-        #[cfg(feature = "windows-speech")]
-        "windows" => {
-            #[cfg(not(windows))]
-            bail!("Windows 本地语音识别仅支持 Windows");
-            let path = crate::project_directory()
-                .join("assets")
-                .join("voice")
-                .join("to_words_windows_speech.exe");
-            if !path.is_file() {
-                bail!("缺少 Windows 语音桥接程序：{}", path.display());
-            }
-            Ok(RecognitionEngine::Windows(path))
-        }
         _ => bail!("未知的语音识别引擎：{backend}"),
     }
 }
@@ -483,59 +438,6 @@ fn transcribe_selected(
         RecognitionEngine::Whisper(executable, model) => {
             transcribe(executable, model, samples, language)
         }
-        #[cfg(feature = "windows-speech")]
-        RecognitionEngine::Windows(executable) => transcribe_windows(executable, samples),
-    }
-}
-
-#[cfg(feature = "windows-speech")]
-fn transcribe_windows(executable: &Path, samples: &[i16]) -> Result<String> {
-    let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    let wav = std::env::temp_dir().join(format!(
-        "to_words_windows_voice_{}_{}.wav",
-        std::process::id(),
-        temp_id
-    ));
-    let result = (|| {
-        write_wav(&wav, samples)?;
-        let mut command = Command::new(executable);
-        command.arg("transcribe").arg(&wav).stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let output = command
-            .output()
-            .context("无法启动 Windows 本地语音识别桥接程序")?;
-        if !output.status.success() {
-            bail!(
-                "Windows 本地语音识别失败：{}",
-                windows_bridge_error(&output)
-            );
-        }
-        let text = String::from_utf8(output.stdout).context("Windows 语音识别输出不是 UTF-8")?;
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("Windows 本地语音识别未返回文字");
-        }
-        Ok(text.to_owned())
-    })();
-    let _ = fs::remove_file(&wav);
-    result
-}
-
-#[cfg(feature = "windows-speech")]
-fn windows_bridge_error(output: &std::process::Output) -> String {
-    let diagnostic = String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .filter(|line| !line.starts_with("[loader]"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if diagnostic.trim().is_empty() {
-        format!("进程退出状态：{}", output.status)
-    } else {
-        diagnostic
     }
 }
 

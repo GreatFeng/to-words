@@ -17,13 +17,22 @@ mod platform;
 mod ui;
 
 pub(crate) use app::{
-    UiConfig, WORD_EDITOR_FONT_FAMILY, prepare_word_library_file, project_directory,
-    word_library_directory,
+    UiConfig, WORD_EDITOR_FONT_FAMILY, project_directory, word_library_directory,
 };
 pub(crate) use components::word_library::{editor as word_editor, merge_panel as word_merge_panel};
 pub(crate) use domain::{translation_language, word_merge};
 pub(crate) use ui::theme as ui_theme;
 
-fn main() -> eframe::Result {
-    app::run()
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|argument| argument == "--migrate-data") {
+        let statistics = domain::storage::library_statistics()?;
+        println!("SQLite: {}", domain::storage::database_path().display());
+        for (library, active, quarantined) in statistics {
+            println!("{library}: {active} active, {quarantined} quarantined");
+        }
+        println!("隔离总数: {}", domain::storage::quarantine_count()?);
+        return Ok(());
+    }
+    app::run()?;
+    Ok(())
 }

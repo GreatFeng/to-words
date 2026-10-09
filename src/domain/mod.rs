@@ -5,6 +5,9 @@
 
 pub(crate) mod ai_word_save;
 pub(crate) mod continuous_input;
+pub(crate) mod shortcut;
+pub(crate) mod storage;
 pub(crate) mod translation_language;
+pub(crate) mod voice_word_cache;
 pub(crate) mod word_index;
 pub(crate) mod word_merge;
