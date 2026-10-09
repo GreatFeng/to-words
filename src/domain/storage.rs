@@ -355,37 +355,6 @@ fn save_words_on(connection: &mut Connection, library: &str, words: &[StoredWord
     Ok(())
 }
 
-pub(crate) fn save_word_map(library: &str, words: &BTreeMap<String, String>) -> Result<()> {
-    let existing = list_words_newest(library)?;
-    let metadata: BTreeMap<_, _> = existing
-        .into_iter()
-        .map(|word| (word.key.clone(), word))
-        .collect();
-    let rows = words
-        .iter()
-        .map(|(key, value)| {
-            if let Some(old) = metadata.get(key) {
-                StoredWord {
-                    key: key.clone(),
-                    value: value.clone(),
-                    pronunciation: old.pronunciation.clone(),
-                    created_at: old.created_at,
-                    created_at_label: old.created_at_label.clone(),
-                }
-            } else {
-                StoredWord {
-                    key: key.clone(),
-                    value: value.clone(),
-                    pronunciation: String::new(),
-                    created_at: 0,
-                    created_at_label: String::new(),
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    save_words(library, &rows)
-}
-
 pub(crate) fn get_word(library: &str, key: &str) -> Result<Option<StoredWord>> {
     let connection = open()?;
     connection
@@ -449,13 +418,6 @@ pub(crate) fn insert_word_if_absent(
     }
     transaction.commit()?;
     Ok(changed != 0)
-}
-
-pub(crate) fn list_library_names() -> Result<Vec<String>> {
-    let connection = open()?;
-    let mut statement = connection.prepare("SELECT name FROM word_libraries ORDER BY name")?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-    rows.map(|row| row.map_err(Into::into)).collect()
 }
 
 pub(crate) fn load_setting(name: &str) -> Result<Option<String>> {

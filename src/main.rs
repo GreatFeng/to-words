@@ -19,8 +19,8 @@ mod ui;
 pub(crate) use app::{
     UiConfig, WORD_EDITOR_FONT_FAMILY, project_directory, word_library_directory,
 };
-pub(crate) use components::word_library::{editor as word_editor, merge_panel as word_merge_panel};
-pub(crate) use domain::{translation_language, word_merge};
+pub(crate) use components::word_library::editor as word_editor;
+pub(crate) use domain::translation_language;
 pub(crate) use ui::theme as ui_theme;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

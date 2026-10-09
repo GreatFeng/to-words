@@ -1,7 +1,7 @@
 //! 设置页面组件。
 //!
-//! 主要管理设置草稿、快捷键录制、语言选择、外观与行为选项，并负责在设置首页、
-//! 词库编辑器和词库合并界面之间导航。公开的 [`SettingsPanel`] 由应用层持有，
+//! 主要管理设置草稿、快捷键录制、语言选择、外观与行为选项，并负责设置首页与
+//! 词库编辑器之间的导航。公开的 [`SettingsPanel`] 由应用层持有，
 //! `shortcut_pressed` 用于判断 egui 收到的按键是否符合用户配置。
 
 mod glass_footer;
@@ -19,7 +19,6 @@ use crate::ui_theme::{
     pale_yellow, primary_text, red_text, surface, yellow_text,
 };
 use crate::word_editor::WordEditor;
-use crate::word_merge_panel::WordMergePanel;
 use crate::{UiConfig, translation_language};
 use eframe::egui;
 use std::time::{Duration, Instant};
@@ -76,7 +75,6 @@ pub(crate) struct SettingsPanel {
     last_wheel_change: f64,
     word_editor: WordEditor,
     word_editor_review_requested: bool,
-    word_merge_panel: WordMergePanel,
     ai_key_input: String,
     ai_key_present: bool,
     remove_ai_key: bool,
@@ -102,7 +100,6 @@ impl SettingsPanel {
             last_wheel_change: 0.0,
             word_editor: WordEditor::default(),
             word_editor_review_requested: false,
-            word_merge_panel: WordMergePanel::default(),
             ai_key_input: String::new(),
             ai_key_present: false,
             remove_ai_key: false,
@@ -138,7 +135,6 @@ impl SettingsPanel {
         self.active_number = None;
         self.word_editor.close();
         self.word_editor_review_requested = false;
-        self.word_merge_panel.close();
         self.ai_key_input.clear();
         self.remove_ai_key = false;
         match credentials::load_key() {
@@ -178,13 +174,11 @@ impl SettingsPanel {
     }
 
     pub(crate) fn has_open_dialog(&self) -> bool {
-        self.word_editor.is_open() || self.word_merge_panel.is_open()
+        self.word_editor.is_open()
     }
 
     pub(crate) fn take_word_reload_requested(&mut self) -> bool {
-        let edited = self.word_editor.take_reload_requested();
-        let selected_merge = self.word_merge_panel.take_reload_requested();
-        edited || selected_merge
+        self.word_editor.take_reload_requested()
     }
 
     pub(crate) fn take_word_editor_review_requested(&mut self) -> bool {
@@ -266,13 +260,6 @@ impl SettingsPanel {
             self.word_editor.show(ui);
             return None;
         }
-        if self.word_merge_panel.is_open() {
-            self.active_shortcut = None;
-            self.active_number = None;
-            self.word_merge_panel.show(ui);
-            return None;
-        }
-
         self.capture_shortcut(ui.ctx());
 
         ui_theme::apply(ui);
@@ -356,16 +343,9 @@ impl SettingsPanel {
                             |ui| {
                                 self.draw_translation_selector(ui);
                                 ui.add_space(12.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    if secondary_button(ui, "编辑词库", 104.0).clicked() {
-                                        self.open_word_editor(ui.ctx());
-                                    }
-                                    if secondary_button(ui, "合并本地词库", 128.0).clicked() {
-                                        let file_name = self.current_word_file_name();
-                                        self.word_merge_panel.open(file_name);
-                                    }
-                                    help_icon(ui, "选择一个或多个词库并合并到当前语言词库");
-                                });
+                                if secondary_button(ui, "编辑词库", 104.0).clicked() {
+                                    self.open_word_editor(ui.ctx());
+                                }
                             },
                         );
                         ui.add_space(14.0);
@@ -825,12 +805,26 @@ impl SettingsPanel {
             });
             ui.add_space(12.0);
             ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(tr("目标语言"))
-                        .size(13.0)
-                        .strong()
-                        .color(primary_text()),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(tr("目标语言"))
+                            .size(13.0)
+                            .strong()
+                            .color(primary_text()),
+                    );
+                    if self.draft.source_language == "auto" {
+                        let explanation = i18n::message(
+                            "自动检测当前使用：{language}；语言难以判断时沿用该词库。缺少的词库会自动创建。",
+                            &[(
+                                "language",
+                                i18n::language_name(&self.active_source_language),
+                            )],
+                        );
+                        help_icon(ui, &explanation);
+                    } else {
+                        help_icon(ui, "缺少的词库会自动创建，不会覆盖已有词条。");
+                    }
+                });
                 egui::ComboBox::from_id_salt("translation_language")
                     .selected_text(i18n::language_name(&self.draft.translation_language))
                     .width(220.0)
@@ -851,25 +845,6 @@ impl SettingsPanel {
                         }
                     });
             });
-        });
-
-        let file_name = self.current_word_file_name();
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(i18n::message("词库文件：{file}", &[("file", &file_name)]))
-                    .monospace()
-                    .size(12.0)
-                    .color(muted_text()),
-            );
-            if self.draft.source_language == "auto" {
-                let explanation = i18n::message(
-                    "自动检测当前使用：{language}；语言难以判断时沿用该词库。缺少的词库会自动创建。",
-                    &[("language", i18n::language_name(&self.active_source_language))]
-                );
-                help_icon(ui, &explanation);
-            } else {
-                help_icon(ui, "缺少的词库会自动创建，不会覆盖已有词条。");
-            }
         });
     }
 
