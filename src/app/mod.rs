@@ -59,6 +59,8 @@ pub(crate) struct UiConfig {
     pub(crate) voice_aion2_manual_paste: bool,
     pub(crate) voice_keep_input: bool,
     pub(crate) voice_hold_to_talk: bool,
+    pub(crate) voice_owner_filter: bool,
+    pub(crate) voice_playback_filter: bool,
     pub(crate) voice_silence_seconds: f32,
     pub(crate) voice_backend: String,
     pub(crate) voice_language: String,
@@ -88,6 +90,8 @@ impl Default for UiConfig {
             voice_aion2_manual_paste: false,
             voice_keep_input: false,
             voice_hold_to_talk: false,
+            voice_owner_filter: false,
+            voice_playback_filter: false,
             voice_silence_seconds: 0.6,
             voice_backend: "sensevoice".to_string(),
             voice_language: "auto".to_string(),
@@ -1480,6 +1484,8 @@ impl MatchApp {
             &self.config.voice_language,
             &self.config.voice_backend,
             self.config.voice_silence_seconds,
+            self.config.voice_owner_filter,
+            self.config.voice_playback_filter,
         ) {
             Ok(session) => {
                 self.voice_trace = Some(session.trace.clone());
@@ -1598,6 +1604,16 @@ impl MatchApp {
                         self.finish_voice_error_for(utterance_id, format!("语音识别失败：{error}"));
                     }
                 },
+                VoiceEvent::Filtered(utterance_id) => {
+                    if let Some(trace) = &self.voice_trace {
+                        trace.finish(utterance_id, "speaker_rejected");
+                    }
+                    if let Some(overlay) = &mut self.voice_overlay {
+                        overlay.status = "不是已注册的本人声音，已跳过".to_string();
+                        overlay.finish_after(VOICE_OVERLAY_HOLD);
+                    }
+                    self.system_tray.set_status("不是已注册的本人声音，已跳过");
+                }
                 VoiceEvent::Stopped(error) => {
                     self.voice_session = None;
                     self.voice_hold_active = false;
@@ -1612,10 +1628,11 @@ impl MatchApp {
                     if let Some(error) = error {
                         self.finish_voice_error(format!("语音录音失败：{error}"));
                     } else if self.voice_pending.is_empty() && self.voice_translation.is_none() {
-                        let recognition_failed = self
-                            .voice_overlay
-                            .as_ref()
-                            .is_some_and(|overlay| overlay.status.starts_with("语音识别失败："));
+                        let recognition_failed =
+                            self.voice_overlay.as_ref().is_some_and(|overlay| {
+                                overlay.status.starts_with("语音识别失败：")
+                                    || overlay.status.starts_with("不是已注册的本人声音")
+                            });
                         if recognition_failed {
                             continue;
                         }
@@ -3671,6 +3688,8 @@ mod tests {
         assert!(!config.voice_aion2_manual_paste);
         assert!(!config.voice_keep_input);
         assert!(!config.voice_hold_to_talk);
+        assert!(!config.voice_owner_filter);
+        assert!(!config.voice_playback_filter);
         assert_eq!(config.voice_silence_seconds, 0.6);
         assert_eq!(config.voice_backend, "sensevoice");
         assert_eq!(config.voice_language, "auto");
@@ -3763,6 +3782,8 @@ mod tests {
         assert!(config.voice_auto_copy_first);
         assert!(!config.voice_aion2_manual_paste);
         assert!(!config.voice_keep_input);
+        assert!(!config.voice_owner_filter);
+        assert!(!config.voice_playback_filter);
         assert!(!config.voice_hold_to_talk);
         assert_eq!(config.voice_silence_seconds, 0.6);
         assert_eq!(config.voice_backend, "sensevoice");

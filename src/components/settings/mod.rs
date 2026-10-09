@@ -13,6 +13,7 @@ use crate::platform::credentials;
 use crate::platform::mouse_hotkey::MouseButtonEvent;
 use crate::platform::ocr;
 use crate::platform::voice;
+use crate::platform::voice_identity::{self, EnrollmentEvent};
 use crate::ui_theme::{
     self, accent_fill, accent_text, border, canvas, control_surface, green_text, muted_text,
     pale_yellow, primary_text, red_text, surface, yellow_text,
@@ -82,6 +83,10 @@ pub(crate) struct SettingsPanel {
     active_source_language: String,
     ocr_status: String,
     voice_status: String,
+    voice_enrollment: Option<std::sync::mpsc::Receiver<EnrollmentEvent>>,
+    voice_enrollment_status: String,
+    voice_registered: bool,
+    voice_registration_playback_filter: Option<bool>,
     glass_footer: GlassFooter,
 }
 
@@ -104,6 +109,10 @@ impl SettingsPanel {
             active_source_language: "cn".to_string(),
             ocr_status: String::new(),
             voice_status: String::new(),
+            voice_enrollment: None,
+            voice_enrollment_status: String::new(),
+            voice_registered: false,
+            voice_registration_playback_filter: None,
             glass_footer: GlassFooter::default(),
         }
     }
@@ -114,6 +123,14 @@ impl SettingsPanel {
         self.active_source_language = active_source_language.to_string();
         self.ocr_status = ocr::engine_status();
         self.voice_status = voice::engine_status(&self.draft.voice_backend);
+        self.voice_registered = voice_identity::is_registered();
+        self.voice_registration_playback_filter =
+            voice_identity::registration_uses_playback_filter();
+        self.voice_enrollment_status = if self.voice_registered {
+            tr("已注册本人声纹").to_string()
+        } else {
+            tr("尚未注册本人声纹").to_string()
+        };
         self.message = None;
         self.scroll_to_top = false;
         self.active_shortcut = None;
@@ -203,6 +220,40 @@ impl SettingsPanel {
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> Option<(UiConfig, AiKeyUpdate)> {
+        if self.voice_enrollment.is_some() {
+            while let Some(event) = self
+                .voice_enrollment
+                .as_ref()
+                .and_then(|receiver| receiver.try_recv().ok())
+            {
+                match event {
+                    EnrollmentEvent::Captured(count) => {
+                        self.voice_enrollment_status =
+                            i18n::message("已录制 {count}/3 段", &[("count", &count.to_string())]);
+                    }
+                    EnrollmentEvent::Finished(result) => {
+                        self.voice_enrollment_status = match result {
+                            Ok(()) => {
+                                self.voice_registered = true;
+                                self.voice_registration_playback_filter =
+                                    Some(self.draft.voice_playback_filter);
+                                format!(
+                                    "{} · {}",
+                                    i18n::message("已录制 {count}/3 段", &[("count", "3")]),
+                                    tr("本人声纹注册完成")
+                                )
+                            }
+                            Err(error) => format!("{}: {error:#}", tr("声纹注册失败")),
+                        };
+                        self.voice_enrollment = None;
+                        break;
+                    }
+                }
+            }
+            if self.voice_enrollment.is_some() {
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+        }
         i18n::set_language(&self.draft.ui_language);
         self.expire_message(ui.ctx(), Instant::now());
         if ui.input(|input| input.pointer.any_pressed()) {
@@ -415,6 +466,52 @@ impl SettingsPanel {
                                     );
                                     help_icon(ui, "启用后按下快捷键开始录音，松开快捷键的主按键时停止并识别最后一句。按住期间可连续说多句；此模式优先于“是否保持语音输入”。");
                                 });
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    contrast_checkbox(ui, &mut self.draft.voice_owner_filter, "仅识别已注册的本人声音");
+                                    help_icon(ui, "使用本地声纹模型判断说话人；需要先录制三段本人语音。多人同时说话、录音回放或环境变化可能误判，不能作为身份认证。");
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.add_enabled(self.voice_enrollment.is_none(), egui::Button::new(tr("注册本人声纹"))).clicked() {
+                                        match voice_identity::start_enrollment(self.draft.voice_playback_filter) {
+                                            Ok(receiver) => {
+                                                self.voice_enrollment = Some(receiver);
+                                                self.voice_enrollment_status = i18n::message("已录制 {count}/3 段", &[("count", "0")]);
+                                            }
+                                            Err(error) => self.voice_enrollment_status = format!("{}: {error:#}", tr("声纹注册失败")),
+                                        }
+                                    }
+                                    if ui.add_enabled(self.voice_enrollment.is_none() && self.voice_registered, egui::Button::new(tr("删除声纹"))).clicked() {
+                                        match voice_identity::clear_profile() {
+                                            Ok(()) => {
+                                                self.voice_registered = false;
+                                                self.voice_registration_playback_filter = None;
+                                                self.draft.voice_owner_filter = false;
+                                                self.voice_enrollment_status = tr("声纹已删除，请保存并应用设置").to_string();
+                                            }
+                                            Err(error) => self.voice_enrollment_status = format!("{}: {error:#}", tr("删除声纹失败")),
+                                        }
+                                    }
+                                    ui.label(egui::RichText::new(&self.voice_enrollment_status).size(12.0).color(muted_text()));
+                                });
+                                if self.voice_enrollment.is_some() {
+                                    ui.add_space(10.0);
+                                    voice_enrollment_guide(ui);
+                                }
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    contrast_checkbox(ui, &mut self.draft.voice_playback_filter, "过滤电脑播放声");
+                                    help_icon(ui, "优先使用 Windows 通信麦克风的回声消除；设备不支持时改用系统播放声回采和软件消除。只处理电脑播放声，不能消除手机外放或旁人说话；耳机也有帮助。");
+                                });
+                                if self.voice_registered
+                                    && self.voice_registration_playback_filter
+                                        != Some(self.draft.voice_playback_filter)
+                                {
+                                    ui.colored_label(
+                                        ui.visuals().warn_fg_color,
+                                        tr("声纹与当前播放声过滤设置不一致，请重新注册"),
+                                    );
+                                }
                                 ui.add_space(8.0);
                                 egui::Grid::new("voice_silence_settings")
                                     .num_columns(2)
@@ -1165,6 +1262,38 @@ fn help_icon(ui: &mut egui::Ui, explanation: &str) {
                     .size(13.0)
                     .color(primary_text()),
             );
+        });
+}
+
+fn voice_enrollment_guide(ui: &mut egui::Ui) {
+    egui::Frame::new()
+        .fill(control_surface())
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(tr("请依次朗读以下三句话"))
+                    .size(13.0)
+                    .strong()
+                    .color(primary_text()),
+            );
+            ui.label(egui::RichText::new(tr("请使用平时的麦克风，并保持当前“过滤电脑播放声”设置不变。"))
+                .size(12.0).color(muted_text()));
+            ui.add_space(6.0);
+            for sentence in [
+                "1. 今天我想试试语音输入，看看识别是否准确。",
+                "2. 请把这句话记下来，等一下我还会继续说话。",
+                "3. 现在我会用平时的声音，完成最后一段录音。",
+            ] {
+                ui.add(egui::Label::new(egui::RichText::new(tr(sentence)).color(primary_text())).wrap());
+            }
+            ui.add_space(8.0);
+            ui.add(egui::Label::new(egui::RichText::new(tr("点击“注册本人声纹”后先等约 1 秒，再逐句朗读。每句说约 3–5 秒，每句后（包括最后一句）停顿约 1 秒，看界面是否依次显示 1/3、2/3、3/3。"))
+                .size(12.0).color(muted_text())).wrap());
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(egui::RichText::new(tr("当前程序要求三段各至少 1.5 秒，并靠停顿分段；使用不同句子也能提供更丰富的声音样本。"))
+                .size(12.0).color(muted_text())).wrap());
         });
 }
 

@@ -1,0 +1,4 @@
+# sherpa-onnx's prebuilt Windows/MSVC libraries use the static CRT (/MT).
+# Match that runtime across this binary and its native build dependencies.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -20,3 +20,4 @@
 /assets/voice/funasr/*.dll
 /assets/voice/funasr/*.gguf
 /assets/voice/funasr/*.zip
+/assets/voice/speaker/*.onnx

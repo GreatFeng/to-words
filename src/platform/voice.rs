@@ -5,6 +5,7 @@
 
 use crate::i18n::{self, tr};
 use crate::platform::voice_metrics::VoiceTrace;
+use crate::platform::{voice_aec, voice_identity};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-const SAMPLE_RATE: usize = 16_000;
+pub(crate) const SAMPLE_RATE: usize = 16_000;
 const MAX_SECONDS: usize = 90;
 const MAX_UTTERANCE_SECONDS: usize = 30;
 const CALIBRATION_FRAMES: usize = 4;
@@ -24,6 +25,7 @@ pub(crate) enum VoiceEvent {
     SpeechStarted(u64),
     Recognizing(u64),
     Utterance(u64, Result<String, String>),
+    Filtered(u64),
     Stopped(Option<String>),
 }
 
@@ -95,8 +97,15 @@ pub(crate) fn start(
     language: &str,
     backend: &str,
     silence_seconds: f32,
+    owner_filter: bool,
+    playback_filter: bool,
 ) -> Result<VoiceSession> {
     let engine = selected_engine(backend)?;
+    let owner_verifier = if owner_filter {
+        Some(voice_identity::OwnerVerifier::load(playback_filter)?)
+    } else {
+        None
+    };
     let language = whisper_language(language).to_string();
     let trace_name = match &engine {
         RecognitionEngine::SenseVoice(_, model, _) => model
@@ -132,7 +141,27 @@ pub(crate) fn start(
         let asr_trace = worker_trace.clone();
         let asr_stop = Arc::clone(&worker_stop);
         let transcriber = std::thread::spawn(move || {
-            for (utterance_id, samples) in segment_receiver {
+            for (utterance_id, mut samples) in segment_receiver {
+                if let Some(verifier) = &owner_verifier {
+                    match verifier.select_owner_audio(&samples) {
+                        Ok(Some(owner_audio)) => {
+                            samples = owner_audio;
+                            asr_trace.record(utterance_id, "speaker_check", None, "accepted");
+                        }
+                        Ok(None) => {
+                            asr_trace.record(utterance_id, "speaker_check", None, "rejected");
+                            let _ = asr_sender.send(VoiceEvent::Filtered(utterance_id));
+                            continue;
+                        }
+                        Err(error) => {
+                            let _ = asr_sender.send(VoiceEvent::Utterance(
+                                utterance_id,
+                                Err(format!("声纹验证失败：{error:#}")),
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 let asr_started = Instant::now();
                 asr_trace.record(utterance_id, "asr_started", None, "ok");
                 let result = transcribe_selected(&engine, &samples, &language)
@@ -154,7 +183,11 @@ pub(crate) fn start(
         let recorder_stop = Arc::clone(&worker_stop);
         let recorder_trace = worker_trace.clone();
         let recorder = std::thread::spawn(move || {
-            record_microphone(recorder_stop, audio_sender, keep_input, recorder_trace)
+            if playback_filter {
+                voice_aec::record(recorder_stop, audio_sender, keep_input, recorder_trace)
+            } else {
+                record_microphone(recorder_stop, audio_sender, keep_input, recorder_trace)
+            }
         });
         let mut gate = SpeechGate::new(silence_seconds, !push_to_talk);
         let mut auto_stopped = false;
@@ -265,7 +298,7 @@ pub(crate) fn start(
     })
 }
 
-struct SpeechGate {
+pub(crate) struct SpeechGate {
     noise_floor: f32,
     calibration: [f32; CALIBRATION_FRAMES],
     calibrated_frames: usize,
@@ -279,19 +312,19 @@ struct SpeechGate {
     segment: Vec<i16>,
 }
 
-struct GateUpdate {
+pub(crate) struct GateUpdate {
     started: bool,
-    completed: Option<CompletedSegment>,
+    pub(crate) completed: Option<CompletedSegment>,
 }
 
-struct CompletedSegment {
-    samples: Vec<i16>,
+pub(crate) struct CompletedSegment {
+    pub(crate) samples: Vec<i16>,
     trailing_silence: Duration,
     reason: &'static str,
 }
 
 impl SpeechGate {
-    fn new(silence_seconds: f32, submit_on_silence: bool) -> Self {
+    pub(crate) fn new(silence_seconds: f32, submit_on_silence: bool) -> Self {
         let silence_seconds = if silence_seconds.is_finite() {
             silence_seconds.clamp(0.2, 3.0)
         } else {
@@ -312,7 +345,7 @@ impl SpeechGate {
         }
     }
 
-    fn push(&mut self, chunk: &[i16]) -> GateUpdate {
+    pub(crate) fn push(&mut self, chunk: &[i16]) -> GateUpdate {
         let mean_square = chunk
             .iter()
             .map(|sample| (*sample as f64).powi(2))
@@ -618,7 +651,7 @@ fn audio_duration(sample_count: usize) -> Duration {
 }
 
 #[cfg(windows)]
-fn record_microphone(
+pub(crate) fn record_microphone(
     stop: Arc<AtomicBool>,
     sender: mpsc::Sender<Vec<i16>>,
     keep_input: bool,
@@ -746,7 +779,7 @@ fn record_microphone(
 }
 
 #[cfg(not(windows))]
-fn record_microphone(
+pub(crate) fn record_microphone(
     _stop: Arc<AtomicBool>,
     _sender: mpsc::Sender<Vec<i16>>,
     _keep_input: bool,

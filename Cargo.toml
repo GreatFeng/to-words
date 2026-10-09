@@ -35,6 +35,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.21"
+sherpa-onnx = "1.13.8"
+sonora = "0.2.0"
+wasapi = "0.25.0"
 windows = { version = "0.59", features = [
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
