@@ -12,6 +12,7 @@ mod windows_impl {
     use anyhow::{Context, Result};
     use std::ffi::c_void;
     use std::mem::size_of;
+    #[cfg(not(feature = "react-ui"))]
     use std::time::Instant;
     use windows::Win32::Devices::HumanInterfaceDevice::{
         DIDATAFORMAT, DIMOUSESTATE2, DISCL_BACKGROUND, DISCL_NONEXCLUSIVE, DirectInput8Create,
@@ -24,6 +25,7 @@ mod windows_impl {
         GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
 
+    // Windows SDK 把该预定义格式静态放在 dinput8.lib，而不是从 dinput8.dll 导出。
     #[link(name = "dinput8", kind = "static")]
     unsafe extern "C" {
         static c_dfDIMouse2: DIDATAFORMAT;
@@ -106,6 +108,7 @@ mod windows_impl {
                 return Vec::new();
             };
             let modifiers = current_modifiers();
+            #[cfg(not(feature = "react-ui"))]
             let occurred_at = Instant::now();
             [
                 MouseButton::Extra6,
@@ -119,11 +122,13 @@ mod windows_impl {
                 button,
                 pressed: current[index],
                 modifiers,
+                #[cfg(not(feature = "react-ui"))]
                 occurred_at,
             })
             .collect()
         }
 
+        #[cfg(not(feature = "react-ui"))]
         pub(crate) fn reset(&mut self) {
             self.previous = None;
         }

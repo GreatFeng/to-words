@@ -1,12 +1,16 @@
 //! 从托盘图标母版生成窗口图标，并为 Windows 可执行文件嵌入多尺寸图标。
 
 use std::{env, fs, io::Cursor, path::PathBuf};
+#[cfg(feature = "react-ui")]
+use std::{path::Path, process::Command, time::SystemTime};
 
 const SOURCE: &str = "assets/icons/to_words_tray_source.png";
 const SIZES: &[u32] = &[16, 24, 32, 48, 64, 128, 256];
 
 fn main() {
     println!("cargo:rerun-if-changed={SOURCE}");
+    #[cfg(feature = "react-ui")]
+    build_frontend_if_needed();
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must provide OUT_DIR"));
     let source = image::open(SOURCE).expect("app icon source image must be readable");
     let mut images = Vec::new();
@@ -23,15 +27,97 @@ fn main() {
     }
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        if let Some(sdk_lib) = windows_sdk_um_lib() {
+            println!("cargo:rustc-link-search=native={}", sdk_lib.display());
+        }
         let ico = build_ico(&images);
         fs::write(output.join("to_words.ico"), &ico).expect("ICO must be writable");
-        if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") && !cfg!(feature = "react-ui")
+        {
             let resource = output.join("to_words_icon.res");
             fs::write(&resource, build_windows_resource(&images))
                 .expect("Windows icon resource must be writable");
             println!("cargo:rustc-link-arg-bin=to_words={}", resource.display());
         }
     }
+    #[cfg(feature = "react-ui")]
+    tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(
+        tauri_build::WindowsAttributes::new().window_icon_path(output.join("to_words.ico")),
+    ))
+    .expect("Tauri build metadata must be generated");
+}
+
+fn windows_sdk_um_lib() -> Option<PathBuf> {
+    let architecture = match env::var("CARGO_CFG_TARGET_ARCH").ok()?.as_str() {
+        "x86_64" => "x64",
+        "x86" => "x86",
+        "aarch64" => "arm64",
+        _ => return None,
+    };
+    let root = env::var_os("ProgramFiles(x86)")
+        .map(PathBuf::from)?
+        .join("Windows Kits")
+        .join("10")
+        .join("Lib");
+    fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("um").join(architecture))
+        .filter(|path| path.join("dinput8.lib").exists())
+        .max()
+}
+
+#[cfg(feature = "react-ui")]
+fn build_frontend_if_needed() {
+    const FRONTEND_SOURCES: &[&str] = &[
+        "frontend/src",
+        "frontend/index.html",
+        "frontend/package.json",
+        "frontend/package-lock.json",
+        "frontend/vite.config.ts",
+        "frontend/tsconfig.json",
+        "assets/i18n",
+    ];
+    for path in FRONTEND_SOURCES {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let output = Path::new("frontend/dist/index.html");
+    let built = fs::metadata(output)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let source_changed = FRONTEND_SOURCES
+        .iter()
+        .any(|path| newest_modified(Path::new(path)) > built);
+    if !source_changed && output.exists() {
+        return;
+    }
+    assert!(
+        Path::new("frontend/node_modules").exists(),
+        "React 依赖尚未安装：请先运行 npm --prefix frontend ci"
+    );
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let status = Command::new(npm)
+        .args(["--prefix", "frontend", "run", "build"])
+        .status()
+        .expect("无法启动 npm；请先安装 Node.js");
+    assert!(status.success(), "React 前端构建失败，请检查前端编译错误");
+}
+
+#[cfg(feature = "react-ui")]
+fn newest_modified(path: &Path) -> SystemTime {
+    if path.is_dir() {
+        return fs::read_dir(path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| newest_modified(&entry.path()))
+            .max()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+    }
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn build_ico(images: &[(u32, Vec<u8>)]) -> Vec<u8> {

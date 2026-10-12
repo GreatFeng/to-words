@@ -26,6 +26,7 @@ impl std::fmt::Display for TextServiceSendError {
 #[cfg(feature = "tsf-notepad-prototype")]
 impl std::error::Error for TextServiceSendError {}
 
+#[cfg(not(feature = "react-ui"))]
 pub(crate) fn input_error_trace_code(error: &anyhow::Error) -> &'static str {
     #[cfg(feature = "tsf-notepad-prototype")]
     if let Some(error) = error.downcast_ref::<TextServiceSendError>() {

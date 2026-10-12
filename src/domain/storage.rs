@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) const DATABASE_FILE: &str = "to_words.db";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StoredWord {
     pub(crate) key: String,
     pub(crate) value: String,
@@ -58,6 +58,7 @@ fn open_at(path: &Path, root: &Path, libraries: &Path) -> Result<Connection> {
            created_at INTEGER NOT NULL,
            updated_at INTEGER NOT NULL,
            origin TEXT NOT NULL DEFAULT 'manual',
+           use_count INTEGER NOT NULL DEFAULT 0,
            quality_status TEXT NOT NULL DEFAULT 'active'
              CHECK (quality_status IN ('active','quarantined')),
            quality_reason TEXT,
@@ -68,9 +69,26 @@ fn open_at(path: &Path, root: &Path, libraries: &Path) -> Result<Connection> {
          CREATE INDEX IF NOT EXISTS idx_words_lookup
            ON word_entries(library_name, quality_status, key_text);",
     )?;
+    ensure_use_count_column(&connection)?;
     migrate_legacy(&mut connection, root, libraries)?;
     migrate_library_catalog(&mut connection, root, libraries)?;
     Ok(connection)
+}
+
+fn ensure_use_count_column(connection: &Connection) -> Result<()> {
+    let mut columns = connection.prepare("PRAGMA table_info(word_entries)")?;
+    let has_column = columns
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "use_count");
+    if !has_column {
+        connection.execute(
+            "ALTER TABLE word_entries ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_library_catalog(
@@ -259,11 +277,54 @@ pub(crate) fn obvious_error_reason(library: &str, key: &str, value: &str) -> Opt
     None
 }
 
-pub(crate) fn load_word_map(library: &str) -> Result<BTreeMap<String, String>> {
+pub(crate) fn load_search_rows(library: &str) -> Result<Vec<(String, String, u64)>> {
     let connection = open()?;
-    load_word_map_from(&connection, library)
+    let mut statement = connection.prepare(
+        "SELECT key_text,value_text,use_count FROM word_entries
+         WHERE library_name=?1 AND quality_status='active' ORDER BY key_text",
+    )?;
+    let rows = statement.query_map([library], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?.max(0) as u64,
+        ))
+    })?;
+    rows.map(|row| row.map_err(Into::into)).collect()
 }
 
+/// 仅统计仍在词库中的词条；一次组合复制可包含同一词条多次。
+pub(crate) fn record_word_uses(uses: &[(String, String)]) -> Result<Vec<(String, String)>> {
+    if uses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut connection = open()?;
+    record_word_uses_on(&mut connection, uses)
+}
+
+fn record_word_uses_on(
+    connection: &mut Connection,
+    uses: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let transaction = connection.transaction()?;
+    let mut recorded = Vec::with_capacity(uses.len());
+    {
+        let mut statement = transaction.prepare(
+            "UPDATE word_entries SET use_count=CASE
+               WHEN use_count < 9223372036854775807 THEN use_count+1 ELSE use_count END
+             WHERE library_name=?1 AND key_text=?2 AND quality_status='active'",
+        )?;
+        for (library, key) in uses {
+            if statement.execute(params![library, key])? == 1 {
+                recorded.push((library.clone(), key.clone()));
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(recorded)
+}
+
+#[cfg(test)]
 fn load_word_map_from(connection: &Connection, library: &str) -> Result<BTreeMap<String, String>> {
     let mut statement = connection.prepare(
         "SELECT key_text,value_text FROM word_entries
@@ -505,6 +566,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn existing_word_table_gains_usage_column_without_losing_entries() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE word_entries (
+                   library_name TEXT NOT NULL,
+                   key_text TEXT NOT NULL,
+                   value_text TEXT NOT NULL
+                 );
+                 INSERT INTO word_entries VALUES ('lib','key','value');",
+            )
+            .unwrap();
+        ensure_use_count_column(&connection).unwrap();
+        ensure_use_count_column(&connection).unwrap();
+        let row: (String, i64) = connection
+            .query_row(
+                "SELECT value_text,use_count FROM word_entries WHERE key_text='key'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("value".into(), 0));
+    }
+
+    #[test]
     fn import_is_idempotent_and_quarantines_only_verified_errors() {
         let root = std::env::temp_dir().join(format!(
             "to_words_sqlite_{}_{}",
@@ -522,7 +608,7 @@ mod tests {
         fs::write(root.join("ui_config.json"), r#"{"voice_keep_input":true}"#).unwrap();
         fs::write(root.join("voice_word_cache.json"), r#"{"records":[]}"#).unwrap();
         let path = root.join(DATABASE_FILE);
-        let connection = open_at(&path, &root, &libraries).unwrap();
+        let mut connection = open_at(&path, &root, &libraries).unwrap();
         assert_eq!(
             load_word_map_from(&connection, "user_words_cn_ko.json")
                 .unwrap()
@@ -538,6 +624,23 @@ mod tests {
                 )
                 .unwrap(),
             1
+        );
+        let use_entries = vec![
+            (
+                "user_words_cn_ko.json".to_string(),
+                "안녕하세요".to_string(),
+            ),
+            (
+                "user_words_cn_ko.json".to_string(),
+                "안녕하세요".to_string(),
+            ),
+            ("user_words_cn_ko.json".to_string(), "없는단어".to_string()),
+        ];
+        assert_eq!(
+            record_word_uses_on(&mut connection, &use_entries)
+                .unwrap()
+                .len(),
+            2
         );
         assert_eq!(
             connection
@@ -638,6 +741,16 @@ mod tests {
                 )
                 .unwrap(),
             old_timestamp
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT use_count FROM word_entries WHERE key_text='안녕하세요'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
         );
         drop(connection);
         fs::remove_file(libraries.join("user_words_cn_ko.json")).unwrap();

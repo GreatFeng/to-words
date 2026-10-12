@@ -232,6 +232,128 @@ pub(crate) fn normalize_source_code(code: &str) -> String {
     }
 }
 
+pub(crate) fn same_language_pair<'a>(source: &'a str, target: &str) -> Option<&'a str> {
+    (!target.is_empty() && source != "auto" && source == target).then_some(source)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WritingSystem {
+    Latin,
+    Han,
+    Kana,
+    Hangul,
+    Cyrillic,
+    Arabic,
+    Hebrew,
+    Devanagari,
+    Bengali,
+    Tamil,
+    Telugu,
+    Thai,
+    Khmer,
+    Lao,
+    Myanmar,
+    Greek,
+    Other,
+}
+
+fn writing_system(ch: char) -> WritingSystem {
+    match ch as u32 {
+        0x0041..=0x007a | 0x00c0..=0x024f | 0x1e00..=0x1eff | 0x2c60..=0x2c7f | 0xa720..=0xa7ff => {
+            WritingSystem::Latin
+        }
+        0x3400..=0x9fff | 0xf900..=0xfaff => WritingSystem::Han,
+        0x3040..=0x30ff | 0x31f0..=0x31ff | 0xff66..=0xff9f => WritingSystem::Kana,
+        0x1100..=0x11ff | 0x3130..=0x318f | 0xac00..=0xd7af => WritingSystem::Hangul,
+        0x0400..=0x052f => WritingSystem::Cyrillic,
+        0x0600..=0x06ff | 0x0750..=0x077f | 0x08a0..=0x08ff => WritingSystem::Arabic,
+        0x0590..=0x05ff => WritingSystem::Hebrew,
+        0x0900..=0x097f => WritingSystem::Devanagari,
+        0x0980..=0x09ff => WritingSystem::Bengali,
+        0x0b80..=0x0bff => WritingSystem::Tamil,
+        0x0c00..=0x0c7f => WritingSystem::Telugu,
+        0x0e00..=0x0e7f => WritingSystem::Thai,
+        0x1780..=0x17ff => WritingSystem::Khmer,
+        0x0e80..=0x0eff => WritingSystem::Lao,
+        0x1000..=0x109f => WritingSystem::Myanmar,
+        0x0370..=0x03ff | 0x1f00..=0x1fff => WritingSystem::Greek,
+        _ => WritingSystem::Other,
+    }
+}
+
+fn expected_writing_system(language: &str) -> Option<WritingSystem> {
+    match language {
+        "cn" | "zh_tw" => Some(WritingSystem::Han),
+        "ja" => Some(WritingSystem::Kana),
+        "ko" => Some(WritingSystem::Hangul),
+        "ru" | "uk" | "bg" | "mn" | "kk" => Some(WritingSystem::Cyrillic),
+        "ar" | "fa" | "ur" => Some(WritingSystem::Arabic),
+        "he" => Some(WritingSystem::Hebrew),
+        "hi" => Some(WritingSystem::Devanagari),
+        "bn" => Some(WritingSystem::Bengali),
+        "ta" => Some(WritingSystem::Tamil),
+        "te" => Some(WritingSystem::Telugu),
+        "th" => Some(WritingSystem::Thai),
+        "km" => Some(WritingSystem::Khmer),
+        "lo" => Some(WritingSystem::Lao),
+        "my" => Some(WritingSystem::Myanmar),
+        "el" => Some(WritingSystem::Greek),
+        code if is_supported(code) => Some(WritingSystem::Latin),
+        _ => None,
+    }
+}
+
+/// Reject clearly different writing systems in same-language mode. Shared
+/// scripts (for example English/French or Japanese/Chinese kanji) cannot be
+/// conclusively distinguished from a short text alone.
+pub(crate) fn accepts_same_language_text(text: &str, language: &str) -> bool {
+    let Some(expected) = expected_writing_system(language) else {
+        return true;
+    };
+    let letters: Vec<_> = text
+        .chars()
+        .filter(|ch| ch.is_alphabetic())
+        .map(writing_system)
+        .collect();
+    if letters.is_empty() {
+        return true; // Numbers and punctuation do not identify a language.
+    }
+    let count = |system| letters.iter().filter(|&&item| item == system).count();
+    let primary = count(expected);
+    let han = count(WritingSystem::Han);
+    let kana = count(WritingSystem::Kana);
+    let hangul = count(WritingSystem::Hangul);
+    let allowed = |system| {
+        system == expected
+            || (expected != WritingSystem::Latin && system == WritingSystem::Latin)
+            || (language == "ja" && system == WritingSystem::Han)
+            || (language == "ko" && system == WritingSystem::Han)
+    };
+    if letters.iter().copied().any(|system| !allowed(system)) {
+        return false;
+    }
+    match language {
+        "ja" => (kana > 0 || han > 0) && hangul == 0,
+        "ko" => hangul > 0 && hangul >= han,
+        _ if expected == WritingSystem::Latin => {
+            if primary == 0 {
+                return false;
+            }
+            // Long shared-script sentences can be checked more confidently;
+            // short gaming terms must not be rejected by unreliable guessing.
+            if primary >= 24
+                && let Some(detected) = detect_source_language(text)
+                && expected_writing_system(detected) == Some(WritingSystem::Latin)
+            {
+                detected == language
+            } else {
+                true
+            }
+        }
+        _ => primary > 0,
+    }
+}
+
 /// 短输入先按文字系统判断；拉丁文字要有足够长度和可信度才切换词库。
 /// 无法确定时返回 None，调用方沿用当前词库，避免逐字输入时频繁创建文件。
 pub(crate) fn detect_source_language(text: &str) -> Option<&'static str> {
@@ -305,7 +427,40 @@ pub(crate) fn detect_source_language(text: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_source_language, normalize_language_code, word_file_name};
+    use super::{
+        accepts_same_language_text, detect_source_language, normalize_language_code,
+        same_language_pair, word_file_name,
+    };
+
+    #[test]
+    fn same_language_requires_an_explicit_nonempty_pair() {
+        assert_eq!(same_language_pair("en", "en"), Some("en"));
+        assert_eq!(same_language_pair("ja", "ja"), Some("ja"));
+        assert_eq!(same_language_pair("auto", "en"), None);
+        assert_eq!(same_language_pair("en", ""), None);
+    }
+
+    #[test]
+    fn same_language_text_rejects_other_writing_systems() {
+        assert!(accepts_same_language_text("Hello, world!", "en"));
+        assert!(accepts_same_language_text(
+            "This is a simple English sentence spoken clearly in a quiet room.",
+            "en"
+        ));
+        assert!(!accepts_same_language_text(
+            "Bonjour, je voudrais savoir comment vous allez aujourd'hui et demain.",
+            "en"
+        ));
+        assert!(!accepts_same_language_text("你好", "en"));
+        assert!(!accepts_same_language_text("こんにちは", "en"));
+        assert!(accepts_same_language_text("こんにちは、東京", "ja"));
+        assert!(accepts_same_language_text("東京", "ja"));
+        assert!(!accepts_same_language_text("hello", "ja"));
+        assert!(!accepts_same_language_text("안녕하세요", "ja"));
+        assert!(accepts_same_language_text("안녕하세요", "ko"));
+        assert!(!accepts_same_language_text("你好", "ko"));
+        assert!(accepts_same_language_text("123!", "ko"));
+    }
 
     #[test]
     fn korean_uses_the_cn_to_ko_dictionary() {

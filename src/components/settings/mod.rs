@@ -4,9 +4,14 @@
 //! 词库编辑器之间的导航。公开的 [`SettingsPanel`] 由应用层持有，
 //! `shortcut_pressed` 用于判断 egui 收到的按键是否符合用户配置。
 
+mod controls;
 mod glass_footer;
 
+use self::controls::{
+    elastic_slider, help_bubble as help_icon, hover_bubble, setting_switch as contrast_checkbox,
+};
 use self::glass_footer::GlassFooter;
+use crate::ai::PolitenessLevel;
 use crate::domain::shortcut::{MouseShortcut, Shortcut};
 use crate::i18n::{self, tr};
 use crate::platform::credentials;
@@ -15,8 +20,8 @@ use crate::platform::ocr;
 use crate::platform::voice;
 use crate::platform::voice_identity::{self, EnrollmentEvent};
 use crate::ui_theme::{
-    self, accent_fill, accent_text, border, canvas, control_surface, green_text, muted_text,
-    pale_yellow, primary_text, red_text, surface, yellow_text,
+    self, border, canvas, control_surface, green_text, muted_text, pale_yellow, primary_text,
+    red_text, surface, yellow_text,
 };
 use crate::word_editor::WordEditor;
 use crate::{UiConfig, translation_language};
@@ -264,7 +269,7 @@ impl SettingsPanel {
 
         ui_theme::apply(ui);
         ui.painter().rect_filled(ui.max_rect(), 0.0, canvas());
-        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+        ui.spacing_mut().item_spacing = egui::vec2(10.0, 9.0);
 
         let mut save = false;
         let allow_page_wheel = self.active_number.is_none();
@@ -275,12 +280,6 @@ impl SettingsPanel {
             .inner_margin(egui::Margin::symmetric(28, 18))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(tr("TO WORDS / PREFERENCES"))
-                            .monospace()
-                            .size(11.0)
-                            .color(muted_text()),
-                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let previous_language = self.draft.ui_language.clone();
                         egui::ComboBox::from_id_salt("ui_language")
@@ -301,12 +300,19 @@ impl SettingsPanel {
                                     ui.selectable_value(&mut self.draft.ui_language, code.to_string(), name);
                                 }
                             });
-                        let language_label = if self.draft.ui_language == "zh-CN" {
-                            "界面语言（language）"
+                        if self.draft.ui_language == "zh-CN" {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(85.0, 34.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    ui.label(egui::RichText::new("界面语言").size(13.0).color(primary_text()));
+                                    ui.label(egui::RichText::new("(language)").size(11.0).color(primary_text()));
+                                },
+                            );
                         } else {
-                            tr("界面语言")
-                        };
-                        ui.label(egui::RichText::new(language_label).size(13.0).color(primary_text()));
+                            ui.label(egui::RichText::new(tr("界面语言")).size(13.0).color(primary_text()));
+                        }
                         if self.draft.ui_language != previous_language {
                             i18n::set_language(&self.draft.ui_language);
                             self.message = None;
@@ -366,7 +372,6 @@ impl SettingsPanel {
                                 ui.label(
                                     egui::RichText::new(tr("识别引擎"))
                                         .size(13.0)
-                                        .strong()
                                         .color(primary_text()),
                                 );
                                 let old_backend = self.draft.voice_backend.clone();
@@ -390,7 +395,6 @@ impl SettingsPanel {
                                 ui.label(
                                     egui::RichText::new(tr("识别语言"))
                                         .size(13.0)
-                                        .strong()
                                         .color(primary_text()),
                                 );
                                 ui.horizontal(|ui| {
@@ -424,7 +428,7 @@ impl SettingsPanel {
                                         if self.draft.voice_backend == "whisper" {
                                             "经常说同一种语言时，手动指定可减少短句误判。"
                                         } else {
-                                            "SenseVoice 自动识别语言，不能通过此选项限定；识别语言设置仅用于 Whisper。"
+                                            "SenseVoice 自动检测语种；所有语言组合都会沿用已选引擎。同语言模式会过滤明显不符的文字，但不能保证固定识别该语言。"
                                         },
                                     );
                                 });
@@ -509,8 +513,8 @@ impl SettingsPanel {
                                         );
                                     });
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(tr("点击数值后滚轮调整，每次 0.1 秒"))
-                                        .size(12.0)
+                                    ui.label(egui::RichText::new(tr("停顿后自动提交；可用方向键或滚轮微调"))
+                                        .size(11.5)
                                         .color(muted_text()));
                                     help_icon(ui, "范围 0.2–3.0 秒，默认 0.6 秒。按住说话模式会等到松开快捷键才提交，停顿时间对该模式不生效。");
                                 });
@@ -715,12 +719,20 @@ impl SettingsPanel {
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            contrast_checkbox(
-                ui,
-                &mut self.draft.ai_polite_mode,
-                "敬语模式",
-            );
-            help_icon(ui, "AI 正向或反向翻译时，按译文语言使用自然礼貌的表达；没有专门敬语形式的语言会使用礼貌语气。词库已有的固定句式不受影响。");
+            ui.label(tr("敬语模式"));
+            let selected = match self.draft.ai_politeness {
+                PolitenessLevel::Informal => tr("非敬语"),
+                PolitenessLevel::Conversational => tr("口语化敬语"),
+                PolitenessLevel::Formal => tr("官方化敬语"),
+            };
+            egui::ComboBox::from_id_salt("ai_politeness")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.draft.ai_politeness, PolitenessLevel::Informal, tr("非敬语"));
+                    ui.selectable_value(&mut self.draft.ai_politeness, PolitenessLevel::Conversational, tr("口语化敬语"));
+                    ui.selectable_value(&mut self.draft.ai_politeness, PolitenessLevel::Formal, tr("官方化敬语"));
+                });
+            help_icon(ui, "非敬语适合熟人交流；口语化敬语适合日常游戏聊天；官方化敬语适合正式场合。只影响 AI 新生成的译文，不改写词库。");
         });
         ui.add_space(8.0);
         self.draw_ocr_auto_translation(ui);
@@ -768,6 +780,11 @@ impl SettingsPanel {
             );
             help_icon(ui, "松开截图选区后自动显示纯文字译文；点击 √ 才复制 OCR 原文并关闭。开启后仅向 DeepSeek 发送识别文字，不发送截图。原始语言为“自动检测”时译成简体中文。需要 API Key，可能产生费用。");
         });
+        contrast_checkbox(
+            ui,
+            &mut self.draft.ocr_show_original,
+            "截图翻译同时显示原文",
+        );
     }
 
     fn draw_translation_selector(&mut self, ui: &mut egui::Ui) {
@@ -776,7 +793,6 @@ impl SettingsPanel {
                 ui.label(
                     egui::RichText::new(tr("原始语言"))
                         .size(13.0)
-                        .strong()
                         .color(primary_text()),
                 );
                 egui::ComboBox::from_id_salt("source_language")
@@ -809,7 +825,6 @@ impl SettingsPanel {
                     ui.label(
                         egui::RichText::new(tr("目标语言"))
                             .size(13.0)
-                            .strong()
                             .color(primary_text()),
                     );
                     if self.draft.source_language == "auto" {
@@ -919,24 +934,6 @@ impl SettingsPanel {
                     ShortcutTarget::ClearComposed,
                 );
             });
-        ui.add_space(8.0);
-        egui::CollapsingHeader::new(tr("G502 LIGHTSPEED 扩展键"))
-            .default_open(false)
-            .show(ui, |ui| {
-                for line in [
-                    "后退/前进键若录制为 MouseX1/MouseX2，可直接使用；其他按键只有在驱动提供独立鼠标事件时才能录制为 Mouse6～Mouse8。",
-                    "DPI、G-Shift 等按键可在 G HUB 中分别映射为不同的键盘快捷键，再点击上方对应设置项录制；推荐使用不与其他程序冲突的 F13～F24（若 G HUB 提供）。",
-                    "重新映射会替换该按键原来的 DPI 或 G-Shift 功能。",
-                    "如切换到游戏后快捷键失效，请检查 G HUB 是否切换了配置文件；可将映射配置设为持久配置。",
-                ] {
-                    ui.label(
-                        egui::RichText::new(tr(line))
-                            .size(12.0)
-                            .color(muted_text()),
-                    );
-                    ui.add_space(4.0);
-                }
-            });
     }
 
     fn draw_input_settings(&mut self, ui: &mut egui::Ui) {
@@ -944,7 +941,7 @@ impl SettingsPanel {
             .num_columns(2)
             .spacing([16.0, 11.0])
             .show(ui, |ui| {
-                text_row(ui, "背景颜色", &mut self.draft.input.background_color);
+                color_row(ui, "背景颜色", &mut self.draft.input.background_color);
                 number_row(
                     ui,
                     "input_opacity",
@@ -1003,7 +1000,7 @@ impl SettingsPanel {
             .num_columns(2)
             .spacing([16.0, 11.0])
             .show(ui, |ui| {
-                text_row(ui, "背景颜色", &mut self.draft.results.background_color);
+                color_row(ui, "背景颜色", &mut self.draft.results.background_color);
                 number_row(
                     ui,
                     "results_opacity",
@@ -1101,9 +1098,9 @@ impl SettingsPanel {
                     &mut self.active_number,
                     &mut self.last_wheel_change,
                 );
-                text_row(ui, "文字颜色", &mut self.draft.text_color);
-                text_row(ui, "选中背景色", &mut self.draft.selected_color);
-                text_row(ui, "选中文字颜色", &mut self.draft.selected_text_color);
+                color_row(ui, "文字颜色", &mut self.draft.text_color);
+                color_row(ui, "选中背景色", &mut self.draft.selected_color);
+                color_row(ui, "选中文字颜色", &mut self.draft.selected_text_color);
                 number_row(
                     ui,
                     "selected_opacity",
@@ -1117,7 +1114,7 @@ impl SettingsPanel {
                 ui.label(
                     egui::RichText::new(tr("保持打开"))
                         .size(13.0)
-                        .color(muted_text()),
+                        .color(primary_text()),
                 );
                 contrast_checkbox(
                     ui,
@@ -1128,7 +1125,7 @@ impl SettingsPanel {
                 ui.label(
                     egui::RichText::new(tr("返回后自动清空"))
                         .size(13.0)
-                        .color(muted_text()),
+                        .color(primary_text()),
                 );
                 ui.add_enabled_ui(self.draft.continuous_input, |ui| {
                     contrast_checkbox(
@@ -1183,63 +1180,6 @@ impl SettingsPanel {
     }
 }
 
-fn contrast_checkbox(ui: &mut egui::Ui, value: &mut bool, text: &str) -> egui::Response {
-    ui.scope(|ui| {
-        if *value {
-            let visuals = &mut ui.style_mut().visuals;
-            visuals.widgets.inactive.bg_fill = accent_fill();
-            visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.5, accent_text());
-            visuals.widgets.inactive.fg_stroke =
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(24, 68, 94));
-        }
-        ui.checkbox(
-            value,
-            egui::RichText::new(tr(text))
-                .size(13.0)
-                .color(primary_text()),
-        )
-    })
-    .inner
-}
-
-fn help_icon(ui: &mut egui::Ui, explanation: &str) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-    let color = if response.hovered() {
-        accent_text()
-    } else {
-        muted_text()
-    };
-    let center = rect.center();
-    let painter = ui.painter();
-    painter.circle_filled(
-        center,
-        7.0,
-        if response.hovered() {
-            accent_fill()
-        } else {
-            control_surface()
-        },
-    );
-    painter.circle_stroke(center, 7.0, egui::Stroke::new(1.3, color));
-    painter.circle_filled(egui::pos2(center.x, center.y - 2.5), 1.0, color);
-    painter.rect_filled(
-        egui::Rect::from_center_size(egui::pos2(center.x, center.y + 1.5), egui::vec2(1.6, 4.2)),
-        0.8,
-        color,
-    );
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    egui::Popup::from_toggle_button_response(&response)
-        .width(360.0)
-        .frame(ui_theme::tooltip_frame())
-        .show(|ui| {
-            ui.label(
-                egui::RichText::new(tr(explanation))
-                    .size(13.0)
-                    .color(primary_text()),
-            );
-        });
-}
-
 fn voice_enrollment_guide(ui: &mut egui::Ui) {
     egui::Frame::new()
         .fill(control_surface())
@@ -1288,7 +1228,7 @@ fn settings_card<R>(
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(tr(title))
-                        .size(17.0)
+                        .size(16.0)
                         .strong()
                         .color(primary_text()),
                 );
@@ -1296,7 +1236,7 @@ fn settings_card<R>(
                     help_icon(ui, description);
                 }
             });
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             add_contents(ui)
         })
         .inner
@@ -1389,7 +1329,7 @@ fn glass_scroll_to_top_button(ui: &mut egui::Ui, dark_backdrop: bool) -> egui::R
         ],
         egui::Stroke::new(2.0, text_color),
     ));
-    response.on_hover_text(tr("返回顶部"))
+    hover_bubble(ui, response, tr("返回顶部"))
 }
 
 fn scroll_to_top_visible(offset: f32) -> bool {
@@ -1403,23 +1343,52 @@ fn status_message(ui: &mut egui::Ui, message: &str, is_error: bool, dark_backdro
         (true, true) => egui::Color32::from_rgb(255, 184, 185),
         (false, true) => egui::Color32::from_rgb(182, 233, 187),
     };
-    ui.add(egui::Label::new(egui::RichText::new(message).size(13.0).color(color)).truncate())
-        .on_hover_text(message);
+    let response =
+        ui.add(egui::Label::new(egui::RichText::new(message).size(13.0).color(color)).truncate());
+    hover_bubble(ui, response, message);
 }
 
-fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+fn field_label(ui: &mut egui::Ui, label: &str) {
     ui.label(
         egui::RichText::new(tr(label))
             .size(13.0)
-            .color(muted_text()),
+            .color(primary_text()),
     );
-    let width = ui.available_width().clamp(132.0, 180.0);
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .desired_width(width)
-            .margin(egui::Margin::symmetric(8, 5))
-            .background_color(control_surface()),
-    );
+}
+
+fn parse_color_hex(value: &str) -> Option<[u8; 3]> {
+    let trimmed = value.trim();
+    let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    Some([
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ])
+}
+
+fn color_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    field_label(ui, label);
+    let mut valid = parse_color_hex(value);
+    let mut rgb = valid.unwrap_or([232, 232, 232]);
+    ui.horizontal(|ui| {
+        if ui.color_edit_button_srgb(&mut rgb).changed() {
+            *value = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+            valid = Some(rgb);
+        }
+        ui.label(
+            egui::RichText::new(value.as_str())
+                .monospace()
+                .size(12.0)
+                .color(if valid.is_some() {
+                    muted_text()
+                } else {
+                    red_text()
+                }),
+        );
+    });
     ui.end_row();
 }
 
@@ -1431,11 +1400,7 @@ fn shortcut_row(
     recording_started_at: &mut Option<Instant>,
     target: ShortcutTarget,
 ) {
-    ui.label(
-        egui::RichText::new(tr(label))
-            .size(13.0)
-            .color(muted_text()),
-    );
+    field_label(ui, label);
     let recording = *active == Some(target);
     let text = if recording || value.is_empty() {
         tr("请按键或鼠标按键…")
@@ -1482,40 +1447,16 @@ fn number_row(
     last_wheel_change: &mut f64,
 ) {
     let voice_pause = id_source == "voice_silence_seconds";
-    ui.label(
-        egui::RichText::new(tr(label))
-            .size(13.0)
-            .color(muted_text()),
-    );
+    field_label(ui, label);
     let id = ui.make_persistent_id(id_source);
-    let selected = *active == Some(id);
-    let text = if voice_pause {
-        format!("{value:.1}")
-    } else if step < 1.0 {
-        format!("{value:.2}")
-    } else {
-        format!("{value:.0}")
-    };
-    let width = ui.available_width().clamp(132.0, 180.0);
-    let response =
-        ui.add_sized(
-            [width, 32.0],
-            egui::Button::new(egui::RichText::new(text).monospace().size(12.5).color(
-                if selected {
-                    accent_text()
-                } else {
-                    primary_text()
-                },
-            ))
-            .fill(if selected {
-                accent_fill()
-            } else {
-                control_surface()
-            })
-            .stroke(egui::Stroke::new(1.0, border()))
-            .corner_radius(4),
-        );
-    if response.clicked() {
+    let response = elastic_slider(
+        ui,
+        value,
+        range.clone(),
+        step,
+        if voice_pause { 1 } else { 2 },
+    );
+    if response.clicked() || response.drag_started() {
         *active = Some(id);
         response.request_focus();
     }
@@ -1544,8 +1485,8 @@ fn number_row(
                 let direction = if wheel > 0.0 { 1.0 } else { -1.0 };
                 *value = (*value + direction * step).clamp(*range.start(), *range.end());
             }
-
             *last_wheel_change = now;
+            ui.ctx().request_repaint();
         }
     }
     ui.end_row();
@@ -1568,35 +1509,18 @@ fn usize_number_row(
     active: &mut Option<egui::Id>,
     last_wheel_change: &mut f64,
 ) {
-    ui.label(
-        egui::RichText::new(tr(label))
-            .size(13.0)
-            .color(muted_text()),
-    );
+    field_label(ui, label);
     let id = ui.make_persistent_id(id_source);
-    let selected = *active == Some(id);
-    let width = ui.available_width().clamp(132.0, 180.0);
-    let response = ui.add_sized(
-        [width, 32.0],
-        egui::Button::new(
-            egui::RichText::new(value.to_string())
-                .monospace()
-                .size(12.5)
-                .color(if selected {
-                    accent_text()
-                } else {
-                    primary_text()
-                }),
-        )
-        .fill(if selected {
-            accent_fill()
-        } else {
-            control_surface()
-        })
-        .stroke(egui::Stroke::new(1.0, border()))
-        .corner_radius(4),
+    let mut float_value = *value as f32;
+    let response = elastic_slider(
+        ui,
+        &mut float_value,
+        *range.start() as f32..=*range.end() as f32,
+        1.0,
+        0,
     );
-    if response.clicked() {
+    *value = float_value.round() as usize;
+    if response.clicked() || response.drag_started() {
         *active = Some(id);
         response.request_focus();
     }
@@ -1609,6 +1533,7 @@ fn usize_number_row(
                 *value = value.saturating_sub(1).max(*range.start());
             }
             *last_wheel_change = now;
+            ui.ctx().request_repaint();
         }
     }
     ui.end_row();
@@ -1697,13 +1622,22 @@ fn shortcut_text(key: egui::Key, modifiers: egui::Modifiers) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::{
-        SettingsPanel, ShortcutTarget, scroll_to_top_visible, shortcut_text, step_voice_pause,
+        SettingsPanel, ShortcutTarget, parse_color_hex, scroll_to_top_visible, shortcut_text,
+        step_voice_pause,
     };
     use crate::UiConfig;
     use crate::domain::shortcut::{MouseButton, MouseModifiers};
     use crate::platform::mouse_hotkey::MouseButtonEvent;
     use eframe::egui;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn color_picker_reads_existing_hex_colors_without_alpha() {
+        assert_eq!(parse_color_hex("#E8E8E8"), Some([232, 232, 232]));
+        assert_eq!(parse_color_hex("0b57d0"), Some([11, 87, 208]));
+        assert_eq!(parse_color_hex("#1234"), None);
+        assert_eq!(parse_color_hex("#GG0000"), None);
+    }
 
     #[test]
     fn records_ctrl_alt_enter() {

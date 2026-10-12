@@ -6,6 +6,7 @@
 use crate::domain::shortcut::{MouseButton, MouseModifiers};
 #[cfg(not(target_os = "windows"))]
 use anyhow::Result;
+#[cfg(not(feature = "react-ui"))]
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
@@ -13,6 +14,7 @@ pub(crate) struct MouseButtonEvent {
     pub(crate) button: MouseButton,
     pub(crate) pressed: bool,
     pub(crate) modifiers: MouseModifiers,
+    #[cfg(not(feature = "react-ui"))]
     pub(crate) occurred_at: Instant,
 }
 
@@ -25,6 +27,7 @@ mod windows_impl {
     use std::ptr;
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread::{self, JoinHandle};
+    #[cfg(not(feature = "react-ui"))]
     use std::time::Instant;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
@@ -119,6 +122,7 @@ mod windows_impl {
                     button,
                     pressed,
                     modifiers: current_modifiers(),
+                    #[cfg(not(feature = "react-ui"))]
                     occurred_at: Instant::now(),
                 };
                 SENDER.with(|slot| {

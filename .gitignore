@@ -1,6 +1,9 @@
 /word_libraries/
 /tests/
 /target/
+/frontend/node_modules/
+/frontend/dist/
+/gen/
 /logs/
 /voice_word_cache.json
 /voice_word_cache.json.tmp

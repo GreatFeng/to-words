@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+:root {
+  font-family: "Segoe UI", "Microsoft YaHei UI", "Malgun Gothic", "Yu Gothic UI", sans-serif;
+  color: #26282a;
+  background: transparent;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+html, body, #root { width: 100%; height: 100%; margin: 0; }
+button, input, textarea, select { font: inherit; }
+button { cursor: pointer; }
+
+.app-scrollbar::-webkit-scrollbar { width: 9px; height: 9px; }
+.app-scrollbar::-webkit-scrollbar-thumb { border-radius: 9px; background: #c9ccd0; border: 2px solid transparent; background-clip: padding-box; }
+
+.surface-card { @apply rounded-2xl border border-slate-200 bg-white shadow-[0_8px_25px_rgba(34,42,48,0.06)]; }
+.field { @apply h-9 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm text-slate-800 outline-none transition-colors focus:border-blue-500 focus:ring-2 focus:ring-blue-100; }
+.button { @apply inline-flex h-9 items-center justify-center rounded-xl border border-slate-300 bg-white px-4 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 active:bg-slate-100; }
+.button-primary { @apply border-slate-800 bg-slate-800 text-white hover:bg-slate-700 active:bg-slate-900; }
+.button-danger { @apply border-red-100 bg-red-50 text-red-700 hover:bg-red-100; }
+
+.setting-range {
+  appearance: none;
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(to right, #24272e var(--range-progress), #d5dbe1 var(--range-progress));
+  outline: none;
+}
+.setting-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #24272e;
+  transition: box-shadow .2s ease, transform .2s ease;
+}
+.setting-range:hover::-webkit-slider-thumb,
+.setting-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 8px rgb(36 39 46 / 16%);
+}
+.setting-range:active::-webkit-slider-thumb { transform: scale(1.13); }

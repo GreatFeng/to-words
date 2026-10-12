@@ -19,7 +19,7 @@ const INPUT_ID: &str = "word_match_input";
 const VOICE_OVERLAY_HOLD: Duration = Duration::from_secs(1);
 pub(crate) const WORD_EDITOR_FONT_FAMILY: &str = "word_editor_chinese";
 
-use crate::ai::{self, AiCandidate, TranslationDirection};
+use crate::ai::{self, AiCandidate, PolitenessLevel, TranslationDirection};
 use crate::components::ocr_selection::{OcrSelection, SelectionAction};
 use crate::components::settings::{
     AiKeyUpdate, SettingsPanel, shortcut_pressed, shortcut_released,
@@ -52,9 +52,10 @@ pub(crate) struct UiConfig {
     pub(crate) continuous_input: bool,
     pub(crate) ai_translation: bool,
     pub(crate) ai_auto_save: bool,
-    #[serde(alias = "ai_korean_honorific")]
-    pub(crate) ai_polite_mode: bool,
+    #[serde(alias = "ai_polite_mode", alias = "ai_korean_honorific")]
+    pub(crate) ai_politeness: PolitenessLevel,
     pub(crate) ocr_auto_translate: bool,
+    pub(crate) ocr_show_original: bool,
     pub(crate) voice_auto_copy_first: bool,
     pub(crate) voice_aion2_manual_paste: bool,
     pub(crate) voice_keep_input: bool,
@@ -84,8 +85,9 @@ impl Default for UiConfig {
             continuous_input: false,
             ai_translation: false,
             ai_auto_save: true,
-            ai_polite_mode: false,
+            ai_politeness: PolitenessLevel::Informal,
             ocr_auto_translate: true,
+            ocr_show_original: true,
             voice_auto_copy_first: true,
             voice_aion2_manual_paste: false,
             voice_keep_input: false,
@@ -184,7 +186,7 @@ impl Default for HotkeyConfig {
 }
 
 impl UiConfig {
-    fn normalized(mut self) -> Self {
+    pub(crate) fn normalized(mut self) -> Self {
         self.input.opacity = self.input.opacity.clamp(0.0, 1.0);
         self.input.width = self.input.width.clamp(80.0, 1200.0);
         self.input.height = self.input.height.clamp(18.0, 200.0);
@@ -267,12 +269,10 @@ pub(crate) fn word_library_directory() -> PathBuf {
 
 fn load_user_words(config: &UiConfig, source: &str) -> Result<WordIndex> {
     let file_name = translation_language::word_file_name(source, &config.translation_language);
-    Ok(WordIndex::from_map(
-        storage::load_word_map(&file_name)?.into_iter().collect(),
-    ))
+    Ok(WordIndex::from_rows(storage::load_search_rows(&file_name)?))
 }
 
-fn load_ui_config() -> Result<UiConfig> {
+pub(crate) fn load_ui_config() -> Result<UiConfig> {
     let Some(content) = storage::load_setting("ui_config")? else {
         return Ok(UiConfig::default());
     };
@@ -280,7 +280,7 @@ fn load_ui_config() -> Result<UiConfig> {
     Ok(config.normalized())
 }
 
-fn save_ui_config(config: &UiConfig) -> Result<()> {
+pub(crate) fn save_ui_config(config: &UiConfig) -> Result<()> {
     let content = serde_json::to_string_pretty(config).context("无法生成 UI 配置")?;
     storage::save_setting("ui_config", &content)
 }
@@ -947,16 +947,20 @@ impl OcrPreview {
     }
 }
 
-fn translate_ocr_recognized(recognized: &str, target: &str, polite_mode: bool) -> Result<String> {
+fn translate_ocr_recognized(
+    recognized: &str,
+    target: &str,
+    politeness: PolitenessLevel,
+) -> Result<String> {
     let key = credentials::load_key()
         .context("读取 DeepSeek API Key 失败")?
         .filter(|key| !key.trim().is_empty())
         .context("未配置 DeepSeek API Key")?;
-    ai::translate_ocr_text(recognized, target, &key, polite_mode)
+    ai::translate_ocr_text(recognized, target, &key, politeness)
 }
 
 fn same_language_no_translation(source: &str, target: &str) -> bool {
-    !target.is_empty() && source != "auto" && source == target
+    translation_language::same_language_pair(source, target).is_some()
 }
 
 fn ocr_translation_target(enabled: bool, source: &str, target: &str) -> Option<String> {
@@ -967,6 +971,16 @@ fn ocr_translation_target(enabled: bool, source: &str, target: &str) -> Option<S
             source.to_string()
         }
     })
+}
+
+fn ocr_preview_text(original: &str, translation: &str, show_original: bool) -> String {
+    if translation.is_empty() {
+        original.to_string()
+    } else if show_original {
+        format!("{original}\n{translation}")
+    } else {
+        translation.to_string()
+    }
 }
 
 struct MatchApp {
@@ -1366,15 +1380,15 @@ impl MatchApp {
                         &self.config.translation_language,
                     ) {
                         let (sender, receiver) = mpsc::channel();
-                        let polite_mode = self.config.ai_polite_mode;
+                        let politeness = self.config.ai_politeness;
                         std::thread::spawn(move || {
                             let _ =
-                                sender.send(translate_ocr_recognized(&text, &target, polite_mode));
+                                sender.send(translate_ocr_recognized(&text, &target, politeness));
                         });
                         preview.translating = Some(receiver);
                         preview.display = Some(("正在翻译…".to_string(), false));
                     } else {
-                        preview.display = None;
+                        preview.display = Some((text, false));
                     }
                 }
                 Err(error) => {
@@ -1396,8 +1410,12 @@ impl MatchApp {
                 });
         if let Some(result) = translated {
             preview.translating = None;
+            let original = preview.recognized.as_deref().unwrap_or_default();
             preview.display = Some(match result {
-                Ok(text) => (text, false),
+                Ok(text) => (
+                    ocr_preview_text(original, &text, self.config.ocr_show_original),
+                    false,
+                ),
                 Err(error) => (format!("翻译失败：{error:#}"), true),
             });
         }
@@ -1481,8 +1499,20 @@ impl MatchApp {
         match voice::start(
             self.config.voice_keep_input || hold_to_talk,
             hold_to_talk,
-            &self.config.voice_language,
-            &self.config.voice_backend,
+            voice::effective_voice_language(
+                &self.config.voice_language,
+                &self.config.source_language,
+                &self.config.translation_language,
+            ),
+            voice::effective_voice_backend(
+                &self.config.voice_backend,
+                &self.config.source_language,
+                &self.config.translation_language,
+            ),
+            translation_language::same_language_pair(
+                &self.config.source_language,
+                &self.config.translation_language,
+            ),
             self.config.voice_silence_seconds,
             self.config.voice_owner_filter,
             self.config.voice_playback_filter,
@@ -1833,6 +1863,20 @@ impl MatchApp {
             self.finish_voice_error_for(utterance_id, "没有识别到清晰的语音，请重试".to_string());
             return;
         }
+        if let Some(language) = translation_language::same_language_pair(
+            &self.config.source_language,
+            &self.config.translation_language,
+        ) && !translation_language::accepts_same_language_text(query, language)
+        {
+            self.finish_voice_error_for(
+                utterance_id,
+                format!(
+                    "识别结果不是所选的{}，已忽略",
+                    translation_language::language_label(language)
+                ),
+            );
+            return;
+        }
         self.voice_context
             .push_back((utterance_id, query.to_owned()));
         if self.voice_context.len() > 20 {
@@ -2049,7 +2093,7 @@ impl MatchApp {
         let source = query.to_string();
         let source_language = self.active_source_language.clone();
         let target_language = self.config.translation_language.clone();
-        let polite_mode = self.config.ai_polite_mode;
+        let politeness = self.config.ai_politeness;
         let reverse_language = if self.config.source_language == "auto" {
             "cn".to_string()
         } else {
@@ -2065,13 +2109,13 @@ impl MatchApp {
             if let Some(trace) = &trace {
                 trace.record(utterance_id, "ai_request_started", None, "ok");
             }
-            let result = ai::translate(
+            let result = ai::translate_voice(
                 source,
                 source_language,
                 target_language,
                 reverse_language,
                 key,
-                polite_mode,
+                politeness,
             );
             if let Some(trace) = &trace {
                 trace.record(
@@ -2290,6 +2334,26 @@ impl MatchApp {
             return;
         }
 
+        if let Some(language) = translation_language::same_language_pair(
+            &self.config.source_language,
+            &self.config.translation_language,
+        ) {
+            self.matches.clear();
+            self.last_query.clear();
+            self.message = Some(
+                if translation_language::accepts_same_language_text(&query, language) {
+                    "同语言模式：按 Enter 直接复制原文".to_string()
+                } else {
+                    format!(
+                        "输入内容不是所选的{}",
+                        translation_language::language_label(language)
+                    )
+                },
+            );
+            self.resize_window(context);
+            return;
+        }
+
         if self.config.source_language == "auto"
             && let Some(detected) = translation_language::detect_source_language(&query)
         {
@@ -2478,6 +2542,22 @@ impl MatchApp {
     }
 
     fn commit_current_with_space(&mut self, context: &egui::Context) {
+        if let Some(language) = translation_language::same_language_pair(
+            &self.config.source_language,
+            &self.config.translation_language,
+        ) {
+            let text = self.input.trim().to_owned();
+            if translation_language::accepts_same_language_text(&text, language) {
+                self.accept_text(&text, "", None, context, true);
+            } else {
+                self.message = Some(format!(
+                    "输入内容不是所选的{}",
+                    translation_language::language_label(language)
+                ));
+                self.resize_window(context);
+            }
+            return;
+        }
         if let AiState::Ready(candidate) = &self.ai_state {
             self.accept_ai_candidate(candidate.clone(), context, true);
         } else if !self.matches.is_empty() {
@@ -2535,10 +2615,16 @@ impl MatchApp {
             self.selected = (self.selected + 1).min(self.visible_match_range().end - 1);
         }
         if context.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter)) {
+            if self.commit_same_language_text(context) {
+                return;
+            }
             self.request_ai_translation(context);
             return;
         }
         if context.input(|input| input.key_pressed(egui::Key::Enter)) {
+            if self.commit_same_language_text(context) {
+                return;
+            }
             if let AiState::Ready(candidate) = &self.ai_state {
                 self.accept_ai_candidate(candidate.clone(), context, false);
             } else if self.matches.is_empty() {
@@ -2550,6 +2636,29 @@ impl MatchApp {
                 self.request_input_focus = true;
             }
         }
+    }
+
+    fn commit_same_language_text(&mut self, context: &egui::Context) -> bool {
+        let Some(language) = translation_language::same_language_pair(
+            &self.config.source_language,
+            &self.config.translation_language,
+        ) else {
+            return false;
+        };
+        let text = self.input.trim().to_owned();
+        if text.is_empty() {
+            return false;
+        }
+        if translation_language::accepts_same_language_text(&text, language) {
+            self.accept_text(&text, "", None, context, false);
+        } else {
+            self.message = Some(format!(
+                "输入内容不是所选的{}",
+                translation_language::language_label(language)
+            ));
+            self.resize_window(context);
+        }
+        true
     }
 
     fn change_composed(&mut self, context: &egui::Context, clear_all: bool) -> bool {
@@ -2581,6 +2690,7 @@ impl MatchApp {
         if self.input.trim().is_empty() {
             if !self.continuous_input.is_empty() {
                 context.copy_text(self.continuous_input.clipboard_text().to_owned());
+                self.record_composed_usage();
                 self.copied_since_focus = true;
                 self.left_after_copy = false;
             }
@@ -2620,7 +2730,11 @@ impl MatchApp {
         };
         let key = entry.key.clone();
         let value = entry.value.clone();
-        self.accept_text(&key, &value, context, continue_input);
+        let library = translation_language::word_file_name(
+            &self.active_source_language,
+            &self.config.translation_language,
+        );
+        self.accept_text(&key, &value, Some(&library), context, continue_input);
     }
 
     fn accept_ai_candidate(
@@ -2632,6 +2746,7 @@ impl MatchApp {
         self.accept_text(
             &candidate.translated,
             &candidate.source,
+            None,
             context,
             continue_input,
         );
@@ -2647,12 +2762,18 @@ impl MatchApp {
         &mut self,
         key: &str,
         value: &str,
+        library: Option<&str>,
         context: &egui::Context,
         continue_input: bool,
     ) {
-        let composed = self.continuous_input.append(key, value).to_owned();
+        let composed = match library {
+            Some(library) => self.continuous_input.append_word(key, value, library),
+            None => self.continuous_input.append(key, value),
+        }
+        .to_owned();
         if !continue_input {
             context.copy_text(composed);
+            self.record_composed_usage();
             self.copied_since_focus = true;
             self.left_after_copy = false;
         }
@@ -2671,9 +2792,30 @@ impl MatchApp {
         }
     }
 
+    fn record_composed_usage(&mut self) {
+        match storage::record_word_uses(&self.continuous_input.used_words()) {
+            Ok(recorded) => {
+                let current_library = translation_language::word_file_name(
+                    &self.active_source_language,
+                    &self.config.translation_language,
+                );
+                for (library, key) in recorded {
+                    if library == current_library {
+                        self.words.record_use(&key);
+                    }
+                }
+            }
+            Err(reason) => eprintln!("无法记录词条使用次数：{reason:#}"),
+        }
+    }
+
     fn ai_available(&self) -> bool {
         self.config.ai_translation
             && !self.config.translation_language.is_empty()
+            && !same_language_no_translation(
+                &self.config.source_language,
+                &self.config.translation_language,
+            )
             && self.word_load_error.is_none()
     }
 
@@ -2700,7 +2842,7 @@ impl MatchApp {
         let source = self.input.trim().to_owned();
         let source_language = self.active_source_language.clone();
         let language = self.config.translation_language.clone();
-        let polite_mode = self.config.ai_polite_mode;
+        let politeness = self.config.ai_politeness;
         let reverse_language = if self.config.source_language == "auto" {
             "cn".to_string()
         } else {
@@ -2714,7 +2856,7 @@ impl MatchApp {
                 language,
                 reverse_language,
                 key,
-                polite_mode,
+                politeness,
             ));
         });
         self.ai_state = AiState::Loading(receiver);
@@ -3651,7 +3793,7 @@ pub(crate) fn run() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        PopupAnchor, UiConfig, parse_hex_color, parse_hotkeys, popup_position,
+        PolitenessLevel, PopupAnchor, UiConfig, parse_hex_color, parse_hotkeys, popup_position,
         take_query_separator, voice_review_due,
     };
     use eframe::egui;
@@ -3682,7 +3824,7 @@ mod tests {
         assert_eq!(config.results.max_visible_results, 8);
         assert!(!config.continuous_input);
         assert!(config.ai_auto_save);
-        assert!(!config.ai_polite_mode);
+        assert_eq!(config.ai_politeness, PolitenessLevel::Informal);
         assert!(config.ocr_auto_translate);
         assert!(config.voice_auto_copy_first);
         assert!(!config.voice_aion2_manual_paste);
@@ -3738,7 +3880,7 @@ mod tests {
         let config: UiConfig = serde_json::from_str(r#"{"ai_translation":true}"#).unwrap();
         assert!(config.ai_translation);
         assert!(config.ai_auto_save);
-        assert!(!config.ai_polite_mode);
+        assert_eq!(config.ai_politeness, PolitenessLevel::Informal);
         assert!(config.ocr_auto_translate);
         assert_eq!(config.source_language, "auto");
         assert_eq!(config.ui_language, "zh-CN");
@@ -3762,11 +3904,11 @@ mod tests {
     }
 
     #[test]
-    fn former_korean_honorific_setting_migrates_to_general_polite_mode() {
+    fn former_korean_honorific_setting_migrates_to_conversational_politeness() {
         let config: UiConfig = serde_json::from_str(r#"{"ai_korean_honorific":true}"#).unwrap();
-        assert!(config.ai_polite_mode);
+        assert_eq!(config.ai_politeness, PolitenessLevel::Conversational);
         let saved = serde_json::to_value(config).unwrap();
-        assert_eq!(saved["ai_polite_mode"], true);
+        assert_eq!(saved["ai_politeness"], "conversational");
         assert!(saved.get("ai_korean_honorific").is_none());
     }
 
@@ -3774,6 +3916,17 @@ mod tests {
     fn ocr_auto_translation_can_be_disabled_in_config() {
         let config: UiConfig = serde_json::from_str(r#"{"ocr_auto_translate":false}"#).unwrap();
         assert!(!config.ocr_auto_translate);
+    }
+
+    #[test]
+    fn ocr_original_display_defaults_on_and_can_be_hidden() {
+        let old: UiConfig = serde_json::from_str("{}").unwrap();
+        assert!(old.ocr_show_original);
+        let hidden: UiConfig = serde_json::from_str(r#"{"ocr_show_original":false}"#).unwrap();
+        assert!(!hidden.ocr_show_original);
+        assert_eq!(super::ocr_preview_text("原文", "译文", true), "原文\n译文");
+        assert_eq!(super::ocr_preview_text("原文", "译文", false), "译文");
+        assert_eq!(super::ocr_preview_text("原文", "", false), "原文");
     }
 
     #[test]
@@ -3811,12 +3964,8 @@ mod tests {
     #[test]
     fn voice_query_uses_local_dictionary_before_ai_fallback() {
         use super::{WordIndex, search_voice_words, voice_lookup_output};
-        use std::collections::HashMap;
 
-        let words = WordIndex::from_map(HashMap::from([(
-            "안녕하세요".to_string(),
-            "你好".to_string(),
-        )]));
+        let words = WordIndex::from_rows(vec![("안녕하세요".into(), "你好".into(), 0)]);
         let (hits, query) = search_voice_words(&words, "你好！");
         assert_eq!(query, "你好");
         assert_eq!(hits.len(), 1);

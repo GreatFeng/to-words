@@ -6,11 +6,14 @@
 
 ## 运行
 
-安装 Rust 后，在项目目录执行：
+安装 Rust、Node.js 后，先安装前端依赖，再在项目目录运行：
 
 ```powershell
+npm --prefix frontend ci
 cargo run
 ```
+
+默认使用 React + TailwindCSS + Tauri 界面。Rust 构建脚本会在前端源码变化后自动重新构建静态资源。若要临时运行旧版 egui 界面，可执行 `cargo run --no-default-features`；发布时执行 `cargo build --release`。前端源码在 `frontend/src`，Rust/Tauri 命令和窗口调度在 `src/web_app.rs`，跨程序定位在 `src/platform/caret_position.rs`，SQLite/词库/语音/OCR 仍由 `src/domain` 与 `src/platform` 复用。
 
 程序启动后在后台运行，不会自动弹出查询框。系统托盘出现图标即表示程序已经启动。
 
@@ -36,9 +39,11 @@ G502 LIGHTSPEED 的 11 个可编程功能不等于 Windows 上报 11 个鼠标�
 
 Whisper CLI 的计算线程数自动取可用逻辑处理器数与 8 的较小值（查询失败则用 4）。实测同一段 4.5 秒中文录音，4 线程约 1.18 秒、8 线程约 0.75 秒，文字相同；更激进的解码参数虽然略快，但会丢失标点，因此没有启用。启用耗时诊断时，日志中的 `asr_threads` 会记录实际线程数。
 
-`voice_silence_seconds` 默认 `0.6`，读取配置后限制在 `0.2..=3.0`，按 16 kHz 采样数控制自动提交。`voice_hold_to_talk` 默认 `false`：启用后全局语音快捷键的 Pressed 开始录音，Released 停止；按住期间不按静音阈值自动提交，最后一段在松开后交给识别线程，并短暂等待快捷键修饰键松开再输入结果。此模式优先于 `voice_keep_input`。`ai_polite_mode` 默认 `false`，对查询框、语音及 OCR 的 AI 翻译结果添加按目标语言选择的礼貌表达提示；正向、反向均适用，不改写本地词库匹配结果。旧配置字段 `ai_korean_honorific` 作为反序列化别名继续读取。
+`voice_silence_seconds` 默认 `0.6`，读取配置后限制在 `0.2..=3.0`，按 16 kHz 采样数控制自动提交。`voice_hold_to_talk` 默认 `false`：启用后全局语音快捷键的 Pressed 开始录音，Released 停止；按住期间不按静音阈值自动提交，最后一段在松开后交给识别线程，并短暂等待快捷键修饰键松开再输入结果。此模式优先于 `voice_keep_input`。
 
-最终文字先按现有 `WordIndex` 在 key/value 两列搜索；命中时输入 key，多条命中默认输入第一条。设置项 `voice_auto_copy_first=false` 时，多条结果会交给现有查询框选择（手动选择沿用查询框的复制流程）。未命中时，仅在启用 `ai_translation`、配置目标语言和 DeepSeek API Key 后调用现有双向翻译，再立即输入译文；入库则交由后台缓存审核。窗口变化或输入被系统拒绝时跳过输入，避免写入错误窗口。设置项通过 `hotkeys.voice` 配置快捷键，默认 `ctrl+alt+v`；`voice_language` 默认 `auto`，可指定 Whisper 的识别语言。模型优先级为 medium → small → base → tiny。
+`ai_politeness` 默认 `informal`，可设为 `informal`（非敬语）、`conversational`（口语化敬语）或 `formal`（官方化敬语）。查询框、语音和 OCR 的 AI 翻译共用该档位，正向和反向翻译按实际译文语言调整表达；本地词库匹配结果不改写。旧配置字段 `ai_polite_mode` 和 `ai_korean_honorific` 仍可读取：`false` 迁移到 `informal`，`true` 迁移到 `conversational`；保存后统一写为新字段。
+
+最终文字先按现有 `WordIndex` 在 key/value 两列搜索；命中时输入 key，多条命中默认输入第一条。设置项 `voice_auto_copy_first=false` 时，多条结果会交给现有查询框选择（手动选择沿用查询框的复制流程）。未命中时，仅在启用 `ai_translation`、配置目标语言和 DeepSeek API Key 后调用双向翻译，再立即输入译文；入库则交由后台缓存审核。语音 AI 路径使用 `src/domain/voice_sentence.rs` 对超过 60 字符的原文按标点、空格或连接词做保守断句；同一段语音的所有片段在一次请求中送给 DeepSeek，要求逐段对应且不漏译，最后合并为一条 `AiCandidate`，因此缓存与入库仍按整句处理。没有可靠边界时不强切单词，而是要求模型内部按语义处理完整长句；本地词库命中和文字查询不受影响。断句只改善翻译，不修正语音识别本身的错误。窗口变化或输入被系统拒绝时跳过输入，避免写入错误窗口。设置项通过 `hotkeys.voice` 配置快捷键，默认 `ctrl+alt+v`；`voice_language` 默认 `auto`，可指定 Whisper 的识别语言。模型优先级为 medium → small → base → tiny。
 
 语音自动入库由 `src/domain/voice_word_cache.rs` 管理，待审核记录持久化到程序目录的 `to_words.db`（被 Git 忽略，不含录音或 API Key），重启后继续审核；旧版 `voice_word_cache.json` 只读迁入。空串、几乎全符号、异常连续重复字符、已知无语音/低可信标记以及两分钟内相同识别文本直接跳过；模型若仅返回普通文本而不提供可信度，不能额外推断数值置信度。缓存满 20 条或距上次审核约 1 小时触发，单次最多处理 100 条，AI 每批审核 10 条并使用同一录音会话内相邻语句作上下文。`normal` 写入对应词库后清缓存，`error` 直接移除，`uncertain` 留存，只有相邻上下文变化才重新审核；无新依据 7 天后清理。网络/凭据/词库写入失败时保留待处理记录，下次再试；已有冲突 key 不被覆盖。审核请求只发送识别文本、已有译文和相邻语句，可能产生额外 API 费用。查询框手动翻译及 OCR 路径不经过此缓存。
 
@@ -100,6 +105,7 @@ OCR 需要预先安装 [Tesseract OCR](https://github.com/tesseract-ocr/tesserac
 
 - 没有匹配结果时，连续按两次 `Enter` 清空当前查询文字。
 - 启用 DeepSeek 后，无论本地词库是否已有匹配，都可以点击“使用 DeepSeek 翻译”，或按 `Ctrl + Enter` 主动翻译当前输入文字。
+- 查询结果先按 `word_entries.use_count` 降序，再按精确、前缀、包含的匹配等级以及 key 升序排列；常用的包含匹配可排在未使用的前缀匹配之前。首次打开旧数据库时自动增加 `use_count` 列（默认 0）；用户最终复制本地词条后才计数，取消组合不计数；词库编辑保存既有词条时不重置次数。
 - 按 `Esc` 隐藏查询框。
 - 点击右侧 `×` 彻底退出程序。
 - 查询框可以拖动。

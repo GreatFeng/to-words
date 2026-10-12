@@ -5,7 +5,7 @@
 
 use crate::i18n::{self, tr};
 use crate::platform::voice_metrics::VoiceTrace;
-use crate::platform::{voice_aec, voice_identity};
+use crate::platform::{voice_aec, voice_identity, voice_path_compat};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ impl VoiceSession {
 }
 
 pub(crate) fn engine_status(backend: &str) -> String {
-    match selected_engine(backend) {
+    let status = match selected_engine(backend) {
         Ok(RecognitionEngine::SenseVoice(_, model, _)) => i18n::message(
             "SenseVoice 模型：{model}",
             &[(
@@ -88,6 +88,20 @@ pub(crate) fn engine_status(backend: &str) -> String {
             };
             i18n::message("语音识别尚未就绪：{error}", &[("error", &detail)])
         }
+    };
+    let notice = voice_path_compat::path_warning().or_else(|| match selected_engine(backend) {
+        Ok(RecognitionEngine::SenseVoice(executable, model, vad)) => {
+            voice_path_compat::resource_notice(&executable, &model, Some(&vad))
+        }
+        Ok(RecognitionEngine::Whisper(executable, model)) => {
+            voice_path_compat::resource_notice(&executable, &model, None)
+        }
+        Err(_) => None,
+    });
+    if let Some(notice) = notice {
+        format!("{status}\n{notice}")
+    } else {
+        status
     }
 }
 
@@ -96,17 +110,20 @@ pub(crate) fn start(
     push_to_talk: bool,
     language: &str,
     backend: &str,
+    strict_language: Option<&str>,
     silence_seconds: f32,
     owner_filter: bool,
     playback_filter: bool,
 ) -> Result<VoiceSession> {
     let engine = selected_engine(backend)?;
+    let background = keep_input && !push_to_talk;
     let owner_verifier = if owner_filter {
         Some(voice_identity::OwnerVerifier::load(playback_filter)?)
     } else {
         None
     };
     let language = whisper_language(language).to_string();
+    let strict_language = strict_language.map(str::to_owned);
     let trace_name = match &engine {
         RecognitionEngine::SenseVoice(_, model, _) => model
             .file_name()
@@ -125,8 +142,19 @@ pub(crate) fn start(
         if keep_input { "enabled" } else { "disabled" },
     );
     if matches!(engine, RecognitionEngine::Whisper(_, _)) {
-        trace.record(0, "asr_threads", None, &whisper_thread_count().to_string());
+        trace.record(
+            0,
+            "asr_threads",
+            None,
+            &whisper_thread_count(background).to_string(),
+        );
     }
+    trace.record(
+        0,
+        "asr_process_priority",
+        None,
+        if background { "below_normal" } else { "normal" },
+    );
     #[cfg(not(windows))]
     bail!("语音识别目前仅支持 Windows");
 
@@ -164,7 +192,20 @@ pub(crate) fn start(
                 }
                 let asr_started = Instant::now();
                 asr_trace.record(utterance_id, "asr_started", None, "ok");
-                let result = transcribe_selected(&engine, &samples, &language)
+                let result = transcribe_selected(&engine, &samples, &language, background)
+                    .and_then(|text| {
+                        if let Some(expected) = strict_language.as_deref()
+                            && !crate::translation_language::accepts_same_language_text(
+                                &text, expected,
+                            )
+                        {
+                            bail!(
+                                "识别结果不是所选的{}，已忽略",
+                                crate::translation_language::language_label(expected)
+                            );
+                        }
+                        Ok(text)
+                    })
                     .map_err(|error| format!("{error:#}"));
                 asr_trace.record(
                     utterance_id,
@@ -296,6 +337,25 @@ pub(crate) fn start(
         receiver,
         stopping: false,
     })
+}
+
+/// In same-language mode, use the source language for Whisper and the output
+/// filter. SenseVoice still detects the spoken language automatically.
+pub(crate) fn effective_voice_language<'a>(
+    configured: &'a str,
+    source: &'a str,
+    target: &str,
+) -> &'a str {
+    crate::translation_language::same_language_pair(source, target).unwrap_or(configured)
+}
+
+/// Language selection must not silently replace the user's selected engine.
+pub(crate) fn effective_voice_backend<'a>(
+    configured: &'a str,
+    _source: &str,
+    _target: &str,
+) -> &'a str {
+    configured
 }
 
 pub(crate) struct SpeechGate {
@@ -463,13 +523,14 @@ fn transcribe_selected(
     engine: &RecognitionEngine,
     samples: &[i16],
     language: &str,
+    background: bool,
 ) -> Result<String> {
     match engine {
         RecognitionEngine::SenseVoice(executable, model, vad) => {
-            transcribe_sensevoice(executable, model, vad, samples)
+            transcribe_sensevoice(executable, model, vad, samples, background)
         }
         RecognitionEngine::Whisper(executable, model) => {
-            transcribe(executable, model, samples, language)
+            transcribe(executable, model, samples, language, background)
         }
     }
 }
@@ -499,33 +560,36 @@ fn transcribe_sensevoice(
     model: &Path,
     vad: &Path,
     samples: &[i16],
+    background: bool,
 ) -> Result<String> {
+    let paths = voice_path_compat::prepare(executable, model, Some(vad))?;
     let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    let wav = std::env::temp_dir().join(format!(
+    let wav = paths.scratch.join(format!(
         "to_words_sensevoice_{}_{}.wav",
         std::process::id(),
         temp_id
     ));
     let result = (|| {
         write_wav(&wav, samples)?;
-        let mut command = Command::new(executable);
+        let mut command = Command::new(&paths.executable);
         command
             .arg("-m")
-            .arg(model)
+            .arg(&paths.model)
             .arg("--vad")
-            .arg(vad)
+            .arg(
+                paths
+                    .vad
+                    .as_ref()
+                    .expect("SenseVoice always has a VAD model"),
+            )
             .arg("-a")
             .arg(&wav)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(directory) = executable.parent() {
+        if let Some(directory) = paths.executable.parent() {
             command.current_dir(directory);
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
+        configure_recognition_process(&mut command, background);
         let output = command.output().context("无法启动 SenseVoice 识别程序")?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr);
@@ -573,24 +637,32 @@ fn whisper_language(language: &str) -> &str {
     }
 }
 
-fn transcribe(engine: &Path, model: &Path, samples: &[i16], language: &str) -> Result<String> {
+fn transcribe(
+    engine: &Path,
+    model: &Path,
+    samples: &[i16],
+    language: &str,
+    background: bool,
+) -> Result<String> {
+    let paths = voice_path_compat::prepare(engine, model, None)?;
     let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-    let prefix =
-        std::env::temp_dir().join(format!("to_words_voice_{}_{}", std::process::id(), temp_id));
+    let prefix = paths
+        .scratch
+        .join(format!("to_words_voice_{}_{}", std::process::id(), temp_id));
     let wav = prefix.with_extension("wav");
     let output_text = prefix.with_extension("txt");
     let result = (|| {
         write_wav(&wav, samples)?;
-        let mut command = Command::new(engine);
+        let mut command = Command::new(&paths.executable);
         command
             .arg("--model")
-            .arg(model)
+            .arg(&paths.model)
             .arg("--file")
             .arg(&wav)
             .arg("--language")
             .arg(language)
             .arg("--threads")
-            .arg(whisper_thread_count().to_string())
+            .arg(whisper_thread_count(background).to_string())
             .arg("--output-txt")
             .arg("--output-file")
             .arg(&prefix)
@@ -598,14 +670,10 @@ fn transcribe(engine: &Path, model: &Path, samples: &[i16], language: &str) -> R
             .arg("--no-prints")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        if let Some(directory) = engine.parent() {
+        if let Some(directory) = paths.executable.parent() {
             command.current_dir(directory);
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
+        configure_recognition_process(&mut command, background);
         let output = command.output().context("无法启动本地语音识别引擎")?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr);
@@ -619,10 +687,33 @@ fn transcribe(engine: &Path, model: &Path, samples: &[i16], language: &str) -> R
     result
 }
 
-fn whisper_thread_count() -> usize {
-    std::thread::available_parallelism()
+fn whisper_thread_count(background: bool) -> usize {
+    let available = std::thread::available_parallelism()
         .map(|count| count.get().min(8))
-        .unwrap_or(4)
+        .unwrap_or(4);
+    if background {
+        available.div_ceil(2).min(4)
+    } else {
+        available
+    }
+}
+
+fn configure_recognition_process(command: &mut Command, background: bool) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{
+            BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW,
+        };
+        let priority = if background {
+            BELOW_NORMAL_PRIORITY_CLASS
+        } else {
+            0
+        };
+        command.creation_flags(CREATE_NO_WINDOW | priority);
+    }
+    #[cfg(not(windows))]
+    let _ = (command, background);
 }
 
 fn write_wav(path: &Path, samples: &[i16]) -> Result<()> {
@@ -791,9 +882,39 @@ pub(crate) fn record_microphone(
 #[cfg(test)]
 mod tests {
     use super::{
-        SAMPLE_RATE, SpeechGate, engine_files, sensevoice_files_in, transcribe, whisper_language,
-        whisper_thread_count, write_wav,
+        SAMPLE_RATE, SpeechGate, effective_voice_backend, effective_voice_language, engine_files,
+        sensevoice_files_in, transcribe, whisper_language, whisper_thread_count, write_wav,
     };
+
+    #[test]
+    fn language_selection_preserves_the_selected_engine() {
+        assert_eq!(effective_voice_language("auto", "ko", "ko"), "ko");
+        assert_eq!(effective_voice_language("auto", "en", "en"), "en");
+        assert_eq!(effective_voice_language("auto", "ja", "ja"), "ja");
+        assert_eq!(effective_voice_language("auto", "cn", "ko"), "auto");
+        assert_eq!(effective_voice_language("ja", "ko", "ko"), "ko");
+        assert_eq!(
+            effective_voice_backend("sensevoice", "ko", "ko"),
+            "sensevoice"
+        );
+        assert_eq!(
+            effective_voice_backend("sensevoice", "en", "en"),
+            "sensevoice"
+        );
+        assert_eq!(
+            effective_voice_backend("sensevoice", "ja", "ja"),
+            "sensevoice"
+        );
+        assert_eq!(
+            effective_voice_backend("sensevoice", "cn", "cn"),
+            "sensevoice"
+        );
+        assert_eq!(effective_voice_backend("whisper", "cn", "cn"), "whisper");
+        assert_eq!(
+            effective_voice_backend("sensevoice", "cn", "ko"),
+            "sensevoice"
+        );
+    }
 
     #[test]
     fn voice_language_uses_whisper_codes() {
@@ -806,7 +927,11 @@ mod tests {
 
     #[test]
     fn whisper_threads_respect_cpu_limit() {
-        assert!((1..=8).contains(&whisper_thread_count()));
+        let one_shot = whisper_thread_count(false);
+        let continuous = whisper_thread_count(true);
+        assert!((1..=8).contains(&one_shot));
+        assert!((1..=4).contains(&continuous));
+        assert!(continuous <= one_shot);
     }
 
     #[test]
@@ -825,7 +950,7 @@ mod tests {
         let (engine, model) = engine_files().unwrap();
         let silent_audio = vec![0_i16; SAMPLE_RATE * 2];
         let started = std::time::Instant::now();
-        let _ = transcribe(&engine, &model, &silent_audio, "auto").unwrap();
+        let _ = transcribe(&engine, &model, &silent_audio, "auto", false).unwrap();
         eprintln!("本地两秒音频识别耗时：{:?}", started.elapsed());
     }
 

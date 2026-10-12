@@ -102,6 +102,7 @@ impl VoiceTrace {
         self.write(utterance_id, "speech_end_estimated", elapsed_ms, None, "ok");
     }
 
+    #[cfg(any(test, not(feature = "react-ui")))]
     pub(crate) fn finish(&self, utterance_id: u64, result: &str) {
         let duration_ms = self
             .inner
@@ -190,6 +191,7 @@ impl VoiceTrace {
 
     pub(crate) fn speech_end(&self, _utterance_id: u64, _trailing_silence: Duration) {}
 
+    #[cfg(not(feature = "react-ui"))]
     pub(crate) fn finish(&self, _utterance_id: u64, _result: &str) {}
 }
 

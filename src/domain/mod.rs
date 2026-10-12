@@ -4,9 +4,11 @@
 //! 领域层尽量不依赖 egui 或 Windows API，以便独立测试和复用。
 
 pub(crate) mod ai_word_save;
+#[cfg(not(feature = "react-ui"))]
 pub(crate) mod continuous_input;
 pub(crate) mod shortcut;
 pub(crate) mod storage;
 pub(crate) mod translation_language;
+pub(crate) mod voice_sentence;
 pub(crate) mod voice_word_cache;
 pub(crate) mod word_index;

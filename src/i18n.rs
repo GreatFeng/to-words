@@ -73,8 +73,8 @@ pub(crate) fn message(template: &str, values: &[(&str, &str)]) -> String {
     result
 }
 
+#[cfg(not(feature = "react-ui"))]
 pub(crate) fn language_name(code: &str) -> &str {
-    // 语言代码保持不变，只本地化设置页下拉列表中的可见名称。
     let name = crate::translation_language::language_label(code);
     tr(name)
 }

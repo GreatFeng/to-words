@@ -45,6 +45,7 @@ pub(crate) fn is_registered() -> bool {
     })
 }
 
+#[cfg(not(feature = "react-ui"))]
 pub(crate) fn registration_uses_playback_filter() -> Option<bool> {
     load_profile().ok().flatten().and_then(|profile| {
         (profile.model == MODEL_NAME && profile.embeddings.len() >= REQUIRED_SAMPLES)

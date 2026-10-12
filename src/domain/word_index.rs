@@ -2,7 +2,7 @@
 //!
 //! 词条以按 key 排序的 `Vec<WordEntry>` 保存，查询结果只保存 `EntryId`。
 //! `WordIndex` 同时维护字符二元倒排索引，并在输入增长时复用上一次候选集；
-//! 搜索会匹配 key 和 value，再按照精确、前缀和包含等级稳定排序。
+//! 搜索会匹配 key 和 value，按使用次数优先、匹配等级次之排序。
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,12 +41,27 @@ pub(crate) struct WordEntry {
 #[derive(Default)]
 pub(crate) struct WordIndex {
     entries: Vec<WordEntry>,
+    use_counts: Vec<u64>,
     bigrams: HashMap<(char, char), Vec<EntryId>>,
 }
 
 impl WordIndex {
-    pub(crate) fn new(mut entries: Vec<WordEntry>) -> Self {
-        entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+    #[cfg(test)]
+    pub(crate) fn new(entries: Vec<WordEntry>) -> Self {
+        Self::new_with_counts(entries.into_iter().map(|entry| (entry, 0)).collect())
+    }
+
+    pub(crate) fn from_rows(rows: Vec<(String, String, u64)>) -> Self {
+        Self::new_with_counts(
+            rows.into_iter()
+                .map(|(key, value, count)| (WordEntry { key, value }, count))
+                .collect(),
+        )
+    }
+
+    fn new_with_counts(mut rows: Vec<(WordEntry, u64)>) -> Self {
+        rows.sort_unstable_by(|left, right| left.0.key.cmp(&right.0.key));
+        let (entries, use_counts): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
         let mut bigrams: HashMap<(char, char), Vec<EntryId>> = HashMap::new();
         for (index, entry) in entries.iter().enumerate() {
             let id = EntryId(index);
@@ -54,24 +69,29 @@ impl WordIndex {
                 bigrams.entry(bigram).or_default().push(id);
             }
         }
-        Self { entries, bigrams }
+        Self {
+            entries,
+            use_counts,
+            bigrams,
+        }
     }
 
-    pub(crate) fn from_map(words: HashMap<String, String>) -> Self {
-        Self::new(
-            words
-                .into_iter()
-                .map(|(key, value)| WordEntry { key, value })
-                .collect(),
-        )
-    }
-
+    #[cfg(not(feature = "react-ui"))]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     pub(crate) fn get(&self, id: EntryId) -> Option<&WordEntry> {
         self.entries.get(id.0)
+    }
+
+    pub(crate) fn record_use(&mut self, key: &str) {
+        if let Ok(index) = self
+            .entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(key))
+        {
+            self.use_counts[index] = self.use_counts[index].saturating_add(1);
+        }
     }
 
     pub(crate) fn search(
@@ -100,7 +120,7 @@ impl WordIndex {
     }
 
     fn rank_candidates(&self, candidates: Vec<EntryId>, query: &str) -> Vec<SearchHit> {
-        let mut buckets: [Vec<SearchHit>; 3] = std::array::from_fn(|_| Vec::new());
+        let mut hits = Vec::new();
         for entry_id in candidates {
             let Some(entry) = self.get(entry_id) else {
                 continue;
@@ -108,9 +128,15 @@ impl WordIndex {
             let Some(rank) = match_rank(entry, query) else {
                 continue;
             };
-            buckets[rank.bucket()].push(SearchHit { entry_id, rank });
+            hits.push(SearchHit { entry_id, rank });
         }
-        buckets.into_iter().flatten().collect()
+        hits.sort_unstable_by(|left, right| {
+            self.use_counts[right.entry_id.0]
+                .cmp(&self.use_counts[left.entry_id.0])
+                .then_with(|| left.rank.bucket().cmp(&right.rank.bucket()))
+                .then_with(|| left.entry_id.cmp(&right.entry_id))
+        });
+        hits
     }
 
     fn index_candidates(&self, query: &str) -> Vec<EntryId> {
@@ -281,9 +307,46 @@ mod tests {
         assert_eq!(
             matches
                 .iter()
-                .map(|hit| index.get(hit.entry_id).unwrap().key.as_str())
+                .map(|hit| index.get(hit.entry_id).unwrap().key.clone())
                 .collect::<Vec<_>>(),
             vec!["另一个", "가나다", "包含가나"]
         );
+    }
+
+    #[test]
+    fn frequently_used_entries_lead_even_across_match_ranks() {
+        let mut index = WordIndex::from_rows(vec![
+            ("A".into(), "hello world".into(), 1),
+            ("B".into(), "hello again".into(), 5),
+            ("C".into(), "say hello".into(), 100),
+            ("D".into(), "hello".into(), 0),
+        ]);
+        let keys = |index: &WordIndex| {
+            index
+                .search("hello", "", &[])
+                .iter()
+                .map(|hit| index.get(hit.entry_id).unwrap().key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&index), vec!["C", "B", "A", "D"]);
+        for _ in 0..5 {
+            index.record_use("A");
+        }
+        assert_eq!(keys(&index), vec!["C", "A", "B", "D"]);
+    }
+
+    #[test]
+    fn common_korean_replies_beat_unused_prefix_matches() {
+        let index = WordIndex::from_rows(vec![
+            ("ㅇㅋ".into(), "OK 或 好的 okei".into(), 2),
+            ("네".into(), "是的 / 好的 ne".into(), 1),
+            ("네 저 7시".into(), "好的，我七点到".into(), 0),
+        ]);
+        let keys: Vec<_> = index
+            .search("好的", "", &[])
+            .iter()
+            .map(|hit| index.get(hit.entry_id).unwrap().key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["ㅇㅋ", "네", "네 저 7시"]);
     }
 }

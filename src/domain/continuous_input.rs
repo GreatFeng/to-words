@@ -14,6 +14,7 @@ pub(crate) struct ContinuousInput {
 struct ComposedItem {
     key: String,
     value: String,
+    library: Option<String>,
 }
 
 impl ContinuousInput {
@@ -23,11 +24,20 @@ impl ContinuousInput {
     }
 
     pub(crate) fn append(&mut self, key: &str, value: &str) -> &str {
+        self.append_with_library(key, value, None)
+    }
+
+    pub(crate) fn append_word(&mut self, key: &str, value: &str, library: &str) -> &str {
+        self.append_with_library(key, value, Some(library))
+    }
+
+    fn append_with_library(&mut self, key: &str, value: &str, library: Option<&str>) -> &str {
         let key = key.trim();
         if !key.is_empty() {
             self.items.push(ComposedItem {
                 key: key.to_owned(),
                 value: value.trim().to_owned(),
+                library: library.map(str::to_owned),
             });
             self.rebuild_text();
         }
@@ -52,6 +62,17 @@ impl ContinuousInput {
         self.items.is_empty()
     }
 
+    pub(crate) fn used_words(&self) -> Vec<(String, String)> {
+        self.items
+            .iter()
+            .filter_map(|item| {
+                item.library
+                    .as_ref()
+                    .map(|library| (library.clone(), item.key.clone()))
+            })
+            .collect()
+    }
+
     fn rebuild_text(&mut self) {
         self.clipboard_text = self
             .items
@@ -62,7 +83,13 @@ impl ContinuousInput {
         self.display_text = self
             .items
             .iter()
-            .map(|item| format!("{}（{}）", item.key, item.value))
+            .map(|item| {
+                if item.value.is_empty() {
+                    item.key.clone()
+                } else {
+                    format!("{}（{}）", item.key, item.value)
+                }
+            })
             .collect::<Vec<_>>()
             .join("　");
     }
@@ -85,5 +112,12 @@ mod tests {
         input.clear();
         assert!(input.is_empty());
         assert_eq!(input.clipboard_text(), "");
+    }
+
+    #[test]
+    fn direct_same_language_text_has_no_empty_parentheses() {
+        let mut input = ContinuousInput::default();
+        input.append("Hello", "");
+        assert_eq!(input.display_text(), "Hello");
     }
 }

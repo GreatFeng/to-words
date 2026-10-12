@@ -15,10 +15,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const TABLE_PAGE_SIZE: usize = 50;
+// 非编辑状态仅预览列宽的一部分，留白使长句词条更容易扫读。
+const TABLE_CELL_PREVIEW_RATIO: f32 = 0.62;
 // 保证打开编辑器时可以同时看到多行词条，而不是为了操作栏过度压缩表格区域。
 const MIN_EDITOR_VIEWPORT_HEIGHT: f32 = 220.0;
+const MIN_TABLE_VIEWPORT_HEIGHT: f32 = 200.0;
 // 为表格下方的分页/间距、保存/取消与状态消息留出空间。
-const TABLE_EDITOR_BOTTOM_RESERVE: f32 = 178.0;
+const TABLE_EDITOR_BOTTOM_RESERVE: f32 = 200.0;
 
 #[derive(Clone, Default)]
 pub(crate) struct WordEditor {
@@ -226,39 +229,19 @@ impl WordEditorState {
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(24, 20))
             .show(ui, |ui| {
-                if back_button(ui, "返回设置").clicked() {
-                    close = true;
-                }
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(tr("TO WORDS / LIBRARY"))
-                        .monospace()
-                        .size(11.0)
-                        .color(ui_theme::muted_text()),
-                );
-                ui.label(
-                    egui::RichText::new(tr("词库编辑器"))
-                        .size(27.0)
-                        .strong()
-                        .color(ui_theme::primary_text()),
-                );
-                ui.label(
-                    egui::RichText::new(tr(
-                        "使用结构化表格维护词条，或在高级模式中直接编辑 JSON。",
-                    ))
-                    .size(13.0)
-                    .color(ui_theme::muted_text()),
-                );
-                ui.label(
-                    egui::RichText::new(i18n::message(
-                        "当前文件：{file}",
-                        &[("file", &self.file_name)],
-                    ))
-                    .monospace()
-                    .size(12.0)
-                    .color(ui_theme::muted_text()),
-                );
-                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if back_button(ui, "返回设置").clicked() {
+                        close = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(tr("词库编辑器"))
+                            .size(22.0)
+                            .strong()
+                            .color(ui_theme::primary_text()),
+                    );
+                });
+                ui.add_space(6.0);
                 self.draw_mode_toolbar(ui);
                 match self.mode {
                     EditorMode::Table => self.draw_table_editor(ui),
@@ -326,49 +309,6 @@ impl WordEditorState {
             {
                 requested_mode = EditorMode::AdvancedJson;
             }
-            ui.add_space(6.0);
-            if self.mode == EditorMode::Table {
-                if filled_toolbar_button(
-                    ui,
-                    "＋ 新增",
-                    88.0,
-                    egui::Color32::from_rgb(31, 31, 30),
-                    egui::Color32::WHITE,
-                )
-                .clicked()
-                {
-                    self.rows.insert(0, WordRow::default());
-                    self.table_page = 0;
-                    self.scroll_table_to_top = true;
-                }
-                if filled_toolbar_button(
-                    ui,
-                    "批量导入",
-                    104.0,
-                    ui_theme::control_surface(),
-                    ui_theme::accent_text(),
-                )
-                .clicked()
-                {
-                    self.batch_import_content.clear();
-                    self.batch_import_open = true;
-                }
-                if ui_theme::opaque_hover_text(
-                    filled_toolbar_button(
-                        ui,
-                        "批量导出",
-                        104.0,
-                        ui_theme::pale_green(),
-                        ui_theme::green_text(),
-                    ),
-                    tr("将格式化后的 JSON 导出到 word_libraries 词库目录"),
-                )
-                .clicked()
-                {
-                    self.batch_export_file_name = "user_words_export.json".to_string();
-                    self.batch_export_open = true;
-                }
-            }
         });
 
         if requested_mode != self.mode {
@@ -394,35 +334,122 @@ impl WordEditorState {
         }
     }
 
+    fn draw_table_header(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(tr("词条"))
+                            .size(16.0)
+                            .strong()
+                            .color(ui_theme::primary_text()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if filled_toolbar_button(
+                            ui,
+                            "＋ 新增",
+                            88.0,
+                            egui::Color32::from_rgb(31, 31, 30),
+                            egui::Color32::WHITE,
+                        )
+                        .clicked()
+                        {
+                            self.rows.insert(0, WordRow::default());
+                            self.clear_search();
+                        }
+                        if filled_toolbar_button(
+                            ui,
+                            "批量导入",
+                            104.0,
+                            ui_theme::control_surface(),
+                            ui_theme::accent_text(),
+                        )
+                        .clicked()
+                        {
+                            self.batch_import_content.clear();
+                            self.batch_import_open = true;
+                        }
+                        if ui_theme::opaque_hover_text(
+                            filled_toolbar_button(
+                                ui,
+                                "批量导出",
+                                104.0,
+                                ui_theme::control_surface(),
+                                ui_theme::primary_text(),
+                            ),
+                            tr("将格式化后的 JSON 导出到 word_libraries 词库目录"),
+                        )
+                        .clicked()
+                        {
+                            self.batch_export_file_name = "user_words_export.json".to_string();
+                            self.batch_export_open = true;
+                        }
+                    });
+                });
+            });
+    }
+
     fn draw_table_editor(&mut self, ui: &mut egui::Ui) {
-        ui.label(tr(
-            "默认使用 key/value 表格编辑；保存时会自动剔除重复 key 和空白项。",
-        ));
-        let mut search_changed = false;
         egui::Frame::new()
             .fill(ui_theme::surface())
             .stroke(egui::Stroke::new(1.0, ui_theme::border()))
-            .corner_radius(8)
-            .inner_margin(egui::Margin::symmetric(10, 5))
+            .corner_radius(10)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let search_id = egui::Id::new("word_table_search_input");
-                    let search_width = (ui.available_width() - 36.0).max(180.0);
-                    search_changed = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.search_query)
-                                .id(search_id)
-                                .hint_text(tr("筛选 key 或 value…"))
-                                .font(editor_font(15.0))
-                                .desired_width(search_width)
-                                .frame(egui::Frame::NONE),
-                        )
-                        .changed();
-                    if clear_search_button(ui, !self.search_query.is_empty()).clicked() {
-                        self.clear_search();
-                        ui.memory_mut(|memory| memory.request_focus(search_id));
-                    }
-                });
+                ui.set_width(ui.available_width());
+                self.draw_table_card_contents(ui);
+            });
+    }
+
+    fn draw_table_card_contents(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        self.draw_table_header(ui);
+        let mut search_changed = false;
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(14, 8))
+            .show(ui, |ui| {
+                let search_id = egui::Id::new("word_table_search_input");
+                let focused = ui.memory(|memory| memory.has_focus(search_id));
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(252, 252, 251))
+                    .stroke(egui::Stroke::new(
+                        if focused { 2.0 } else { 1.0 },
+                        if focused {
+                            egui::Color32::from_rgb(94, 147, 200)
+                        } else {
+                            egui::Color32::from_rgb(218, 221, 224)
+                        },
+                    ))
+                    .corner_radius(22)
+                    .shadow(egui::Shadow {
+                        offset: [0, 2],
+                        blur: 5,
+                        spread: 0,
+                        color: egui::Color32::from_rgba_unmultiplied(55, 60, 68, 16),
+                    })
+                    .inner_margin(egui::Margin::symmetric(12, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            table_search_icon(ui, search_id);
+                            let search_width = (ui.available_width() - 26.0 - 8.0).max(160.0);
+                            search_changed = ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.search_query)
+                                        .id(search_id)
+                                        .hint_text(tr("搜索译文、原文或读音…"))
+                                        .font(editor_font(15.0))
+                                        .desired_width(search_width)
+                                        .frame(egui::Frame::NONE),
+                                )
+                                .changed();
+                            if clear_search_button(ui, !self.search_query.is_empty()).clicked() {
+                                self.clear_search();
+                                ui.memory_mut(|memory| memory.request_focus(search_id));
+                            }
+                        });
+                    });
             });
         if search_changed {
             self.table_page = 0;
@@ -430,7 +457,7 @@ impl WordEditorState {
         }
 
         let editor_height =
-            (ui.available_height() - TABLE_EDITOR_BOTTOM_RESERVE).max(MIN_EDITOR_VIEWPORT_HEIGHT);
+            (ui.available_height() - TABLE_EDITOR_BOTTOM_RESERVE).max(MIN_TABLE_VIEWPORT_HEIGHT);
         let query = self.search_query.trim();
         let filtered_indices = (!query.is_empty()).then(|| {
             let query = query.to_lowercase();
@@ -451,41 +478,37 @@ impl WordEditorState {
         self.table_page = table_page;
         let page_rows = page_end.saturating_sub(page_start);
         let mut delete_index = None;
-        let table_width = (ui.available_width() - 14.0).max(500.0);
-        let row_content_width = table_width - 20.0;
-        let action_width = 52.0;
-        let field_width = (row_content_width - action_width * 2.0 - 40.0).max(300.0);
-        let key_width = (field_width * 0.35).max(110.0);
-        let value_width = (field_width * 0.40).max(125.0);
-        let pronunciation_width = (field_width - key_width - value_width).max(105.0);
+        let table_width = (ui.available_width() - 14.0).max(520.0);
+        let row_content_width = table_width - 24.0;
+        let action_width = 54.0;
+        let field_width = row_content_width - action_width * 2.0 - 32.0;
+        let key_width = field_width * 0.35;
+        let value_width = field_width * 0.40;
+        let pronunciation_width = field_width - key_width - value_width;
         let scroll_to_top = std::mem::take(&mut self.scroll_table_to_top);
 
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            egui::Frame::new()
-                .fill(ui_theme::control_surface())
-                .stroke(egui::Stroke::new(1.0, ui_theme::border()))
-                .inner_margin(egui::Margin::symmetric(10, 6))
+            let heading = egui::Frame::new()
+                .fill(egui::Color32::from_rgb(72, 76, 81))
+                .inner_margin(egui::Margin::symmetric(12, 7))
                 .show(ui, |ui| {
                     ui.set_width(row_content_width);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.add_sized(
-                            [key_width, 22.0],
-                            egui::Label::new(egui::RichText::new(tr("Key")).strong()),
-                        );
-                        ui.add_sized(
-                            [value_width, 22.0],
-                            egui::Label::new(egui::RichText::new(tr("Value")).strong()),
-                        );
-                        ui.add_sized(
-                            [pronunciation_width, 22.0],
-                            egui::Label::new(egui::RichText::new(tr("读音")).strong()),
-                        );
-                        ui.add_sized([action_width, 22.0], egui::Label::new(tr("复制")));
-                        ui.add_sized([action_width, 22.0], egui::Label::new(tr("删除")));
+                        table_column_label(ui, tr("译文"), key_width);
+                        table_column_label(ui, tr("原文"), value_width);
+                        table_column_label(ui, tr("读音"), pronunciation_width);
+                        ui.add_sized([action_width * 2.0 + 8.0, 22.0], egui::Label::new(""));
                     });
                 });
+            paint_table_cell_boundaries(
+                ui,
+                heading.response.rect,
+                [key_width, value_width, pronunciation_width],
+                egui::Color32::from_rgb(119, 123, 128),
+                egui::Color32::from_rgb(105, 109, 114),
+            );
 
             let mut scroll_area = egui::ScrollArea::vertical()
                 .id_salt("structured_words_scroll")
@@ -503,31 +526,34 @@ impl WordEditorState {
                         .as_ref()
                         .map_or(visible_index, |indices| indices[visible_index]);
                     let row = &mut self.rows[index];
-                    egui::Frame::new()
-                        .fill(ui_theme::surface())
-                        .stroke(egui::Stroke::new(1.0, ui_theme::border()))
-                        .inner_margin(egui::Margin::symmetric(10, 4))
+                    let row_fill = if visible_index % 2 == 0 {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_rgb(242, 243, 244)
+                    };
+                    let row_response = egui::Frame::new()
+                        .fill(row_fill)
+                        .inner_margin(egui::Margin::symmetric(12, 4))
                         .show(ui, |ui| {
                             ui.set_width(row_content_width);
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 8.0;
-                                ui.add_sized(
-                                    [key_width, 34.0],
-                                    egui::TextEdit::singleline(&mut row.key)
-                                        .font(editor_font(15.0))
-                                        .margin(egui::Margin::symmetric(8, 5)),
+                                editable_table_cell(ui, &mut row.key, index, 0, key_width, 15.0);
+                                editable_table_cell(
+                                    ui,
+                                    &mut row.value,
+                                    index,
+                                    1,
+                                    value_width,
+                                    15.0,
                                 );
-                                ui.add_sized(
-                                    [value_width, 34.0],
-                                    egui::TextEdit::singleline(&mut row.value)
-                                        .font(editor_font(15.0))
-                                        .margin(egui::Margin::symmetric(8, 5)),
-                                );
-                                ui.add_sized(
-                                    [pronunciation_width, 34.0],
-                                    egui::TextEdit::singleline(&mut row.pronunciation)
-                                        .font(editor_font(14.0))
-                                        .margin(egui::Margin::symmetric(8, 5)),
+                                editable_table_cell(
+                                    ui,
+                                    &mut row.pronunciation,
+                                    index,
+                                    2,
+                                    pronunciation_width,
+                                    14.0,
                                 );
                                 if row_action_button(
                                     ui,
@@ -551,6 +577,13 @@ impl WordEditorState {
                                 }
                             });
                         });
+                    paint_table_cell_boundaries(
+                        ui,
+                        row_response.response.rect,
+                        [key_width, value_width, pronunciation_width],
+                        egui::Color32::from_rgb(211, 214, 217),
+                        egui::Color32::from_rgb(185, 189, 193),
+                    );
                 }
             });
             if visible_rows == 0 {
@@ -566,32 +599,43 @@ impl WordEditorState {
             }
         });
         if visible_rows != 0 {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if page_button(ui, "上一页", self.table_page > 0).clicked() {
-                    self.table_page -= 1;
-                    self.scroll_table_to_top = true;
-                }
-                ui.label(
-                    egui::RichText::new(i18n::message(
-                        "第 {page} / {pages} 页　{start}–{end} / {total} 条",
-                        &[
-                            ("page", &(self.table_page + 1).to_string()),
-                            ("pages", &page_count.to_string()),
-                            ("start", &(page_start + 1).to_string()),
-                            ("end", &page_end.to_string()),
-                            ("total", &visible_rows.to_string()),
-                        ],
-                    ))
-                    .monospace()
-                    .size(12.0)
-                    .color(ui_theme::muted_text()),
-                );
-                if page_button(ui, "下一页", self.table_page + 1 < page_count).clicked() {
-                    self.table_page += 1;
-                    self.scroll_table_to_top = true;
-                }
-            });
+            let footer = egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if page_button(ui, "上一页", self.table_page > 0).clicked() {
+                            self.table_page -= 1;
+                            self.scroll_table_to_top = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(i18n::message(
+                                "第 {page} / {pages} 页　{start}–{end} / {total} 条",
+                                &[
+                                    ("page", &(self.table_page + 1).to_string()),
+                                    ("pages", &page_count.to_string()),
+                                    ("start", &(page_start + 1).to_string()),
+                                    ("end", &page_end.to_string()),
+                                    ("total", &visible_rows.to_string()),
+                                ],
+                            ))
+                            .monospace()
+                            .size(12.0)
+                            .color(ui_theme::muted_text()),
+                        );
+                        if page_button(ui, "下一页", self.table_page + 1 < page_count).clicked()
+                        {
+                            self.table_page += 1;
+                            self.scroll_table_to_top = true;
+                        }
+                    });
+                });
+            ui.painter().line_segment(
+                [
+                    footer.response.rect.left_top(),
+                    footer.response.rect.right_top(),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(229, 231, 234)),
+            );
         }
         if let Some(index) = delete_index {
             self.rows.remove(index);
@@ -1294,6 +1338,21 @@ fn action_button(
     )
 }
 
+fn table_search_icon(ui: &mut egui::Ui, search_id: egui::Id) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 24.0), egui::Sense::click());
+    let color = ui_theme::muted_text();
+    let center = rect.center() - egui::vec2(1.5, 1.5);
+    ui.painter()
+        .circle_stroke(center, 5.2, egui::Stroke::new(1.4, color));
+    ui.painter().line_segment(
+        [center + egui::vec2(3.8, 3.8), center + egui::vec2(8.0, 8.0)],
+        egui::Stroke::new(1.4, color),
+    );
+    if response.clicked() {
+        ui.memory_mut(|memory| memory.request_focus(search_id));
+    }
+}
+
 fn clear_search_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     ui_theme::opaque_hover_text(
         ui.add_enabled(
@@ -1377,10 +1436,10 @@ fn row_action_button(
     color: egui::Color32,
 ) -> egui::Response {
     ui.add_sized(
-        [52.0, 32.0],
+        [54.0, 28.0],
         egui::Button::new(
             egui::RichText::new(tr(text))
-                .size(13.0)
+                .size(12.0)
                 .strong()
                 .color(color),
         )
@@ -1390,14 +1449,153 @@ fn row_action_button(
     )
 }
 
+fn table_column_label(ui: &mut egui::Ui, text: &str, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
+    ui.painter().text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        editor_font(13.0),
+        egui::Color32::from_rgb(250, 251, 252),
+    );
+}
+
+fn editable_table_cell(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    row_index: usize,
+    column: u8,
+    width: f32,
+    font_size: f32,
+) -> egui::Response {
+    let id = egui::Id::new(("word_table_cell", row_index, column));
+    let font = editor_font(font_size);
+    let preview_width = (width * TABLE_CELL_PREVIEW_RATIO)
+        .min(width - 16.0)
+        .max(40.0);
+    let mut preview_job = egui::text::LayoutJob::simple(
+        text.clone(),
+        font.clone(),
+        ui_theme::primary_text(),
+        preview_width,
+    );
+    preview_job.wrap.max_rows = 1;
+    preview_job.wrap.break_anywhere = true;
+    let preview = ui.fonts_mut(|fonts| fonts.layout_job(preview_job));
+    let needs_ellipsis = preview.elided;
+    if !needs_ellipsis || ui.memory(|memory| memory.has_focus(id)) {
+        ui.add_sized(
+            [width, 34.0],
+            egui::TextEdit::singleline(text)
+                .id(id)
+                .font(font)
+                .margin(egui::Margin::symmetric(8, 5))
+                .frame(egui::Frame::NONE),
+        )
+    } else {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
+        ui.painter().galley(
+            egui::pos2(rect.left() + 8.0, rect.center().y - preview.size().y / 2.0),
+            preview,
+            ui_theme::primary_text(),
+        );
+        let response = response.on_hover_text(text.as_str());
+        if response.clicked() {
+            ui.memory_mut(|memory| memory.request_focus(id));
+            ui.ctx().request_repaint();
+        }
+        response
+    }
+}
+
+fn paint_table_cell_boundaries(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    field_widths: [f32; 3],
+    vertical_color: egui::Color32,
+    bottom_color: egui::Color32,
+) {
+    let mut x = rect.left() + 12.0;
+    for width in field_widths {
+        x += width + 4.0;
+        ui.painter().line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0, vertical_color),
+        );
+        x += 4.0;
+    }
+    ui.painter().line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        egui::Stroke::new(1.0, bottom_color),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        EditorMode, WordEditorState, WordRow, clean_rows, merge_external_additions,
-        normalized_export_file_name, parse_words, rows_preserving_metadata, table_page_bounds,
+        EditorMode, WordEditorState, WordRow, clean_rows, editable_table_cell,
+        merge_external_additions, normalized_export_file_name, parse_words,
+        rows_preserving_metadata, table_page_bounds,
     };
     use eframe::egui;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn long_table_cell_can_be_focused_without_truncating_stored_text() {
+        let context = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let fallback = fonts.families[&egui::FontFamily::Proportional].clone();
+        fonts.families.insert(
+            egui::FontFamily::Name(crate::WORD_EDITOR_FONT_FAMILY.into()),
+            fallback,
+        );
+        context.set_fonts(fonts);
+        let original = "这是一段长度远超过词库表格单元格宽度的完整译文".to_string();
+        let mut text = original.clone();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 700.0));
+        let draw = |text: &mut String, events: Vec<egui::Event>| {
+            let mut cell_rect = egui::Rect::NOTHING;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    cell_rect = editable_table_cell(ui, text, 0, 0, 120.0, 15.0).rect;
+                },
+            );
+            output.textures_delta.clear();
+            cell_rect
+        };
+        let click_pos = draw(&mut text, vec![]).center();
+        draw(
+            &mut text,
+            vec![
+                egui::Event::PointerMoved(click_pos),
+                egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        draw(
+            &mut text,
+            vec![egui::Event::PointerButton {
+                pos: click_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let cell_id = egui::Id::new(("word_table_cell", 0, 0_u8));
+        assert!(context.memory(|memory| memory.has_focus(cell_id)));
+        draw(&mut text, vec![]);
+        assert_eq!(text, original);
+    }
 
     #[test]
     fn external_reviewed_words_survive_editor_save_without_restoring_user_deletions() {
@@ -1490,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_filtered_table_keeps_editor_actions_in_view() {
+    fn table_keeps_editor_actions_in_view_with_or_without_rows() {
         let context = egui::Context::default();
         let mut fonts = egui::FontDefinitions::default();
         let fallback = fonts.families[&egui::FontFamily::Proportional].clone();
@@ -1499,37 +1697,41 @@ mod tests {
             fallback,
         );
         context.set_fonts(fonts);
-        let mut editor = WordEditorState {
-            mode: EditorMode::Table,
-            file_name: "user_words.json".to_string(),
-            rows: vec![WordRow {
-                key: "안녕하세요".to_string(),
-                value: "你好".to_string(),
+        for search_query in ["不存在的词条", ""] {
+            let mut editor = WordEditorState {
+                mode: EditorMode::Table,
+                file_name: "user_words.json".to_string(),
+                rows: (0..51)
+                    .map(|index| WordRow {
+                        key: format!("词条 {index}"),
+                        value: "你好".to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                search_query: search_query.to_string(),
+                message: Some(("已载入词条".to_string(), false)),
                 ..Default::default()
-            }],
-            search_query: "不存在的词条".to_string(),
-            message: Some(("已载入词条".to_string(), false)),
-            ..Default::default()
-        };
-        let mut used_bottom = 0.0;
-        let mut output = context.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(800.0, 700.0),
-                )),
-                ..Default::default()
-            },
-            |ui| {
-                editor.draw_editor(ui);
-                used_bottom = ui.min_rect().bottom();
-            },
-        );
-        output.textures_delta.clear();
-        assert!(
-            used_bottom <= 700.0,
-            "操作按钮应留在编辑窗口内：{used_bottom}"
-        );
+            };
+            let mut used_bottom = 0.0;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    editor.draw_editor(ui);
+                    used_bottom = ui.min_rect().bottom();
+                },
+            );
+            output.textures_delta.clear();
+            assert!(
+                used_bottom <= 700.0,
+                "查询 {search_query:?} 的操作按钮应留在编辑窗口内：{used_bottom}"
+            );
+        }
     }
 
     #[test]
