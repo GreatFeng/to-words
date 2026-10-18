@@ -9,12 +9,20 @@
   -webkit-font-smoothing: antialiased;
 }
 
-html, body, #root { width: 100%; height: 100%; margin: 0; }
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 
 .app-scrollbar::-webkit-scrollbar { width: 9px; height: 9px; }
 .app-scrollbar::-webkit-scrollbar-thumb { border-radius: 9px; background: #c9ccd0; border: 2px solid transparent; background-clip: padding-box; }
+
+.query-popup input {
+  appearance: none;
+  border: 0;
+  box-shadow: none;
+  line-height: normal;
+}
+.query-popup input:focus { outline: none; }
 
 .surface-card { @apply rounded-2xl border border-slate-200 bg-white shadow-[0_8px_25px_rgba(34,42,48,0.06)]; }
 .field { @apply h-9 w-full rounded-xl border border-slate-300 bg-white px-3 text-sm text-slate-800 outline-none transition-colors focus:border-blue-500 focus:ring-2 focus:ring-blue-100; }

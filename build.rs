@@ -95,12 +95,22 @@ fn build_frontend_if_needed() {
         Path::new("frontend/node_modules").exists(),
         "React 依赖尚未安装：请先运行 npm --prefix frontend ci"
     );
-    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
-    let status = Command::new(npm)
-        .args(["--prefix", "frontend", "run", "build"])
+    // Use the installed project-local tools directly. This also works when a
+    // machine has Node.js but its global npm installation is damaged.
+    let typecheck = Command::new("node")
+        .arg("node_modules/typescript/bin/tsc")
+        .arg("--noEmit")
+        .current_dir("frontend")
         .status()
-        .expect("无法启动 npm；请先安装 Node.js");
-    assert!(status.success(), "React 前端构建失败，请检查前端编译错误");
+        .expect("无法启动 Node.js；请先安装 Node.js");
+    assert!(typecheck.success(), "React 前端类型检查失败");
+    let bundle = Command::new("node")
+        .arg("node_modules/vite/bin/vite.js")
+        .arg("build")
+        .current_dir("frontend")
+        .status()
+        .expect("无法启动 Node.js；请先安装 Node.js");
+    assert!(bundle.success(), "React 前端构建失败，请检查前端编译错误");
 }
 
 #[cfg(feature = "react-ui")]

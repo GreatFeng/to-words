@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, type SearchHit, type UiConfig } from "../api";
 
@@ -27,6 +27,7 @@ export function QueryPage() {
   const [translating, setTranslating] = useState(false);
   const input = useRef<HTMLInputElement>(null);
   const content = useRef<HTMLElement>(null);
+  const lastWindowSize = useRef({ width: 0, height: 0 });
   const lastRequested = useRef(0);
   const translationRequest = useRef(0);
   const pageSize = config?.results.max_visible_results ?? 8;
@@ -45,6 +46,21 @@ export function QueryPage() {
     setSearched(null); setUnmatchedEnter(false); setTranslating(false); setLanguageMismatch(false);
   };
 
+  const fitWindow = (force = false) => {
+    const element = content.current;
+    if (!element) return;
+    const rect = element.getBoundingClientRect();
+    const scale = window.devicePixelRatio || 1;
+    const width = Math.ceil(Math.max(rect.width, element.scrollWidth) * scale);
+    const height = Math.ceil(Math.max(rect.height, element.scrollHeight) * scale);
+    if (width <= 0 || height <= 0) return;
+    if (!force && width === lastWindowSize.current.width && height === lastWindowSize.current.height) return;
+    lastWindowSize.current = { width, height };
+    void api.resizeQuery(width, height);
+  };
+
+  useLayoutEffect(() => { fitWindow(); });
+
   useEffect(() => {
     const reload = () => { void api.getConfig().then(setConfig).catch(error => setStatus(String(error))); };
     reload(); input.current?.focus();
@@ -53,10 +69,7 @@ export function QueryPage() {
   }, []);
   useEffect(() => {
     if (!content.current) return;
-    const observer = new ResizeObserver(entries => {
-      const rect = entries[0]?.contentRect;
-      if (rect) void api.resizeQuery(Math.ceil(rect.width) + 2, Math.ceil(rect.height) + 2);
-    });
+    const observer = new ResizeObserver(() => fitWindow());
     observer.observe(content.current);
     return () => observer.disconnect();
   }, []);
@@ -82,6 +95,7 @@ export function QueryPage() {
       reset();
       void api.takePendingQuery().then(pending => { if (pending) setQuery(pending); });
       input.current?.focus();
+      requestAnimationFrame(() => fitWindow(true));
     });
     const onFocus = () => {
       void api.takePendingQuery().then(pending => {
@@ -170,15 +184,15 @@ export function QueryPage() {
 
   const inputColor = config?.input.background_color ?? "#e8e8e8";
   const resultColor = config?.results.background_color ?? "#e8e8e8";
-  return <main ref={content} className="inline-flex max-h-full flex-col overflow-hidden bg-transparent text-sm" style={{ color: config?.text_color ?? "#24272e", maxWidth: config?.results.max_width ?? 600 }}>
-    <div className="flex shrink-0 items-center rounded-[var(--input-radius)] border border-slate-400/40 px-2 backdrop-blur-xl"
+  return <main ref={content} className="query-popup flex w-max flex-col bg-transparent p-[2px] text-sm" style={{ color: config?.text_color ?? "#24272e", maxWidth: (config?.results.max_width ?? 600) + 4 }}>
+    <div className="flex shrink-0 items-center rounded-[var(--input-radius)] border border-slate-400/40 px-2"
       style={{ height: config?.input.height ?? 30, width: config?.input.width ?? 200, "--input-radius": `${config?.input.corner_radius ?? 9}px`, backgroundColor: `${inputColor}${Math.round((config?.input.opacity ?? .2) * 255).toString(16).padStart(2, "0")}` } as React.CSSProperties}>
       <button type="button" aria-label="拖动查询窗口" className="mr-1 cursor-move select-none text-xs text-slate-500" onMouseDown={event => { event.preventDefault(); void api.dragQuery(); }}>⋮</button>
       <input ref={input} value={query} onChange={event => { ++translationRequest.current; setQuery(event.target.value); setPage(0); setTotal(0); setTranslation(""); setPreferTranslation(false); setTranslating(false); setStatus(""); setUnmatchedEnter(false); setLanguageMismatch(false); }} onKeyDown={onKeyDown}
-        placeholder="输入文字…" className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-slate-500/70" style={{ fontSize: config?.input.font_size ?? 14 }} />
+        placeholder="输入文字…" className="h-full min-w-0 flex-1 bg-transparent px-0 outline-none placeholder:text-slate-500/70" style={{ fontSize: config?.input.font_size ?? 14 }} />
       <button type="button" aria-label="退出" className="ml-2 rounded-full px-1 text-lg text-slate-600 hover:bg-red-100 hover:text-red-700" onClick={() => void api.exit()}>×</button>
     </div>
-    {(composed.length > 0 || visible.length > 0 || noMatch || canTranslate || languageMismatch || searchError || status || translation) && <div className="app-scrollbar w-max min-w-0 overflow-auto border border-slate-400/30 px-2 py-1 shadow-sm backdrop-blur-xl"
+    {(composed.length > 0 || visible.length > 0 || noMatch || canTranslate || languageMismatch || searchError || status || translation) && <div className="app-scrollbar w-max min-w-0 overflow-auto border border-slate-400/30 px-2 py-1"
       style={{ marginTop: config?.gap ?? 4, borderRadius: config?.results.corner_radius ?? 7, minWidth: config?.results.min_width ?? 200, maxWidth: config?.results.max_width ?? 600, maxHeight: config?.results.max_height ?? 360, fontSize: config?.results.font_size ?? 12, backgroundColor: `${resultColor}${Math.round((config?.results.opacity ?? .2) * 255).toString(16).padStart(2, "0")}` }}>
       {composed.length > 0 && <p className="mb-1 border-b border-slate-500/20 py-1 text-xs text-slate-700">{composed.map(item => item.value ? `${item.key}（${item.value}）` : item.key).join(" · ")}</p>}
       {canTranslate && <button type="button" disabled={translating} onMouseDown={event => event.preventDefault()} onClick={() => void translate()}

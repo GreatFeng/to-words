@@ -528,12 +528,15 @@ fn resize_query(width: f64, height: f64, app: AppHandle) -> Result<(), String> {
         return Err("窗口尺寸无效".to_string());
     }
     let window = app.get_webview_window("query").ok_or("查询窗口不存在")?;
+    // The page reports physical pixels (CSS size * devicePixelRatio). Keeping
+    // this physical avoids converting with the DPI of a different monitor.
     window
-        .set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-            width.clamp(80.0, 1700.0),
-            height.clamp(30.0, 1300.0),
+        .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(
+            width.clamp(80.0, 3400.0).ceil() as u32,
+            height.clamp(18.0, 2600.0).ceil() as u32,
         )))
         .map_err(error)?;
+    sync_query_webview_size(&window)?;
     if let (Ok(Some(monitor)), Ok(position), Ok(size)) = (
         window.current_monitor(),
         window.outer_position(),
@@ -554,6 +557,22 @@ fn resize_query(width: f64, height: f64, app: AppHandle) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn set_query_size(window: &tauri::WebviewWindow, width: f64, height: f64) -> Result<(), String> {
+    let size = tauri::Size::Logical(tauri::LogicalSize::new(width, height));
+    window.set_size(size).map_err(error)?;
+    sync_query_webview_size(window)
+}
+
+fn sync_query_webview_size(window: &tauri::WebviewWindow) -> Result<(), String> {
+    // WebView2 is a separate child surface. On Windows, resizing its parent
+    // (especially while the popup is hidden) does not always resize that
+    // surface immediately. Use the *actual* client size, not the requested
+    // logical size, so fractional display scaling cannot clip two edges.
+    let size = tauri::Size::Physical(window.inner_size().map_err(error)?);
+    let webview: &tauri::Webview = window.as_ref();
+    webview.set_size(size).map_err(error)
 }
 
 #[tauri::command]
@@ -1422,12 +1441,11 @@ fn open_query(app: &AppHandle) {
             .ok()
             .map(|config| config.clone());
         if let Some(config) = config {
-            let width = config.input.width;
-            let height = config.input.height + 2.0;
-            let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-                width as f64,
-                height as f64,
-            )));
+            // Match the 2px inset on every side of the query content. Drawing
+            // the border on the WebView edge clips it on some Windows setups.
+            let width = config.input.width + 4.0;
+            let height = config.input.height + 4.0;
+            let _ = set_query_size(&window, width as f64, height as f64);
             if let Some((x, y)) = crate::web_config::web_query_position(
                 width,
                 height,
@@ -1439,6 +1457,7 @@ fn open_query(app: &AppHandle) {
             }
         }
         let _ = window.show();
+        let _ = sync_query_webview_size(&window);
         let _ = window.set_focus();
         let _ = app.emit_to("query", "query-opened", ());
     }
@@ -1688,6 +1707,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             .title("to_words")
             .inner_size(620.0, 430.0)
             .decorations(false)
+            .shadow(false)
             .transparent(true)
             .always_on_top(true)
             .visible(false)
@@ -1776,6 +1796,18 @@ pub(crate) fn run() -> anyhow::Result<()> {
                         }
                         manager = Some(new_manager);
                     }
+                }
+            }
+        }
+        if let tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Resized(_),
+            ..
+        } = &event
+        {
+            if label == "query" {
+                if let Some(window) = app.get_webview_window(label) {
+                    let _ = sync_query_webview_size(&window);
                 }
             }
         }
