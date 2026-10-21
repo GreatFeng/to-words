@@ -262,5 +262,8 @@
   "第": "第",
   "行": "行",
   "返回顶部": "上に戻る",
-  "正在检查 OCR 环境…": "OCR 環境を確認中…"
+  "正在检查 OCR 环境…": "OCR 環境を確認中…",
+  "Base64 编码的 DeepSeek API Key": "Base64 エンコードされた DeepSeek API キー",
+  "Base64 编码的 API Key": "Base64 エンコードされた API キー",
+  "粘贴 Base64 字符串": "Base64 文字列を貼り付け"
 }

@@ -45,14 +45,6 @@ pub(crate) fn is_registered() -> bool {
     })
 }
 
-#[cfg(not(feature = "react-ui"))]
-pub(crate) fn registration_uses_playback_filter() -> Option<bool> {
-    load_profile().ok().flatten().and_then(|profile| {
-        (profile.model == MODEL_NAME && profile.embeddings.len() >= REQUIRED_SAMPLES)
-            .then_some(profile.playback_filter)
-    })
-}
-
 pub(crate) fn clear_profile() -> Result<()> {
     let connection = storage::open()?;
     connection.execute("DELETE FROM app_settings WHERE name=?1", [SETTING_NAME])?;

@@ -262,5 +262,8 @@
   "第": "Line",
   "行": "",
   "返回顶部": "Back to top",
-  "正在检查 OCR 环境…": "Checking OCR installation…"
+  "正在检查 OCR 环境…": "Checking OCR installation…",
+  "Base64 编码的 DeepSeek API Key": "Base64-encoded DeepSeek API Key",
+  "Base64 编码的 API Key": "Base64-encoded API Key",
+  "粘贴 Base64 字符串": "Paste Base64 string"
 }

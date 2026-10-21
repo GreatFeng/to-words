@@ -102,17 +102,12 @@ pub(crate) enum Shortcut {
 }
 
 impl Shortcut {
-    #[cfg(any(test, not(feature = "react-ui")))]
+    #[cfg(test)]
     pub(crate) fn keyboard(self) -> Option<HotKey> {
         match self {
             Self::Keyboard(key) => Some(key),
             Self::Mouse(_) => None,
         }
-    }
-
-    #[cfg(not(feature = "react-ui"))]
-    pub(crate) fn keyboard_id(self) -> Option<u32> {
-        self.keyboard().map(|key| key.id())
     }
 
     pub(crate) fn mouse(self) -> Option<MouseShortcut> {

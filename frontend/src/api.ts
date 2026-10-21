@@ -48,6 +48,7 @@ export type UiConfig = {
 
 export type LanguageOption = { code: string; name: string };
 export type OcrResult = { original: string; translation: string; status: string; show_original: boolean };
+export type OcrSnapshot = { image: string; generation: number };
 export type OcrRectangle = { x: number; y: number; width: number; height: number };
 
 export const api = {
@@ -71,7 +72,8 @@ export const api = {
   hideQuery: () => invoke<void>("hide_query"),
   resizeQuery: (width: number, height: number) => invoke<void>("resize_query", { width, height }),
   dragQuery: () => invoke<void>("drag_query"),
-  ocrSnapshot: () => invoke<string>("get_ocr_snapshot"),
+  ocrSnapshot: () => invoke<OcrSnapshot>("get_ocr_snapshot"),
+  showOcr: (generation: number) => invoke<boolean>("show_ocr", { generation }),
   recognizeOcr: (rect: OcrRectangle, viewportWidth: number, viewportHeight: number) => invoke<OcrResult>("recognize_ocr", { rect, viewportWidth, viewportHeight }),
   confirmOcr: () => invoke<void>("confirm_ocr"),
   cancelOcr: () => invoke<void>("cancel_ocr"),

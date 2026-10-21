@@ -182,10 +182,10 @@ export function SettingsPage() {
             <Switch label={label("OCR识别后自动翻译成原始语言")} checked={config.ocr_auto_translate} onChange={value => update("ocr_auto_translate", value)} />
             <Switch label={label("截图翻译同时显示原文")} checked={config.ocr_show_original} onChange={value => update("ocr_show_original", value)} />
             <div className="grid gap-2 border-t border-slate-200 pt-4">
-              <label className="text-sm text-slate-700" htmlFor="deepseek-key">DeepSeek API Key {hasApiKey ? `· ${label("已保存")}` : ""}</label>
+              <label className="text-sm text-slate-700" htmlFor="deepseek-key">{label("Base64 编码的 DeepSeek API Key")} {hasApiKey ? `· ${label("已保存")}` : ""}</label>
               <div className="flex gap-2">
                 <input id="deepseek-key" className="field min-w-0 flex-1" type="password" autoComplete="off" value={apiKey}
-                  onChange={event => setApiKey(event.target.value)} placeholder={hasApiKey ? "••••••••••••" : "sk-…"} />
+                  onChange={event => setApiKey(event.target.value)} placeholder={hasApiKey ? "••••••••••••" : label("粘贴 Base64 字符串")} />
                 <button type="button" className="button" disabled={!apiKey.trim()} onClick={async () => {
                   try { await api.setApiKey(apiKey); setApiKey(""); setHasApiKey(true); setNotice(label("API Key 已保存")); }
                   catch (error) { setNotice(String(error)); }

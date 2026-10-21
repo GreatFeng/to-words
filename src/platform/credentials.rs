@@ -1,8 +1,22 @@
-//! DeepSeek API Key 的本机凭据存储。
+//! Base64 编码的 DeepSeek API Key 解码与本机凭据存储。
 //!
-//! Windows 使用当前用户的凭据管理器，普通 JSON 配置和词库文件不保存密钥。
+//! Base64 仅是编码，并不保护密钥；Windows 使用当前用户的凭据管理器保存解码后的密钥。
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+fn decode_key(encoded: &str) -> Result<String> {
+    let bytes = STANDARD
+        .decode(encoded.trim())
+        .context("API Key 不是有效的 Base64 字符串")?;
+    let key = String::from_utf8(bytes).context("Base64 解码后的 API Key 不是 UTF-8 文本")?;
+    ensure!(!key.is_empty(), "Base64 解码后的 API Key 不能为空");
+    ensure!(
+        !key.chars().any(char::is_whitespace),
+        "Base64 解码后的 API Key 不能包含空白字符"
+    );
+    Ok(key)
+}
 
 #[cfg(target_os = "windows")]
 const TARGET: windows::core::PCWSTR = windows::core::w!("to_words/deepseek_api_key");
@@ -36,14 +50,15 @@ pub(crate) fn load_key() -> Result<Option<String>> {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn save_key(key: &str) -> Result<()> {
+pub(crate) fn save_key(encoded_key: &str) -> Result<()> {
     use windows::{
         Win32::Security::Credentials::{
             CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
         },
         core::PWSTR,
     };
-    let mut bytes = key.as_bytes().to_vec();
+    let key = decode_key(encoded_key)?;
+    let mut bytes = key.into_bytes();
     let credential = CREDENTIALW {
         Type: CRED_TYPE_GENERIC,
         TargetName: PWSTR(TARGET.as_ptr() as *mut u16),
@@ -77,4 +92,22 @@ pub(crate) fn save_key(_key: &str) -> Result<()> {
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn delete_key() -> Result<()> {
     anyhow::bail!("当前系统暂不支持删除 API Key")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_key;
+
+    #[test]
+    fn decodes_base64_api_key() {
+        assert_eq!(decode_key("  c2stZXhhbXBsZQ==  ").unwrap(), "sk-example");
+    }
+
+    #[test]
+    fn rejects_plaintext_and_invalid_decoded_keys() {
+        assert!(decode_key("sk-example").is_err());
+        assert!(decode_key("!!!").is_err());
+        assert!(decode_key("IA==").is_err());
+        assert!(decode_key("c2sgZXhhbXBsZQ==").is_err());
+    }
 }

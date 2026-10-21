@@ -262,5 +262,8 @@
   "第": "",
   "行": "줄",
   "返回顶部": "맨 위로",
-  "正在检查 OCR 环境…": "OCR 환경 확인 중…"
+  "正在检查 OCR 环境…": "OCR 환경 확인 중…",
+  "Base64 编码的 DeepSeek API Key": "Base64로 인코딩된 DeepSeek API 키",
+  "Base64 编码的 API Key": "Base64로 인코딩된 API 키",
+  "粘贴 Base64 字符串": "Base64 문자열 붙여넣기"
 }

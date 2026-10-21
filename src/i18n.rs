@@ -73,12 +73,6 @@ pub(crate) fn message(template: &str, values: &[(&str, &str)]) -> String {
     result
 }
 
-#[cfg(not(feature = "react-ui"))]
-pub(crate) fn language_name(code: &str) -> &str {
-    let name = crate::translation_language::language_label(code);
-    tr(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

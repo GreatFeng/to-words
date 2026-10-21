@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import { api, type OcrRectangle, type OcrResult } from "../api";
 
@@ -23,19 +24,38 @@ export function OcrPage() {
   const gesture = useRef<Gesture | null>(null);
   const requestId = useRef(0);
 
-  const reset = () => {
-    requestId.current += 1;
-    selectionRef.current = null;
-    setSelection(null);
-    setResult(empty);
-    api.ocrSnapshot().then(setScreenshot).catch(error => setResult({ ...empty, status: String(error) }));
+  const prepare = async (requestedGeneration?: number) => {
+    const id = ++requestId.current;
+    try {
+      const snapshot = await api.ocrSnapshot();
+      if (id !== requestId.current) return;
+      selectionRef.current = null;
+      flushSync(() => {
+        setSelection(null);
+        setResult(empty);
+        setScreenshot(snapshot.image);
+      });
+      // 页面仍隐藏；等真正用于绘制的图片解码完再显示窗口。
+      const image = document.getElementById("ocr-screenshot") as HTMLImageElement | null;
+      if (!image) throw new Error("OCR 截图图片未准备好");
+      await image.decode();
+      if (id !== requestId.current) return;
+      await api.showOcr(snapshot.generation);
+    } catch (error) {
+      if (id !== requestId.current || requestedGeneration === undefined) return;
+      setResult({ ...empty, status: String(error) });
+      // 截图异常时仍显示可取消的窗口，避免快捷键看起来完全没有反应。
+      await api.showOcr(requestedGeneration).catch(console.error);
+    }
   };
   useEffect(() => {
-    reset();
-    const pending = listen("ocr-reset", reset);
+    let active = true;
+    const pending = listen<number>("ocr-reset", event => { void prepare(event.payload); });
+    // 先订阅事件，再检查快照，避免首次窗口尚未加载时漏掉快捷键。
+    void pending.then(() => { if (active) void prepare(); });
     const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") void api.cancelOcr(); };
     window.addEventListener("keydown", onKey);
-    return () => { window.removeEventListener("keydown", onKey); void pending.then(stop => stop()); };
+    return () => { active = false; window.removeEventListener("keydown", onKey); void pending.then(stop => stop()); };
   }, []);
 
   const recognize = async (rect: OcrRectangle) => {
@@ -79,10 +99,10 @@ export function OcrPage() {
     if (selectionRef.current) void recognize(selectionRef.current);
   };
 
-  return <main className="relative h-full w-full overflow-hidden bg-slate-900/10"
+  return <main className="relative h-full w-full overflow-hidden"
     onPointerDown={event => begin(event, "draw", { x: event.clientX, y: event.clientY, width: 0, height: 0 })}
     onPointerMove={move} onPointerUp={end}>
-    {screenshot && <img src={screenshot} alt="屏幕截图" draggable={false} className="pointer-events-none absolute inset-0 h-full w-full object-fill" />}
+    {screenshot && <img id="ocr-screenshot" src={screenshot} alt="屏幕截图" draggable={false} className="pointer-events-none absolute inset-0 h-full w-full object-fill" />}
     {selection && <div className="absolute cursor-move border-2 border-blue-400 bg-blue-200/10 shadow-[0_0_0_9999px_rgba(0,0,0,.14)]"
       style={{ left: selection.x, top: selection.y, width: selection.width, height: selection.height }}
       onPointerDown={event => begin(event, "move", selection)} onPointerMove={move} onPointerUp={end}>

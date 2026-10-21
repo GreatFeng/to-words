@@ -26,22 +26,6 @@ impl std::fmt::Display for TextServiceSendError {
 #[cfg(feature = "tsf-notepad-prototype")]
 impl std::error::Error for TextServiceSendError {}
 
-#[cfg(not(feature = "react-ui"))]
-pub(crate) fn input_error_trace_code(error: &anyhow::Error) -> &'static str {
-    #[cfg(feature = "tsf-notepad-prototype")]
-    if let Some(error) = error.downcast_ref::<TextServiceSendError>() {
-        return match error.code {
-            Some(3) => "tsf_no_foreground",
-            Some(4) => "tsf_bridge_missing",
-            Some(5) => "tsf_edit_rejected",
-            Some(7) => "tsf_bridge_other_process",
-            _ => "tsf_sender_error",
-        };
-    }
-    let _ = error;
-    "error"
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VoiceInputMethod {
     Paste,
@@ -127,7 +111,7 @@ impl VoiceInputTarget {
         if modifiers_pressed() {
             return Ok(None);
         }
-        // OLE 剪贴板要求 STA；独立线程也避免与 eframe 的 COM 初始化方式冲突。
+        // OLE 剪贴板要求 STA；独立线程避免与界面线程的 COM 初始化方式冲突。
         let text = text.to_owned();
         std::thread::spawn(move || self.paste_or_type(&text))
             .join()

@@ -13,10 +13,8 @@ path = "src/main.rs"
 opt-level = 1
 
 [features]
-default = ["react-ui"]
 voice-metrics = []
 tsf-notepad-prototype = []
-react-ui = ["dep:tauri", "dep:tauri-build", "dep:base64"]
 
 [dependencies]
 global-hotkey = "0.8.0"
@@ -24,21 +22,18 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 anyhow = "1.0"
-eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 whatlang = "0.18"
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3.6.1"
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
-tauri = { version = "2", optional = true, features = ["tray-icon"] }
-base64 = { version = "0.22", optional = true }
+tauri = { version = "2", features = ["tray-icon"] }
+base64 = "0.22"
 
 [build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
-tauri-build = { version = "2", optional = true }
+tauri-build = "2"
 
 [target.'cfg(windows)'.dependencies]
-tray-icon = "0.21"
 sherpa-onnx = "1.13.8"
 sonora = "0.2.0"
 wasapi = "0.25.0"

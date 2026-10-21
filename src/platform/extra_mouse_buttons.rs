@@ -12,8 +12,6 @@ mod windows_impl {
     use anyhow::{Context, Result};
     use std::ffi::c_void;
     use std::mem::size_of;
-    #[cfg(not(feature = "react-ui"))]
-    use std::time::Instant;
     use windows::Win32::Devices::HumanInterfaceDevice::{
         DIDATAFORMAT, DIMOUSESTATE2, DISCL_BACKGROUND, DISCL_NONEXCLUSIVE, DirectInput8Create,
         GUID_SysMouse, IDirectInput8W, IDirectInputDevice8W,
@@ -108,8 +106,6 @@ mod windows_impl {
                 return Vec::new();
             };
             let modifiers = current_modifiers();
-            #[cfg(not(feature = "react-ui"))]
-            let occurred_at = Instant::now();
             [
                 MouseButton::Extra6,
                 MouseButton::Extra7,
@@ -122,15 +118,8 @@ mod windows_impl {
                 button,
                 pressed: current[index],
                 modifiers,
-                #[cfg(not(feature = "react-ui"))]
-                occurred_at,
             })
             .collect()
-        }
-
-        #[cfg(not(feature = "react-ui"))]
-        pub(crate) fn reset(&mut self) {
-            self.previous = None;
         }
     }
 

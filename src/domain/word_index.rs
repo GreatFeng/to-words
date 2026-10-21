@@ -76,11 +76,6 @@ impl WordIndex {
         }
     }
 
-    #[cfg(not(feature = "react-ui"))]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     pub(crate) fn get(&self, id: EntryId) -> Option<&WordEntry> {
         self.entries.get(id.0)
     }

@@ -13,7 +13,7 @@ npm --prefix frontend ci
 cargo run
 ```
 
-默认使用 React + TailwindCSS + Tauri 界面。Rust 构建脚本会在前端源码变化后自动重新构建静态资源。若要临时运行旧版 egui 界面，可执行 `cargo run --no-default-features`；发布时执行 `cargo build --release`。前端源码在 `frontend/src`，Rust/Tauri 命令和窗口调度在 `src/web_app.rs`，跨程序定位在 `src/platform/caret_position.rs`，SQLite/词库/语音/OCR 仍由 `src/domain` 与 `src/platform` 复用。
+界面使用 React + TailwindCSS + Tauri。Rust 构建脚本会在前端源码变化后自动重新构建静态资源；发布时执行 `cargo build --release`。前端源码在 `frontend/src`，Rust/Tauri 命令和窗口调度在 `src/web_app.rs`，跨程序定位在 `src/platform/caret_position.rs`，SQLite/词库/语音/OCR 由 `src/domain` 与 `src/platform` 复用。
 
 程序启动后在后台运行，不会自动弹出查询框。系统托盘出现图标即表示程序已经启动。
 
@@ -35,7 +35,7 @@ G502 LIGHTSPEED 的 11 个可编程功能不等于 Windows 上报 11 个鼠标�
 
 ### 本地语音识别
 
-语音模块见 `src/platform/voice.rs`，使用 Windows `waveIn` 以 16 kHz 单声道录音，默认调用随程序发布的 SenseVoice CLI、SenseVoice GGUF 模型与 FSMN VAD；也可选择 `whisper-cli.exe` 和多语言 GGML 模型。录音/停顿检测与语音识别使用独立线程，上一句识别时仍能检测下一句，识别任务按语句顺序处理；每 100 毫秒分析一帧音量，开头约 0.4 秒估计背景噪音，说话中根据语音峰值动态判断停顿，检测到约 0.6 秒停顿后只识别完整句子一次，不再每四秒重复启动模型。设置项 `voice_keep_input` 默认 `false`；开启后，每句自动提交并继续监听，直到再次按快捷键结束。语音活动检测仍是音量阈值启发式算法，持续人声或音乐等复杂噪声可能需要手动停止。悬浮文字由 `src/components/voice_overlay.rs` 的独立透明、置顶、鼠标穿透视口绘制，始终位于屏幕底部；最终结果显示约 1 秒后消失，即使保持语音输入也不会一直占据屏幕，下一句开始时清空旧文字。`src/platform/voice_output.rs` 在每条结果产生时捕获当前外部前台窗口，发送前再次确认窗口未变化；临时写入剪贴板后通过扫描码按下 Ctrl+V 并跨帧保持按键，然后恢复原剪贴板；非文本剪贴板或无法备份时退回 Unicode 按键事件。`src/platform/voice_overlay_window.rs` 会尽量移除 Windows 添加的原生边框，并设置不激活窗口样式。主窗口更新后显式请求子视口重绘，确保识别原文在 AI 请求尚未完成时先出现。资源放置和发布要求见 [assets/voice/README.md](../assets/voice/README.md)。
+语音模块见 `src/platform/voice.rs`，使用 Windows `waveIn` 以 16 kHz 单声道录音，默认调用随程序发布的 SenseVoice CLI、SenseVoice GGUF 模型与 FSMN VAD；也可选择 `whisper-cli.exe` 和多语言 GGML 模型。录音/停顿检测与语音识别使用独立线程，上一句识别时仍能检测下一句，识别任务按语句顺序处理；每 100 毫秒分析一帧音量，开头约 0.4 秒估计背景噪音，说话中根据语音峰值动态判断停顿，检测到约 0.6 秒停顿后只识别完整句子一次，不再每四秒重复启动模型。设置项 `voice_keep_input` 默认 `false`；开启后，每句自动提交并继续监听，直到再次按快捷键结束。语音活动检测仍是音量阈值启发式算法，持续人声或音乐等复杂噪声可能需要手动停止。悬浮文字由 React 的 `frontend/src/pages/Voice.tsx` 与 Tauri 窗口绘制，始终位于屏幕底部；最终结果显示约 1 秒后消失，即使保持语音输入也不会一直占据屏幕，下一句开始时清空旧文字。`src/platform/voice_output.rs` 在每条结果产生时捕获当前外部前台窗口，发送前再次确认窗口未变化；临时写入剪贴板后通过扫描码按下 Ctrl+V 并跨帧保持按键，然后恢复原剪贴板；非文本剪贴板或无法备份时退回 Unicode 按键事件。资源放置和发布要求见 [assets/voice/README.md](../assets/voice/README.md)。
 
 Whisper CLI 的计算线程数自动取可用逻辑处理器数与 8 的较小值（查询失败则用 4）。实测同一段 4.5 秒中文录音，4 线程约 1.18 秒、8 线程约 0.75 秒，文字相同；更激进的解码参数虽然略快，但会丢失标点，因此没有启用。启用耗时诊断时，日志中的 `asr_threads` 会记录实际线程数。
 

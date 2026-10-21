@@ -1,34 +1,13 @@
-//! to_words 共享 Rust 核心。
-//!
-//! 原生平台能力、词库与配置逻辑由两种界面运行时复用；React 迁移完成前，
-//! 现有 egui 入口仍可独立运行。
+//! to_words Rust 核心与 React/Tauri 桌面运行时。
 
 mod ai;
-#[cfg(not(feature = "react-ui"))]
-mod app;
-#[cfg(not(feature = "react-ui"))]
-mod components;
 mod domain;
 mod i18n;
 mod platform;
-#[cfg(not(feature = "react-ui"))]
-mod ui;
-#[cfg(feature = "react-ui")]
+mod web_app;
 mod web_config;
 
-#[cfg(feature = "react-ui")]
-mod web_app;
-
-#[cfg(not(feature = "react-ui"))]
-pub(crate) use app::{
-    UiConfig, WORD_EDITOR_FONT_FAMILY, project_directory, word_library_directory,
-};
-#[cfg(not(feature = "react-ui"))]
-pub(crate) use components::word_library::editor as word_editor;
 pub(crate) use domain::translation_language;
-#[cfg(not(feature = "react-ui"))]
-pub(crate) use ui::theme as ui_theme;
-#[cfg(feature = "react-ui")]
 pub(crate) use web_config::{project_directory, word_library_directory};
 
 pub fn migrate_data_report() -> anyhow::Result<()> {
@@ -41,12 +20,6 @@ pub fn migrate_data_report() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "react-ui"))]
-pub fn run_egui() -> eframe::Result {
-    app::run()
-}
-
-#[cfg(feature = "react-ui")]
 pub fn run_react() -> anyhow::Result<()> {
     web_app::run()
 }
