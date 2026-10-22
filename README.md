@@ -4,9 +4,7 @@
 
 ## 产品演示
 
-[![打开 to_words v0.1.6 产品宣传视频](assets/video/to_words_promo_preview.svg)](assets/video/to_words_promo_v0.1.6.mp4)
-
-点击上方图片打开 [to_words v0.1.6 宣传视频](assets/video/to_words_promo_v0.1.6.mp4)；如果浏览器直接下载 MP4，打开下载的文件即可观看。
+https://github.com/user-attachments/assets/3122968a-60d2-435e-9b9d-24aa7d6d0036
 
 ## 开始使用
 
