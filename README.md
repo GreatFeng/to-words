@@ -2,6 +2,12 @@
 
 `to_words` 是一款 Windows 快捷词工具。你可以用熟悉的输入法输入文字，从自己的词库中找到对应句子，再复制到聊天窗口、游戏或其他程序。它也支持多语言词库、屏幕文字与语音识别，以及可选的 AI 翻译。
 
+## 产品演示
+
+[![打开 to_words v0.1.6 产品宣传视频](assets/video/to_words_promo_preview.svg)](assets/video/to_words_promo_v0.1.6.mp4)
+
+点击上方图片打开 [to_words v0.1.6 宣传视频](assets/video/to_words_promo_v0.1.6.mp4)；如果浏览器直接下载 MP4，打开下载的文件即可观看。
+
 ## 开始使用
 
 1. 将拿到的程序文件解压到一个固定文件夹。更新版本时，保留程序目录中的 `to_words.db`；如果是从旧版本升级，首次启动时可把旧词库和旧设置 JSON 放在程序目录中自动迁移。

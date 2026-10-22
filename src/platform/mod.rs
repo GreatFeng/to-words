@@ -16,3 +16,4 @@ pub(crate) mod voice_metrics;
 pub(crate) mod voice_output;
 pub(crate) mod voice_path_compat;
 pub(crate) mod voice_software_aec;
+pub(crate) mod window_monitor;

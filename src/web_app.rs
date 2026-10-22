@@ -20,6 +20,7 @@ use crate::platform::ocr::{self, CapturedScreen};
 use crate::platform::voice::{self, VoiceEvent, VoiceSession};
 use crate::platform::voice_identity::{self, EnrollmentEvent};
 use crate::platform::voice_output::VoiceInputTarget;
+use crate::platform::window_monitor::{SettingsOrigin, settings_position};
 use crate::web_config::{UiConfig, load_ui_config, save_ui_config};
 use crate::{
     ai::{self, AiCandidate},
@@ -420,8 +421,15 @@ async fn translate_text(
     Ok(result)
 }
 
-fn open_settings(app: &AppHandle) {
+fn open_settings(app: &AppHandle, origin: SettingsOrigin) {
     if let Some(window) = app.get_webview_window("settings") {
+        if let Ok(size) = window.outer_size() {
+            if let Some((x, y)) = settings_position(origin, (size.width, size.height)) {
+                let _ = window.set_position(tauri::Position::Physical(
+                    tauri::PhysicalPosition::new(x, y),
+                ));
+            }
+        }
         let _ = window.show();
         let _ = window.set_focus();
     }
@@ -475,7 +483,7 @@ fn create_tray(app: &tauri::App) -> anyhow::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "query" => open_query(app),
-            "settings" => open_settings(app),
+            "settings" => open_settings(app, SettingsOrigin::Mouse),
             "reload" => {
                 app.state::<WebState>()
                     .search
@@ -578,7 +586,7 @@ fn start_mouse_worker(app: AppHandle, window_handle: Option<isize>) {
                     });
                 match action {
                     Some("query") => open_query(&app),
-                    Some("settings") => open_settings(&app),
+                    Some("settings") => open_settings(&app, SettingsOrigin::Mouse),
                     Some("clear") => {
                         use tauri::Emitter;
                         let _ = app.emit_to("query", "clear-composed", ());
@@ -632,7 +640,7 @@ fn keyboard_hotkey_action(config: &UiConfig, id: u32) -> Option<&'static str> {
 fn dispatch_keyboard_hotkey(app: &AppHandle, action: &str) {
     match action {
         "query" => open_query(app),
-        "settings" => open_settings(app),
+        "settings" => open_settings(app, SettingsOrigin::Keyboard),
         "ocr" => {
             let _ = open_ocr(app);
         }

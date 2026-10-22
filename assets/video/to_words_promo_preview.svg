@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="320" viewBox="0 0 960 320" role="img" aria-labelledby="title description">
+  <title id="title">to_words 产品演示视频</title>
+  <desc id="description">点击打开 v0.1.6 产品宣传视频</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#17243d"/>
+      <stop offset="1" stop-color="#334b67"/>
+    </linearGradient>
+    <linearGradient id="button" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d6e8ff"/>
+      <stop offset="1" stop-color="#9dc4f5"/>
+    </linearGradient>
+  </defs>
+  <rect width="960" height="320" rx="24" fill="url(#background)"/>
+  <rect x="24" y="24" width="912" height="272" rx="17" fill="none" stroke="#d6e8ff" stroke-opacity=".20"/>
+  <text x="72" y="126" fill="#f5f9ff" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="55" font-weight="700">to_words</text>
+  <text x="74" y="175" fill="#c8d8ec" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="24">输入 · 搜索 · 翻译 · 识别</text>
+  <text x="74" y="253" fill="#e1ecfa" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="19">点击查看产品演示  ·  v0.1.6</text>
+  <circle cx="785" cy="160" r="67" fill="url(#button)"/>
+  <circle cx="785" cy="160" r="57" fill="none" stroke="#ffffff" stroke-opacity=".65" stroke-width="2"/>
+  <path d="M771 132 L771 188 L815 160 Z" fill="#19314f"/>
+</svg>
