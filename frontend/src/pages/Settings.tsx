@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, type LanguageOption, type UiConfig } from "../api";
+import { api, type AudioOutputDevice, type LanguageOption, type LocalTtsVoice, type UiConfig } from "../api";
 import { t } from "../i18n";
+import { availableVoices, findConfiguredVoice, findLocalVoice, speechLanguage } from "../localSpeech";
 import { LibraryPage } from "./Library";
 
 type Section = "library" | "ai" | "voice" | "ocr" | "shortcuts" | "appearance";
@@ -73,6 +74,8 @@ function ShortcutField({ label, value, onChange, recording, onRecordingChange }:
 
 export function SettingsPage() {
   const [config, setConfig] = useState<UiConfig | null>(null);
+  const uiLanguage = useRef("zh-CN");
+  uiLanguage.current = config?.ui_language ?? "zh-CN";
   const [languages, setLanguages] = useState<LanguageOption[]>([]);
   const [active, setActive] = useState<Section>("library");
   const [editingWords, setEditingWords] = useState(false);
@@ -91,6 +94,13 @@ export function SettingsPage() {
   const [showScrollTop, setShowScrollTop] = useState(false);
   const [ocrStatus, setOcrStatus] = useState("");
   const [voiceStatus, setVoiceStatus] = useState("");
+  const [playbackVoices, setPlaybackVoices] = useState<SpeechSynthesisVoice[] | null>(null);
+  const [localTtsVoices, setLocalTtsVoices] = useState<LocalTtsVoice[]>([]);
+  const [windowsTtsVoices, setWindowsTtsVoices] = useState<LocalTtsVoice[]>([]);
+  const [audioDevices, setAudioDevices] = useState<AudioOutputDevice[]>([]);
+  const [playbackError, setPlaybackError] = useState("");
+  const previewAudio = useRef<HTMLAudioElement | null>(null);
+  const micTogglePending = useRef(false);
 
   useEffect(() => {
     api.getConfig().then(setConfig).catch(error => setNotice(String(error)));
@@ -107,18 +117,106 @@ export function SettingsPage() {
     const pending = listen<string>("voice-enrollment", event => setVoiceEnrollmentStatus(event.payload));
     return () => { void pending.then(stop => stop()); };
   }, []);
+  useEffect(() => {
+    const state = listen<boolean>("mic-tts-toggle", event =>
+      setConfig(current => current && { ...current, mic_tts_enabled: event.payload }));
+    const status = listen<string>("mic-tts-status", event => setNotice(event.payload));
+    const subtitleState = listen<boolean>("system-audio-toggle", event =>
+      setConfig(current => current && { ...current, system_audio_monitor: event.payload, system_audio_translate: event.payload }));
+    const subtitleStatus = listen<string>("system-audio-status", event => setNotice(t(event.payload, uiLanguage.current)));
+    const refresh = () => void api.getConfig().then(saved =>
+      setConfig(current => current && { ...current, mic_tts_enabled: saved.mic_tts_enabled,
+        system_audio_monitor: saved.system_audio_monitor, system_audio_translate: saved.system_audio_translate })).catch(() => {});
+    window.addEventListener("focus", refresh);
+    return () => { void state.then(stop => stop()); void status.then(stop => stop());
+      void subtitleState.then(stop => stop()); void subtitleStatus.then(stop => stop()); window.removeEventListener("focus", refresh); };
+  }, []);
   useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(""), noticeDuration); return () => clearTimeout(timer); }, [notice, noticeRevision, noticeDuration]);
   useEffect(() => { scrollArea.current?.scrollTo({ top: 0, behavior: "auto" }); setShowScrollTop(false); }, [active]);
   useEffect(() => {
     if (active === "ocr") void api.ocrEngineStatus().then(setOcrStatus).catch(error => setOcrStatus(String(error)));
     if (active === "voice" && config) void api.voiceEngineStatus(config.voice_backend, config.source_language, config.translation_language).then(setVoiceStatus).catch(error => setVoiceStatus(String(error)));
   }, [active, config?.voice_backend, config?.source_language, config?.translation_language]);
+  useEffect(() => {
+    if (active !== "voice") return;
+    void api.localTtsVoices().then(setLocalTtsVoices).catch(error => setPlaybackError(String(error)));
+    void api.windowsTtsVoices().then(setWindowsTtsVoices).catch(error => setPlaybackError(String(error)));
+    void api.audioOutputDevices().then(setAudioDevices).catch(error => setPlaybackError(String(error)));
+    const synthesis = window.speechSynthesis;
+    if (!synthesis) { setPlaybackVoices([]); return; }
+    let cancelled = false;
+    void availableVoices(synthesis).then(voices => {
+      if (!cancelled) { setPlaybackVoices(voices.filter(voice => voice.localService)); setPlaybackError(""); }
+    }).catch(error => { if (!cancelled) { setPlaybackVoices([]); setPlaybackError(String(error)); } });
+    return () => { cancelled = true; };
+  }, [active]);
+  useEffect(() => () => { previewAudio.current?.pause(); window.speechSynthesis?.cancel(); }, []);
 
   if (!config) return <div className="grid h-full place-items-center bg-[#eeedea] text-sm text-slate-600">{notice || "正在加载设置…"}</div>;
   const label = (key: string) => t(key, config.ui_language);
   const update = <K extends keyof UiConfig>(key: K, value: UiConfig[K]) => setConfig(current => current && { ...current, [key]: value });
+  const changeMicTts = async (enabled: boolean) => {
+    if (micTogglePending.current) return;
+    micTogglePending.current = true;
+    try {
+      const applied = await api.setMicTtsEnabled(enabled, config.mic_output_device);
+      setConfig(current => current && { ...current, mic_tts_enabled: applied });
+    } catch (error) { setNotice(String(error)); }
+    finally { micTogglePending.current = false; }
+  };
   const updatePart = <K extends "input" | "results" | "hotkeys">(part: K, key: keyof UiConfig[K], value: string | number) =>
     setConfig(current => current && { ...current, [part]: { ...current[part], [key]: value } });
+  const playbackLanguage = config.translation_language ? speechLanguage(config.translation_language, "") : "";
+  const playbackKey = playbackLanguage.toLocaleLowerCase();
+  const selectedPlaybackUri = config.speech_voices?.[playbackKey] ?? "";
+  const voicesForLanguage = playbackVoices?.filter(voice => !playbackLanguage
+    || voice.lang.toLocaleLowerCase().split("-")[0] === playbackKey.split("-")[0]) ?? [];
+  const localVoicesForLanguage = [...localTtsVoices, ...windowsTtsVoices].filter(voice => !playbackLanguage
+    || voice.lang.toLocaleLowerCase().split("-")[0] === playbackKey.split("-")[0]);
+  const choosePlaybackVoice = (uri: string) => setConfig(current => {
+    if (!current) return current;
+    const speech_voices = { ...current.speech_voices };
+    if (uri) speech_voices[playbackKey] = uri;
+    else delete speech_voices[playbackKey];
+    return { ...current, speech_voices };
+  });
+  const previewPlaybackVoice = async () => {
+    previewAudio.current?.pause();
+    previewAudio.current = null;
+    window.speechSynthesis?.cancel();
+    if (!playbackLanguage) return;
+    const sample = playbackKey.startsWith("ko") ? "안녕하세요. 반갑습니다."
+      : playbackKey.startsWith("ja") ? "こんにちは。よろしくお願いします。"
+        : playbackKey.startsWith("zh") ? "你好，很高兴认识你。"
+          : "Hello, nice to meet you.";
+    if (selectedPlaybackUri.startsWith("piper:") || selectedPlaybackUri.startsWith("supertonic:")) {
+      try {
+        const source = await api.synthesizePiper(selectedPlaybackUri, sample);
+        const audio = new Audio(source);
+        previewAudio.current = audio;
+        await audio.play();
+      } catch (error) { setNotice(`本地发音失败：${String(error)}`); }
+      return;
+    }
+    if (selectedPlaybackUri.startsWith("winrt:")) {
+      try {
+        const source = await api.synthesizeWindows(selectedPlaybackUri, sample);
+        const audio = new Audio(source);
+        previewAudio.current = audio;
+        await audio.play();
+      } catch (error) { setNotice(`Windows 发音失败：${String(error)}`); }
+      return;
+    }
+    const synthesis = window.speechSynthesis;
+    if (!synthesis) return;
+    const voice = findConfiguredVoice(voicesForLanguage, selectedPlaybackUri, playbackLanguage)
+      ?? findLocalVoice(voicesForLanguage, playbackLanguage);
+    if (!voice) return;
+    const utterance = new SpeechSynthesisUtterance(sample);
+    utterance.voice = voice;
+    utterance.lang = voice.lang;
+    synthesis.speak(utterance);
+  };
 
   const save = async () => {
     setBusy(true);
@@ -216,6 +314,29 @@ export function SettingsPage() {
             <Switch label={label("Aion2 兼容模式：复制语音结果，手动粘贴")} checked={config.voice_aion2_manual_paste} onChange={value => update("voice_aion2_manual_paste", value)} />
             <Switch label={label("仅识别已注册的本人声音")} checked={config.voice_owner_filter} onChange={value => update("voice_owner_filter", value)} />
             <Switch label={label("过滤电脑播放声")} checked={config.voice_playback_filter} onChange={value => update("voice_playback_filter", value)} />
+            <div className="grid gap-2 border-t border-slate-200 pt-4">
+              <Switch label={label("监听系统播放声音并显示识别字幕")} checked={config.system_audio_monitor} onChange={value => update("system_audio_monitor", value)} />
+              <Switch label={label("将系统声音字幕翻译成原始语言")} checked={config.system_audio_translate} onChange={value => update("system_audio_translate", value)} />
+              <label className="grid gap-2 text-sm text-slate-700">{label("系统声音识别语言")}
+                <select className="field" value={config.system_audio_language} onChange={event => update("system_audio_language", event.target.value)}>
+                  <option value="target">{label("跟随目标语言")}</option>
+                  <option value="auto">{label("自动识别")}</option>
+                  <option value="cn">{label("简体中文")}</option>
+                  <option value="en">{label("英语")}</option>
+                  <option value="ja">{label("日语")}</option>
+                  <option value="ko">{label("韩语")}</option>
+                </select>
+              </label>
+              <label className="grid gap-2 text-sm text-slate-700">{label("系统声音播放设备")}
+                <select className="field" value={config.system_audio_device} onChange={event => update("system_audio_device", event.target.value)}>
+                  <option value="">{label("Windows 默认播放设备")}</option>
+                  {config.system_audio_device && !audioDevices.some(device => device.id === config.system_audio_device)
+                    && <option value={config.system_audio_device} disabled>{label("已保存的设备不可用")}</option>}
+                  {audioDevices.map(device => <option key={device.id} value={device.id}>{device.name}</option>)}
+                </select>
+              </label>
+              <p className="text-xs text-slate-600">{label("选择网页视频实际使用的播放设备；原始语言为自动识别时，字幕译为简体中文。翻译需要 DeepSeek API Key。")}</p>
+            </div>
             <Slider label={label("语音停顿时间（秒）")} value={config.voice_silence_seconds} min={0.2} max={3} step={0.1} unit="s" onChange={value => update("voice_silence_seconds", value)} />
             <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm">
               <p className="mb-3 font-medium">{label("本人声纹")} · {voiceRegistered ? label("已注册本人声纹") : label("尚未注册本人声纹")}</p>
@@ -235,13 +356,46 @@ export function SettingsPage() {
                 <span role="status" className="text-xs text-slate-600">{voiceEnrollmentStatus}</span>
               </div>
             </div>
+            <div className="grid gap-4 border-t border-slate-200 pt-5 text-sm text-slate-700">
+              <h2 className="font-semibold text-slate-900">{label("查询结果发音")}</h2>
+              <p>{label("选择查询结果与自动麦克风发音使用的本地声音。")}</p>
+              {!playbackLanguage ? <p className="rounded-xl bg-slate-100 p-3">{label("请先在词库页面选择目标语言。")}</p> : <>
+                <label className="grid gap-2">{label("发音语音")} · {playbackLanguage}
+                  <select className="field" value={selectedPlaybackUri} onChange={event => choosePlaybackVoice(event.target.value)}>
+                    <option value="">{label("自动选择")}</option>
+                    {selectedPlaybackUri && !voicesForLanguage.some(voice => voice.voiceURI === selectedPlaybackUri)
+                      && !localVoicesForLanguage.some(voice => voice.id === selectedPlaybackUri) &&
+                      <option value={selectedPlaybackUri} disabled>{label("已保存的声音不可用")}</option>}
+                    {voicesForLanguage.map(voice => <option key={voice.voiceURI} value={voice.voiceURI}>{voice.name} · {voice.lang} · {label("仅本机播放")}</option>)}
+                    {localVoicesForLanguage.map(voice => <option key={voice.id} value={voice.id}>{voice.name} · {voice.lang}</option>)}
+                  </select>
+                </label>
+                <button type="button" className="button w-fit" disabled={!voicesForLanguage.length && !localVoicesForLanguage.length} onClick={() => void previewPlaybackVoice()}>{label("试听")}</button>
+                {playbackVoices === null && <p className="text-xs text-slate-500">{label("正在读取本地语音…")}</p>}
+                {playbackVoices !== null && !voicesForLanguage.length && !localVoicesForLanguage.length && <p className="text-xs text-amber-800">{label("未找到这个语言可用的本地声音。请在 Windows 语言设置中安装文字转语音组件后重启 to_words。")}</p>}
+              </>}
+              {playbackError && <p role="status" className="text-xs text-rose-700">{playbackError}</p>}
+              <div className="grid gap-3 border-t border-slate-200 pt-5">
+                <Switch label={label("自动向虚拟麦克风播放查询和语音结果")} checked={config.mic_tts_enabled} onChange={value => void changeMicTts(value)} />
+                <label className="grid gap-2">{label("虚拟麦克风的播放端")}
+                  <select className="field" value={config.mic_output_device} onChange={event => update("mic_output_device", event.target.value)}>
+                    <option value="">{label("未选择")}</option>
+                    {config.mic_output_device && !audioDevices.some(device => device.id === config.mic_output_device)
+                      && <option value={config.mic_output_device} disabled>{label("已保存的设备不可用")}</option>}
+                    {audioDevices.map(device => <option key={device.id} value={device.id}>{device.name}</option>)}
+                  </select>
+                </label>
+                <p className="text-xs text-slate-600">{label("请选虚拟音频设备的播放端（例如 CABLE Input），并在聊天软件中选择对应的录音端（例如 CABLE Output）。")}</p>
+                <p className="text-xs text-slate-600">{label("使用 WebView 声音时，自动麦克风发音会选择同名 Windows 声音或同语言本地模型。")}</p>
+              </div>
+            </div>
           </div>}
           {active === "ocr" && <div className="grid gap-3">
             <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">{ocrStatus || label("正在检查 OCR 环境…")}</p>
           </div>}
           {active === "shortcuts" && <div className="grid gap-1">
-            {(["popup", "settings", "clear_composed", "ocr", "voice"] as const).map((key, index) =>
-              <ShortcutField key={key} label={label(["打开查询", "设置", "清空所有组合内容", "OCR 识别", "语音识别"][index])}
+            {(["popup", "settings", "clear_composed", "ocr", "voice", "mic_tts", "system_audio"] as const).map((key, index) =>
+              <ShortcutField key={key} label={label(["打开查询", "设置", "清空所有组合内容", "OCR 识别", "语音识别", "自动麦克风发音开关", "系统声音字幕与翻译开关"][index])}
                 value={config.hotkeys[key]} onChange={value => updatePart("hotkeys", key, value)}
                 recording={recordingShortcut === key} onRecordingChange={recording => setRecordingShortcut(recording ? key : null)} />)}
           </div>}
@@ -270,6 +424,7 @@ export function SettingsPage() {
             </div>
             <div className="grid gap-5 border-t border-slate-200 pt-5">
               <h2 className="font-semibold">{label("通用")}</h2>
+              <Slider label={label("字幕字号")} value={config.subtitle_font_size} min={12} max={48} step={1} unit="px" onChange={value => update("subtitle_font_size", value)} />
               <ColorField label={label("文字颜色")} value={config.text_color} onChange={value => update("text_color", value)} />
               <ColorField label={label("选中背景颜色")} value={config.selected_color} onChange={value => update("selected_color", value)} />
               <ColorField label={label("选中文字颜色")} value={config.selected_text_color} onChange={value => update("selected_text_color", value)} />

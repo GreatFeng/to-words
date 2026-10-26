@@ -38,6 +38,10 @@ sherpa-onnx = "1.13.8"
 sonora = "0.2.0"
 wasapi = "0.25.0"
 windows = { version = "0.59", features = [
+    "Foundation_Collections",
+    "Media_Core",
+    "Media_SpeechSynthesis",
+    "Storage_Streams",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Security_Credentials",

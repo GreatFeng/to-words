@@ -5,28 +5,88 @@
 
 use crate::i18n::{self, tr};
 use crate::platform::voice_metrics::VoiceTrace;
-use crate::platform::{voice_aec, voice_identity, voice_path_compat};
+use crate::platform::{
+    streaming_asr, voice_aec, voice_identity, voice_path_compat, voice_software_aec,
+};
 use anyhow::{Context, Result, bail};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 pub(crate) const SAMPLE_RATE: usize = 16_000;
 const MAX_SECONDS: usize = 90;
 const MAX_UTTERANCE_SECONDS: usize = 30;
 const CALIBRATION_FRAMES: usize = 4;
+const SHORT_PAUSE_GRACE: Duration = Duration::from_millis(450);
+const SHORT_SEGMENT_SAMPLES: usize = SAMPLE_RATE * 12 / 10;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) enum VoiceEvent {
     SpeechStarted(u64),
+    Partial(u64, String),
     Recognizing(u64),
     Utterance(u64, Result<String, String>),
     Filtered(u64),
     Stopped(Option<String>),
+}
+
+enum StreamCommand {
+    Start(u64, Vec<i16>),
+    Audio(u64, Vec<i16>),
+    End,
+}
+
+fn start_streaming_subtitles(sender: Sender<VoiceEvent>) -> Option<Sender<StreamCommand>> {
+    let root =
+        crate::web_config::project_directory().join("assets/voice/streaming/zipformer-small-zh-en");
+    if ![
+        "encoder-epoch-99-avg-1.int8.onnx",
+        "decoder-epoch-99-avg-1.onnx",
+        "joiner-epoch-99-avg-1.int8.onnx",
+        "tokens.txt",
+    ]
+    .iter()
+    .all(|name| root.join(name).is_file())
+    {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut model = match streaming_asr::StreamingAsr::load() {
+            Ok(Some(model)) => model,
+            Ok(None) => return,
+            Err(reason) => {
+                eprintln!("流式字幕模型加载失败：{reason:#}");
+                return;
+            }
+        };
+        let mut active_id = None;
+        for command in rx {
+            let (id, samples) = match command {
+                StreamCommand::Start(id, samples) => {
+                    model.reset();
+                    active_id = Some(id);
+                    (id, samples)
+                }
+                StreamCommand::Audio(id, samples) if active_id == Some(id) => (id, samples),
+                StreamCommand::End => {
+                    model.reset();
+                    active_id = None;
+                    continue;
+                }
+                _ => continue,
+            };
+            if let Some(text) = model.accept(&samples) {
+                let _ = sender.send(VoiceEvent::Partial(id, text));
+            }
+        }
+    });
+    Some(tx)
 }
 
 pub(crate) struct VoiceSession {
@@ -115,7 +175,62 @@ pub(crate) fn start(
     owner_filter: bool,
     playback_filter: bool,
 ) -> Result<VoiceSession> {
+    start_with_source(
+        keep_input,
+        push_to_talk,
+        language,
+        backend,
+        strict_language,
+        silence_seconds,
+        owner_filter,
+        playback_filter,
+        false,
+        None,
+    )
+}
+
+pub(crate) fn start_playback(
+    backend: &str,
+    silence_seconds: f32,
+    playback_device: &str,
+    language: &str,
+) -> Result<VoiceSession> {
+    start_with_source(
+        true,
+        false,
+        language,
+        backend,
+        None,
+        silence_seconds,
+        false,
+        false,
+        true,
+        Some(playback_device),
+    )
+}
+
+fn start_with_source(
+    keep_input: bool,
+    push_to_talk: bool,
+    language: &str,
+    backend: &str,
+    strict_language: Option<&str>,
+    silence_seconds: f32,
+    owner_filter: bool,
+    playback_filter: bool,
+    system_playback: bool,
+    playback_device: Option<&str>,
+) -> Result<VoiceSession> {
     let engine = selected_engine(backend)?;
+    let engine = match engine {
+        RecognitionEngine::SenseVoice(executable, model, vad)
+            if system_playback && sensevoice_language_token(language).is_some() =>
+        {
+            let model = prepare_subtitle_language_model(&model, language)?;
+            RecognitionEngine::SenseVoice(executable, model, vad)
+        }
+        other => other,
+    };
     let background = keep_input && !push_to_talk;
     let owner_verifier = if owner_filter {
         Some(voice_identity::OwnerVerifier::load(playback_filter)?)
@@ -124,6 +239,7 @@ pub(crate) fn start(
     };
     let language = whisper_language(language).to_string();
     let strict_language = strict_language.map(str::to_owned);
+    let playback_device = playback_device.unwrap_or_default().to_owned();
     let trace_name = match &engine {
         RecognitionEngine::SenseVoice(_, model, _) => model
             .file_name()
@@ -164,6 +280,11 @@ pub(crate) fn start(
     let worker_trace = trace.clone();
     std::thread::spawn(move || {
         let (audio_sender, audio_receiver) = mpsc::channel();
+        let streaming = if system_playback && matches!(language.as_str(), "zh" | "en") {
+            start_streaming_subtitles(sender.clone())
+        } else {
+            None
+        };
         let (segment_sender, segment_receiver) = mpsc::channel::<(u64, Vec<i16>)>();
         let asr_sender = sender.clone();
         let asr_trace = worker_trace.clone();
@@ -192,26 +313,31 @@ pub(crate) fn start(
                 }
                 let asr_started = Instant::now();
                 asr_trace.record(utterance_id, "asr_started", None, "ok");
-                let result = transcribe_selected(&engine, &samples, &language, background)
-                    .and_then(|text| {
-                        if let Some(expected) = strict_language.as_deref()
-                            && !crate::translation_language::accepts_same_language_text(
-                                &text, expected,
-                            )
-                        {
-                            bail!(
-                                "识别结果不是所选的{}，已忽略",
-                                crate::translation_language::language_label(expected)
-                            );
-                        }
-                        Ok(text)
-                    })
-                    .map_err(|error| format!("{error:#}"));
+                let result =
+                    transcribe_selected(&engine, &samples, &language, background, system_playback)
+                        .and_then(|text| {
+                            if let Some(expected) = strict_language.as_deref()
+                                && !crate::translation_language::accepts_same_language_text(
+                                    &text, expected,
+                                )
+                            {
+                                bail!(
+                                    "识别结果不是所选的{}，已忽略",
+                                    crate::translation_language::language_label(expected)
+                                );
+                            }
+                            Ok(text)
+                        })
+                        .map_err(|error| format!("{error:#}"));
                 asr_trace.record(
                     utterance_id,
                     "asr_completed",
                     Some(asr_started.elapsed()),
-                    if result.is_ok() { "ok" } else { "error" },
+                    match &result {
+                        Ok(text) if text.trim().is_empty() => "empty",
+                        Ok(_) => "ok",
+                        Err(_) => "error",
+                    },
                 );
                 if push_to_talk {
                     while !asr_stop.load(Ordering::Acquire) {
@@ -224,16 +350,23 @@ pub(crate) fn start(
         let recorder_stop = Arc::clone(&worker_stop);
         let recorder_trace = worker_trace.clone();
         let recorder = std::thread::spawn(move || {
-            if playback_filter {
+            if system_playback {
+                voice_software_aec::record_playback(recorder_stop, audio_sender, &playback_device)
+            } else if playback_filter {
                 voice_aec::record(recorder_stop, audio_sender, keep_input, recorder_trace)
             } else {
                 record_microphone(recorder_stop, audio_sender, keep_input, recorder_trace)
             }
         });
-        let mut gate = SpeechGate::new(silence_seconds, !push_to_talk);
+        let mut gate = if system_playback {
+            SpeechGate::new_playback(silence_seconds)
+        } else {
+            SpeechGate::new(silence_seconds, !push_to_talk)
+        };
         let mut auto_stopped = false;
         let mut heard_speech = false;
         let mut utterance_id = 0;
+        let mut pending_short: Option<(CompletedSegment, Instant)> = None;
         let started_at = Instant::now();
         loop {
             if !keep_input && !heard_speech && started_at.elapsed() >= Duration::from_secs(15) {
@@ -246,39 +379,45 @@ pub(crate) fn start(
                     let update = gate.push(&chunk);
                     if update.started {
                         heard_speech = true;
-                        utterance_id += 1;
-                        worker_trace.record(utterance_id, "speech_started", None, "ok");
-                        let _ = sender.send(VoiceEvent::SpeechStarted(utterance_id));
+                        if let Some((previous, _)) = pending_short.take() {
+                            gate.resume_short_segment(previous);
+                            worker_trace.record(utterance_id, "short_pause_merged", None, "ok");
+                        } else {
+                            utterance_id += 1;
+                            worker_trace.record(utterance_id, "speech_started", None, "ok");
+                            let _ = sender.send(VoiceEvent::SpeechStarted(utterance_id));
+                            if let Some(tx) = &streaming {
+                                let _ = tx
+                                    .send(StreamCommand::Start(utterance_id, gate.segment.clone()));
+                            }
+                        }
+                    } else if let Some(tx) = &streaming
+                        && (gate.active || update.completed.is_some())
+                    {
+                        let _ = tx.send(StreamCommand::Audio(utterance_id, chunk));
                     }
                     if let Some(segment) = update.completed {
-                        if segment.reason == "silence" {
-                            worker_trace.speech_end(utterance_id, segment.trailing_silence);
+                        if let Some(tx) = &streaming {
+                            let _ = tx.send(StreamCommand::End);
                         }
-                        worker_trace.record(
+                        if !system_playback
+                            && segment.reason == "silence"
+                            && segment.samples.len() <= SHORT_SEGMENT_SAMPLES
+                        {
+                            pending_short = Some((segment, Instant::now()));
+                            worker_trace.record(utterance_id, "short_pause_wait", None, "ok");
+                            continue;
+                        }
+                        submit_segment(
                             utterance_id,
-                            "vad_complete",
-                            Some(segment.trailing_silence),
-                            segment.reason,
+                            segment,
+                            &sender,
+                            &segment_sender,
+                            &worker_trace,
                         );
-                        worker_trace.record(
-                            utterance_id,
-                            "audio_segment",
-                            Some(audio_duration(segment.samples.len())),
-                            "ok",
-                        );
-                        let _ = sender.send(VoiceEvent::Recognizing(utterance_id));
                         if !keep_input {
                             worker_stop.store(true, Ordering::Release);
                             auto_stopped = true;
-                        }
-                        if segment_sender
-                            .send((utterance_id, segment.samples))
-                            .is_err()
-                        {
-                            let _ = sender.send(VoiceEvent::Utterance(
-                                utterance_id,
-                                Err("语音识别线程已停止".to_string()),
-                            ));
                         }
                         if auto_stopped {
                             break;
@@ -289,11 +428,28 @@ pub(crate) fn start(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
+            if pending_short.as_ref().is_some_and(|(_, since)| {
+                since.elapsed() >= SHORT_PAUSE_GRACE && gate.candidate_frames == 0
+            }) {
+                let (segment, _) = pending_short.take().unwrap();
+                submit_segment(
+                    utterance_id,
+                    segment,
+                    &sender,
+                    &segment_sender,
+                    &worker_trace,
+                );
+                if !keep_input {
+                    worker_stop.store(true, Ordering::Release);
+                    auto_stopped = true;
+                    break;
+                }
+            }
         }
         worker_stop.store(true, Ordering::Release);
         let recorded = recorder
             .join()
-            .map_err(|_| "麦克风录音线程意外终止".to_string())
+            .map_err(|_| "音频采集线程意外终止".to_string())
             .and_then(|result| result.map_err(|error| format!("{error:#}")));
         // 手动停止时还没等到静音，仍提交最后一句；自动停止已经提交过，不再重复识别。
         let min_final_samples = if push_to_talk {
@@ -318,6 +474,15 @@ pub(crate) fn start(
                 ));
             }
         }
+        if let Some((segment, _)) = pending_short.take() {
+            submit_segment(
+                utterance_id,
+                segment,
+                &sender,
+                &segment_sender,
+                &worker_trace,
+            );
+        }
         drop(segment_sender);
         let recognized = transcriber
             .join()
@@ -337,6 +502,40 @@ pub(crate) fn start(
         receiver,
         stopping: false,
     })
+}
+
+fn submit_segment(
+    utterance_id: u64,
+    segment: CompletedSegment,
+    sender: &Sender<VoiceEvent>,
+    segment_sender: &Sender<(u64, Vec<i16>)>,
+    trace: &VoiceTrace,
+) {
+    if segment.reason == "silence" {
+        trace.speech_end(utterance_id, segment.trailing_silence);
+    }
+    trace.record(
+        utterance_id,
+        "vad_complete",
+        Some(segment.trailing_silence),
+        segment.reason,
+    );
+    trace.record(
+        utterance_id,
+        "audio_segment",
+        Some(audio_duration(segment.samples.len())),
+        "ok",
+    );
+    let _ = sender.send(VoiceEvent::Recognizing(utterance_id));
+    if segment_sender
+        .send((utterance_id, segment.samples))
+        .is_err()
+    {
+        let _ = sender.send(VoiceEvent::Utterance(
+            utterance_id,
+            Err("语音识别线程已停止".to_string()),
+        ));
+    }
 }
 
 /// In same-language mode, use the source language for Whisper and the output
@@ -368,6 +567,8 @@ pub(crate) struct SpeechGate {
     silent_samples: usize,
     silence_threshold_samples: usize,
     submit_on_silence: bool,
+    max_segment_samples: usize,
+    playback_start_threshold: Option<f32>,
     preroll: Vec<i16>,
     segment: Vec<i16>,
 }
@@ -384,6 +585,12 @@ pub(crate) struct CompletedSegment {
 }
 
 impl SpeechGate {
+    fn resume_short_segment(&mut self, previous: CompletedSegment) {
+        let mut combined = previous.samples;
+        combined.extend_from_slice(&self.segment);
+        self.segment = combined;
+    }
+
     pub(crate) fn new(silence_seconds: f32, submit_on_silence: bool) -> Self {
         let silence_seconds = if silence_seconds.is_finite() {
             silence_seconds.clamp(0.2, 3.0)
@@ -400,9 +607,24 @@ impl SpeechGate {
             silent_samples: 0,
             silence_threshold_samples: (silence_seconds * SAMPLE_RATE as f32).round() as usize,
             submit_on_silence,
+            max_segment_samples: SAMPLE_RATE * MAX_UTTERANCE_SECONDS,
+            playback_start_threshold: None,
             preroll: Vec::new(),
             segment: Vec::new(),
         }
+    }
+
+    /// Playback may already contain speech when monitoring starts and videos often
+    /// have no full pause. Do not calibrate against that speech; submit bounded
+    /// chunks so subtitles continue to appear during uninterrupted playback.
+    pub(crate) fn new_playback(silence_seconds: f32) -> Self {
+        let mut gate = Self::new(silence_seconds, true);
+        gate.calibrated_frames = CALIBRATION_FRAMES;
+        // Temporary text stays visible while waiting for a pause. Bound
+        // continuous playback so final SenseVoice jobs remain manageable.
+        gate.max_segment_samples = SAMPLE_RATE * 5;
+        gate.playback_start_threshold = Some(120.0);
+        gate
     }
 
     pub(crate) fn push(&mut self, chunk: &[i16]) -> GateUpdate {
@@ -428,14 +650,18 @@ impl SpeechGate {
                     completed: None,
                 };
             }
-            let threshold = (self.noise_floor * 1.35)
-                .max(self.noise_floor + 120.0)
-                .max(240.0);
+            let threshold = self.playback_start_threshold.unwrap_or_else(|| {
+                (self.noise_floor * 1.35)
+                    .max(self.noise_floor + 120.0)
+                    .max(240.0)
+            });
             if rms >= threshold {
                 self.candidate_frames = self.candidate_frames.saturating_add(1);
             } else {
                 self.candidate_frames = 0;
-                self.noise_floor = self.noise_floor * 0.95 + rms * 0.05;
+                if self.playback_start_threshold.is_none() {
+                    self.noise_floor = self.noise_floor * 0.95 + rms * 0.05;
+                }
             }
             if self.candidate_frames >= 2 {
                 self.active = true;
@@ -454,16 +680,23 @@ impl SpeechGate {
         }
         self.segment.extend_from_slice(chunk);
         self.speech_peak = rms.max(self.speech_peak * 0.99);
-        let silence_threshold = (self.noise_floor * 1.2)
-            .max(self.speech_peak * 0.62)
-            .max(240.0);
+        let silence_threshold = if self.playback_start_threshold.is_some() {
+            (self.speech_peak * 0.18).max(100.0)
+        } else {
+            // A single loud syllable must not make the quieter remainder of a
+            // sentence look like silence. Keep the ambient-noise threshold,
+            // but limit how far one speech peak can raise it.
+            (self.noise_floor * 1.2)
+                .max((self.speech_peak * 0.4).min(900.0))
+                .max(240.0)
+        };
         if rms < silence_threshold {
             self.silent_samples += chunk.len();
         } else {
             self.silent_samples = 0;
         }
         if (self.submit_on_silence && self.silent_samples >= self.silence_threshold_samples)
-            || self.segment.len() >= SAMPLE_RATE * MAX_UTTERANCE_SECONDS
+            || self.segment.len() >= self.max_segment_samples
         {
             let ended_by_silence =
                 self.submit_on_silence && self.silent_samples >= self.silence_threshold_samples;
@@ -524,11 +757,17 @@ fn transcribe_selected(
     samples: &[i16],
     language: &str,
     background: bool,
+    system_playback: bool,
 ) -> Result<String> {
     match engine {
-        RecognitionEngine::SenseVoice(executable, model, vad) => {
-            transcribe_sensevoice(executable, model, vad, samples, background)
-        }
+        RecognitionEngine::SenseVoice(executable, model, vad) => transcribe_sensevoice(
+            executable,
+            model,
+            vad,
+            samples,
+            background,
+            !system_playback,
+        ),
         RecognitionEngine::Whisper(executable, model) => {
             transcribe(executable, model, samples, language, background)
         }
@@ -555,12 +794,107 @@ fn sensevoice_files_in(base: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     Ok((executable, model, vad))
 }
 
+fn sensevoice_language_token(language: &str) -> Option<u32> {
+    match language {
+        "cn" | "zh" => Some(3),
+        "en" => Some(4),
+        "ja" => Some(11),
+        "ko" => Some(12),
+        _ => None,
+    }
+}
+
+// The bundled GGUF CLI has no language flag. SenseVoice stores its four query
+// tokens in GGUF metadata, so a language-specific copy can change just the
+// first token without changing the original model used by microphone input.
+fn query_language_token(file: &mut fs::File) -> Result<(u64, u32)> {
+    let mut header = [0_u8; 4096];
+    file.read_exact(&mut header)?;
+    let header = &header[..];
+    anyhow::ensure!(header.starts_with(b"GGUF"), "SenseVoice 模型不是 GGUF 格式");
+    let name = b"sv.query_tokens";
+    let start = header
+        .windows(name.len())
+        .position(|window| window == name)
+        .context("SenseVoice 模型缺少语言查询配置")?
+        + name.len();
+    let metadata = header
+        .get(start..start + 32)
+        .context("SenseVoice 语言查询配置不完整")?;
+    let number = |at: usize| u32::from_le_bytes(metadata[at..at + 4].try_into().unwrap());
+    anyhow::ensure!(
+        number(0) == 9
+            && number(4) == 5
+            && u64::from_le_bytes(metadata[8..16].try_into().unwrap()) == 4
+            && number(20) == 1
+            && number(24) == 2,
+        "SenseVoice 模型语言查询格式不受支持"
+    );
+    Ok(((start + 16) as u64, number(16)))
+}
+
+fn prepare_subtitle_language_model(source: &Path, language: &str) -> Result<PathBuf> {
+    if let Some(app_data) = std::env::var_os("LOCALAPPDATA") {
+        let cache = PathBuf::from(app_data).join("to_words/sensevoice_subtitles");
+        if let Ok(model) = prepare_subtitle_language_model_in(source, language, &cache) {
+            return Ok(model);
+        }
+    }
+    // Portable installs and restricted Windows accounts can use the model folder.
+    let cache = crate::web_config::project_directory().join("assets/voice/funasr/.subtitle_cache");
+    prepare_subtitle_language_model_in(source, language, &cache)
+}
+
+fn prepare_subtitle_language_model_in(
+    source: &Path,
+    language: &str,
+    cache: &Path,
+) -> Result<PathBuf> {
+    let token = sensevoice_language_token(language).context("不支持的字幕识别语言")?;
+    let source_meta = fs::metadata(source).context("无法读取 SenseVoice 模型信息")?;
+    let modified = source_meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    fs::create_dir_all(&cache).context("无法创建字幕模型缓存目录")?;
+    let target = cache.join(format!(
+        "sensevoice-subtitle-{language}-{}-{modified}.gguf",
+        source_meta.len()
+    ));
+    if target.is_file() && fs::metadata(&target)?.len() == source_meta.len() {
+        let mut cached = fs::File::open(&target).context("无法读取已缓存的字幕模型")?;
+        if query_language_token(&mut cached).is_ok_and(|(_, current)| current == token) {
+            return Ok(target);
+        }
+    }
+    let result = (|| {
+        fs::copy(source, &target).context("无法缓存字幕识别模型")?;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target)
+            .context("无法修改字幕模型的语言提示")?;
+        let (offset, original) = query_language_token(&mut file)?;
+        anyhow::ensure!(original == 0, "SenseVoice 原模型语言并非自动检测");
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&token.to_le_bytes())?;
+        file.flush()?;
+        drop(file);
+        Ok(target.clone())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&target);
+    }
+    result
+}
+
 fn transcribe_sensevoice(
     executable: &Path,
     model: &Path,
     vad: &Path,
     samples: &[i16],
     background: bool,
+    use_vad: bool,
 ) -> Result<String> {
     let paths = voice_path_compat::prepare(executable, model, Some(vad))?;
     let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
@@ -572,16 +906,16 @@ fn transcribe_sensevoice(
     let result = (|| {
         write_wav(&wav, samples)?;
         let mut command = Command::new(&paths.executable);
-        command
-            .arg("-m")
-            .arg(&paths.model)
-            .arg("--vad")
-            .arg(
+        command.arg("-m").arg(&paths.model);
+        if use_vad {
+            command.arg("--vad").arg(
                 paths
                     .vad
                     .as_ref()
                     .expect("SenseVoice always has a VAD model"),
-            )
+            );
+        }
+        command
             .arg("-a")
             .arg(&wav)
             .stdout(Stdio::piped())
@@ -773,7 +1107,10 @@ pub(crate) fn record_microphone(
     }
     trace.record(0, "microphone_open", Some(open_started.elapsed()), "ok");
 
-    let mut buffers = vec![vec![0_u8; BUFFER_BYTES]; 3];
+    // Keep enough buffers queued for brief CPU spikes (for example, local TTS
+    // synthesis starting while continuous speech is being captured). Reusing
+    // only three 100 ms buffers can make waveIn drop the middle of a sentence.
+    let mut buffers = vec![vec![0_u8; BUFFER_BYTES]; 12];
     let mut headers: Vec<WAVEHDR> = buffers
         .iter_mut()
         .map(|buffer| WAVEHDR {
@@ -788,7 +1125,7 @@ pub(crate) fn record_microphone(
         })
         .collect();
     let header_size = std::mem::size_of::<WAVEHDR>() as u32;
-    let mut prepared = [false; 3];
+    let mut prepared = vec![false; buffers.len()];
     let mut total_samples = 0;
     let mut next_header = 0;
     let result = (|| {
@@ -945,6 +1282,69 @@ mod tests {
     }
 
     #[test]
+    fn bundled_sensevoice_supports_language_query_override() {
+        let Ok((_, model, _)) = super::sensevoice_files() else {
+            return; // Optional model files are not checked into source control.
+        };
+        let (_, token) =
+            super::query_language_token(&mut std::fs::File::open(model).unwrap()).unwrap();
+        assert_eq!(token, 0);
+        assert_eq!(super::sensevoice_language_token("ko"), Some(12));
+        assert_eq!(super::sensevoice_language_token("ja"), Some(11));
+        assert_eq!(super::sensevoice_language_token("en"), Some(4));
+    }
+
+    #[test]
+    #[ignore = "copies the optional 254 MB model and starts the SenseVoice executable"]
+    fn forced_subtitle_model_loads_without_changing_the_original() {
+        let (executable, model, vad) = super::sensevoice_files().unwrap();
+        let korean = super::prepare_subtitle_language_model(&model, "ko").unwrap();
+        assert_eq!(
+            super::query_language_token(&mut std::fs::File::open(&korean).unwrap())
+                .unwrap()
+                .1,
+            12
+        );
+        assert_eq!(
+            super::query_language_token(&mut std::fs::File::open(&model).unwrap())
+                .unwrap()
+                .1,
+            0
+        );
+        super::transcribe_sensevoice(
+            &executable,
+            &korean,
+            &vad,
+            &vec![0; SAMPLE_RATE],
+            true,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a Korean speech source currently playing on the default Windows output"]
+    fn live_korean_playback_uses_hangul() {
+        let mut session = super::start_playback("sensevoice", 0.6, "", "ko").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut recognized = 0;
+        let mut korean = 0;
+        while std::time::Instant::now() < deadline {
+            if let Ok(super::VoiceEvent::Utterance(_, Ok(text))) = session
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(500))
+            {
+                recognized += 1;
+                korean += usize::from(text.chars().any(|ch| matches!(ch, '\u{AC00}'..='\u{D7A3}')));
+            }
+        }
+        session.stop();
+        assert!(recognized > 0, "没有从当前播放设备获得可识别语音");
+        assert!(korean > 0, "当前播放内容没有识别出韩文");
+    }
+
+    #[test]
     #[ignore = "requires the local whisper.cpp binary and model"]
     fn benchmark_local_engine_startup() {
         let (engine, model) = engine_files().unwrap();
@@ -976,6 +1376,92 @@ mod tests {
         assert_eq!(completed.reason, "silence");
         assert!(!gate.push(&speech).started);
         assert!(gate.push(&speech).started);
+    }
+
+    #[test]
+    fn playback_gate_starts_during_existing_audio_and_submits_without_a_pause() {
+        let mut gate = SpeechGate::new_playback(0.6);
+        let playback = vec![1_000_i16; SAMPLE_RATE / 10];
+        assert!(!gate.push(&playback).started);
+        assert!(gate.push(&playback).started);
+        let mut completed = None;
+        for _ in 0..50 {
+            if let Some(segment) = gate.push(&playback).completed {
+                completed = Some(segment);
+                break;
+            }
+        }
+        let completed = completed.expect("continuous playback should produce a subtitle segment");
+        assert_eq!(completed.reason, "max_duration");
+        assert!(completed.samples.len() <= SAMPLE_RATE * 5 + playback.len());
+        assert!(!gate.push(&playback).started);
+        assert!(gate.push(&playback).started);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "plays the checked-in voice sample and runs the installed SenseVoice model"]
+    fn playback_sample_reaches_sensevoice() {
+        let mut session = super::start_playback("sensevoice", 0.6, "", "auto").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let sample = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/voice/test_samples/test-voice2.wav");
+        let playable =
+            std::env::temp_dir().join(format!("to_words_playback_{}.wav", std::process::id()));
+        let converted = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&sample)
+            .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
+            .arg(&playable)
+            .status()
+            .expect("ffmpeg installed for playback test");
+        assert!(converted.success());
+        let output = std::process::Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-Command")
+            .arg("(New-Object System.Media.SoundPlayer $env:TO_WORDS_TEST_WAV).PlaySync()")
+            .env("TO_WORDS_TEST_WAV", &playable)
+            .output()
+            .expect("sample playback should start");
+        assert!(output.status.success(), "sample playback should succeed");
+        let _ = std::fs::remove_file(playable);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut recognized = None;
+        let mut partial = None;
+        while std::time::Instant::now() < deadline {
+            match session
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(250))
+            {
+                Ok(super::VoiceEvent::Partial(_, text)) if !text.trim().is_empty() => {
+                    partial = Some(text);
+                }
+                Ok(super::VoiceEvent::Utterance(_, result)) => {
+                    recognized = Some(result);
+                    break;
+                }
+                Ok(super::VoiceEvent::Stopped(reason)) => {
+                    panic!("playback recognition stopped: {reason:?}")
+                }
+                _ => {}
+            }
+        }
+        session.stop();
+        let text = recognized
+            .expect("playback recognition produced no utterance")
+            .unwrap();
+        assert!(
+            partial.is_some(),
+            "streaming recognizer produced no early subtitle"
+        );
+        assert!(
+            !text.trim().is_empty(),
+            "SenseVoice returned no subtitle text"
+        );
+        assert!(
+            !crate::domain::voice_word_cache::is_obviously_bad(&text),
+            "valid playback speech should not be discarded by subtitle filtering"
+        );
     }
 
     #[test]
@@ -1050,6 +1536,51 @@ mod tests {
             assert!(gate.push(&noise).completed.is_none());
         }
         assert!(gate.push(&noise).completed.is_some());
+    }
+
+    #[test]
+    fn quieter_words_after_a_loud_syllable_remain_in_the_same_utterance() {
+        let mut gate = SpeechGate::new(0.6, true);
+        let ambient = vec![700_i16; SAMPLE_RATE / 10];
+        let loud = vec![4_000_i16; SAMPLE_RATE / 10];
+        let quiet_speech = vec![1_000_i16; SAMPLE_RATE / 10];
+        for _ in 0..4 {
+            gate.push(&ambient);
+        }
+        gate.push(&loud);
+        assert!(gate.push(&loud).started);
+        for _ in 0..10 {
+            assert!(gate.push(&quiet_speech).completed.is_none());
+        }
+        for _ in 0..5 {
+            assert!(gate.push(&ambient).completed.is_none());
+        }
+        assert!(gate.push(&ambient).completed.is_some());
+    }
+
+    #[test]
+    fn short_pause_resume_keeps_the_first_words_for_recognition() {
+        let mut gate = SpeechGate::new(0.6, true);
+        let ambient = vec![0_i16; SAMPLE_RATE / 10];
+        let first_word = vec![2_000_i16; SAMPLE_RATE / 10];
+        let next_words = vec![1_000_i16; SAMPLE_RATE / 10];
+        for _ in 0..4 {
+            gate.push(&ambient);
+        }
+        gate.push(&first_word);
+        assert!(gate.push(&first_word).started);
+        let first = (0..6).find_map(|_| gate.push(&ambient).completed).unwrap();
+        assert!(first.samples.contains(&2_000));
+        gate.push(&next_words);
+        assert!(gate.push(&next_words).started);
+        gate.resume_short_segment(first);
+        let combined = gate.take_active(SAMPLE_RATE / 5).unwrap();
+        assert!(combined.contains(&2_000));
+        assert!(combined.contains(&1_000));
+        assert!(
+            combined.iter().position(|sample| *sample == 2_000)
+                < combined.iter().position(|sample| *sample == 1_000)
+        );
     }
 
     #[test]

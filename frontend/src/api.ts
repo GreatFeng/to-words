@@ -11,6 +11,7 @@ export type WordRow = {
 export type SearchHit = {
   key: string;
   value: string;
+  pronunciation?: string;
   library?: string;
   rank: "exact" | "prefix" | "contains";
 };
@@ -19,7 +20,7 @@ export type SearchPage = { hits: SearchHit[]; total: number; language_mismatch: 
 export type UiConfig = {
   input: { background_color: string; opacity: number; width: number; height: number; font_size: number; corner_radius: number };
   results: { background_color: string; opacity: number; min_width: number; max_width: number; min_row_height: number; max_height: number; font_size: number; corner_radius: number; max_visible_results: number };
-  hotkeys: { popup: string; settings: string; clear_composed: string; ocr: string; voice: string };
+  hotkeys: { popup: string; settings: string; clear_composed: string; ocr: string; voice: string; mic_tts: string; system_audio: string };
   gap: number;
   continuous_input: boolean;
   ai_translation: boolean;
@@ -33,9 +34,18 @@ export type UiConfig = {
   voice_hold_to_talk: boolean;
   voice_owner_filter: boolean;
   voice_playback_filter: boolean;
+  system_audio_monitor: boolean;
+  system_audio_translate: boolean;
+  system_audio_device: string;
+  system_audio_language: string;
+  subtitle_font_size: number;
+  subtitle_bounds: SubtitleBounds | null;
   voice_silence_seconds: number;
   voice_backend: string;
   voice_language: string;
+  speech_voices: Record<string, string>;
+  mic_tts_enabled: boolean;
+  mic_output_device: string;
   clear_on_focus_return: boolean;
   translation_language: string;
   source_language: string;
@@ -46,14 +56,25 @@ export type UiConfig = {
   selected_opacity: number;
 };
 
+export type SubtitleBounds = { x: number; y: number; width: number; height: number };
+
 export type LanguageOption = { code: string; name: string };
+export type LocalTtsVoice = { id: string; name: string; lang: string };
+export type AudioOutputDevice = { id: string; name: string };
 export type OcrResult = { original: string; translation: string; status: string; show_original: boolean };
 export type OcrSnapshot = { image: string; generation: number };
 export type OcrRectangle = { x: number; y: number; width: number; height: number };
 
 export const api = {
   getConfig: () => invoke<UiConfig>("get_config"),
+  narratorVoice: () => invoke<string | null>("get_narrator_voice"),
+  localTtsVoices: () => invoke<LocalTtsVoice[]>("list_local_tts_voices"),
+  windowsTtsVoices: () => invoke<LocalTtsVoice[]>("list_windows_tts_voices"),
+  audioOutputDevices: () => invoke<AudioOutputDevice[]>("list_audio_output_devices"),
+  synthesizePiper: (voiceId: string, text: string) => invoke<string>("synthesize_piper", { voiceId, text }),
+  synthesizeWindows: (voiceId: string, text: string) => invoke<string>("synthesize_windows", { voiceId, text }),
   saveConfig: (config: UiConfig) => invoke<void>("save_config", { config }),
+  setMicTtsEnabled: (enabled: boolean, outputDevice: string) => invoke<boolean>("set_mic_tts_enabled", { enabled, outputDevice }),
   setShortcutRecording: (active: boolean) => invoke<void>("set_shortcut_recording", { active }),
   ocrEngineStatus: () => invoke<string>("ocr_engine_status"),
   voiceEngineStatus: (backend: string, source: string, target: string) => invoke<string>("voice_engine_status", { backend, source, target }),
@@ -78,6 +99,8 @@ export const api = {
   confirmOcr: () => invoke<void>("confirm_ocr"),
   cancelOcr: () => invoke<void>("cancel_ocr"),
   voiceDisplay: () => invoke<{ original: string; result: string; status: string }>("get_voice_display"),
+  systemAudioDisplay: () => invoke<{ original: string; result: string; status: string }>("get_system_audio_display"),
+  saveSubtitleBounds: (bounds: SubtitleBounds) => invoke<void>("save_subtitle_bounds", { bounds }),
   toggleVoice: () => invoke<void>("toggle_voice"),
   takePendingQuery: () => invoke<string | null>("take_pending_query"),
   voiceRegistered: () => invoke<boolean>("voice_registered"),

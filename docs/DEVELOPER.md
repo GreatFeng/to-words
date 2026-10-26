@@ -15,6 +15,8 @@ cargo run
 
 界面使用 React + TailwindCSS + Tauri。Rust 构建脚本会在前端源码变化后自动重新构建静态资源；发布时执行 `cargo build --release`。前端源码在 `frontend/src`，Rust/Tauri 命令和窗口调度在 `src/web_app.rs`，跨程序定位在 `src/platform/caret_position.rs`，SQLite/词库/语音/OCR 由 `src/domain` 与 `src/platform` 复用。
 
+系统声音字幕由 `src/web_app/system_audio_runtime.rs` 协调。`src/platform/voice.rs` 将 WASAPI loopback 音频送给 sherpa-onnx 的有状态流式 Zipformer，增量输出临时字幕；同一段音频在停顿或最长 5 秒边界交给 SenseVoice，最终文字覆盖临时字幕。流式模型只启用 CPU 两个线程，缺少可选模型文件时自动回退到 SenseVoice。当前小模型只支持中英文，因此仅固定为中文或英文的系统声音字幕启用流式预览；自动、韩语和日语模式直接等待最终识别。系统声音识别语言可以固定中英日韩，或跟随目标语言。现用 SenseVoice GGUF 命令行无语言参数，程序在本地缓存模型副本并只修改 GGUF 中的语言查询 token，原模型和麦克风识别不变。副本优先保存在 `%LOCALAPPDATA%/to_words/sensevoice_subtitles`，不可写时回退到 `assets/voice/funasr/.subtitle_cache`；每个固定语种约占 254 MB。字幕 React 窗口可拖动、缩放并将物理像素位置与尺寸保存到 SQLite 设置；每次字幕更新不再重置位置。Chrome 扩展在 `browser-extension/chrome-captions`，通过 `HTMLMediaElement.textTracks` 读取当前播放视频的标准字幕轨道，以扩展来源向 `127.0.0.1:47836` 发送字幕。`src/web_app/browser_captions.rs` 只监听本机回环地址、限制请求体大小并只接受 `chrome-extension://` 来源；新鲜的浏览器轨道字幕优先于系统声音 ASR，轨道失效约 3 秒后恢复 ASR。网站自行绘制的字幕不属于标准轨道，仍由本地语音识别处理。发布包需包含 `assets/voice/streaming/zipformer-small-zh-en` 的四个模型文件和可选的 Chrome 扩展目录；模型下载地址见 [说明](../assets/voice/streaming/README.md)。
+
 程序启动后在后台运行，不会自动弹出查询框。系统托盘出现图标即表示程序已经启动。
 
 默认快捷键：
@@ -167,7 +169,7 @@ OCR 需要预先安装 [Tesseract OCR](https://github.com/tesseract-ocr/tesserac
 - 删除空 key
 - 删除空 value
 - 去除重复 key，重复时保留最后一项
-- 保存后立即重新加载词库
+- 保存后自动刷新查询索引
 
 高级 JSON 编辑模式支持：
 
@@ -237,7 +239,6 @@ user_words (1).json
 
 - 打开查询
 - 打开设置
-- 重新加载词库
 - 退出程序
 
 ## 性能优化

@@ -39,6 +39,7 @@ pub(super) fn search_words(
                 vec![WebHit {
                     key: query.to_owned(),
                     value: String::new(),
+                    pronunciation: String::new(),
                     library: String::new(),
                     rank: "exact",
                 }]
@@ -67,14 +68,28 @@ pub(super) fn search_words(
         .search(query, &search.previous_query, &search.previous_hits);
     let total = hits.len();
     let start = page.saturating_mul(page_size.clamp(1, 100));
-    let page_hits = hits
+    let page_matches: Vec<_> = hits
         .iter()
         .skip(start)
         .take(page_size.clamp(1, 100))
+        .collect();
+    let keys: Vec<_> = page_matches
+        .iter()
+        .filter_map(|hit| {
+            search
+                .index
+                .get(hit.entry_id)
+                .map(|entry| entry.key.as_str())
+        })
+        .collect();
+    let pronunciations = storage::load_search_pronunciations(&library, &keys).map_err(error)?;
+    let page_hits = page_matches
+        .into_iter()
         .filter_map(|hit| {
             search.index.get(hit.entry_id).map(|entry| WebHit {
                 key: entry.key.clone(),
                 value: entry.value.clone(),
+                pronunciation: pronunciations.get(&entry.key).cloned().unwrap_or_default(),
                 library: library.clone(),
                 rank: match hit.rank {
                     MatchRank::Exact => "exact",

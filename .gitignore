@@ -23,4 +23,11 @@
 /assets/voice/funasr/*.dll
 /assets/voice/funasr/*.gguf
 /assets/voice/funasr/*.zip
+/assets/voice/funasr/.subtitle_cache/
 /assets/voice/speaker/*.onnx
+/assets/voice/streaming/zipformer-small-zh-en/*.onnx
+/assets/tts/huayan/
+/assets/tts/.downloads/
+/assets/tts/sherpa-onnx-supertonic-3-tts-int8-2026-05-11/
+/assets/tts/vits-piper-en_US-lessac-high/
+/assets/tts/vits-piper-zh_CN-chaowen-medium/

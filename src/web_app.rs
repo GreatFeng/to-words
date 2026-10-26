@@ -1,12 +1,18 @@
 //! React/Tailwind 桌面界面的 Tauri 状态、窗口与快捷键调度。
 //! 词库、OCR 和语音命令分别由同目录子模块实现。
 
+mod browser_captions;
 mod library;
 mod ocr_runtime;
+mod system_audio_runtime;
+mod tts_runtime;
 mod voice_runtime;
 
+use self::browser_captions::*;
 use self::library::*;
 use self::ocr_runtime::*;
+use self::system_audio_runtime::*;
+use self::tts_runtime::*;
 use self::voice_runtime::*;
 use crate::domain::ai_word_save;
 use crate::domain::shortcut::{MouseShortcut, Shortcut};
@@ -16,11 +22,14 @@ use crate::domain::word_index::{MatchRank, SearchHit, WordIndex};
 use crate::platform::credentials;
 use crate::platform::extra_mouse_buttons::ExtraMouseButtons;
 use crate::platform::mouse_hotkey::MouseHotkeyListener;
+use crate::platform::narrator_voice;
 use crate::platform::ocr::{self, CapturedScreen};
+use crate::platform::piper_tts::{self, LocalTtsVoice};
 use crate::platform::voice::{self, VoiceEvent, VoiceSession};
 use crate::platform::voice_identity::{self, EnrollmentEvent};
 use crate::platform::voice_output::VoiceInputTarget;
 use crate::platform::window_monitor::{SettingsOrigin, settings_position};
+use crate::platform::{tts_output, windows_tts};
 use crate::web_config::{UiConfig, load_ui_config, save_ui_config};
 use crate::{
     ai::{self, AiCandidate},
@@ -28,7 +37,7 @@ use crate::{
 };
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,8 +57,13 @@ struct WebState {
     ocr_generation: AtomicU64,
     ocr_request: AtomicU64,
     voice_control: Mutex<Option<Sender<VoiceControl>>>,
+    tts_control: Mutex<Option<Sender<TtsCommand>>>,
+    tts_generation: Arc<AtomicU64>,
+    recent_tts: Mutex<VecDeque<RecentTts>>,
     voice_cache: Mutex<Option<Sender<CacheCommand>>>,
     voice_display: Mutex<VoiceDisplay>,
+    system_audio_display: Mutex<VoiceDisplay>,
+    browser_caption: Arc<Mutex<BrowserCaptionState>>,
     pending_query: Mutex<Option<String>>,
     shortcut_recording: Mutex<Option<Instant>>,
 }
@@ -66,6 +80,7 @@ struct SearchState {
 struct WebHit {
     key: String,
     value: String,
+    pronunciation: String,
     library: String,
     rank: &'static str,
 }
@@ -146,6 +161,96 @@ fn error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+#[tauri::command]
+fn get_narrator_voice() -> Option<String> {
+    narrator_voice::selected_voice()
+}
+
+#[tauri::command]
+fn list_local_tts_voices() -> Vec<LocalTtsVoice> {
+    piper_tts::list_voices()
+}
+
+#[tauri::command]
+async fn list_windows_tts_voices(
+    state: State<'_, WebState>,
+) -> Result<Vec<windows_tts::WindowsTtsVoice>, String> {
+    let sender = state
+        .tts_control
+        .lock()
+        .map_err(error)?
+        .clone()
+        .ok_or("发音服务未启动")?;
+    let (reply, receiver) = mpsc::channel();
+    sender.send(TtsCommand::ListVoices(reply)).map_err(error)?;
+    tauri::async_runtime::spawn_blocking(move || receiver.recv().map_err(error))
+        .await
+        .map_err(error)??
+}
+
+#[tauri::command]
+fn list_audio_output_devices() -> Result<Vec<tts_output::AudioOutputDevice>, String> {
+    tts_output::list_devices().map_err(error)
+}
+
+#[tauri::command]
+async fn synthesize_windows(
+    voice_id: String,
+    text: String,
+    state: State<'_, WebState>,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    let sender = state
+        .tts_control
+        .lock()
+        .map_err(error)?
+        .clone()
+        .ok_or("发音服务未启动")?;
+    let (reply, receiver) = mpsc::channel();
+    sender
+        .send(TtsCommand::Synthesize {
+            voice_id,
+            text,
+            reply,
+        })
+        .map_err(error)?;
+    let (samples, rate) =
+        tauri::async_runtime::spawn_blocking(move || receiver.recv().map_err(error))
+            .await
+            .map_err(error)???;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut bytes = Vec::with_capacity(44 + samples.len() * 2);
+        let pcm_len = (samples.len() * 2) as u32;
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36_u32 + pcm_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt \x10\0\0\0\x01\0\x01\0");
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&[2, 0, 16, 0]);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&pcm_len.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(
+                &((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes(),
+            );
+        }
+        Ok(format!(
+            "data:audio/wav;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ))
+    })
+    .await
+    .map_err(error)?
+}
+
+#[tauri::command]
+async fn synthesize_piper(voice_id: String, text: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || piper_tts::synthesize(&voice_id, &text))
+        .await
+        .map_err(error)?
+        .map_err(error)
+}
+
 fn library_name(source: &str, target: &str) -> String {
     translation_language::word_file_name(source, target)
 }
@@ -167,12 +272,31 @@ fn get_default_config() -> UiConfig {
 #[tauri::command]
 fn save_config(config: UiConfig, app: AppHandle, state: State<'_, WebState>) -> Result<(), String> {
     use tauri::Emitter;
-    let config = config.normalized();
+    let mut config = config.normalized();
+    // The overlay saves its geometry independently while Settings may remain open.
+    config.subtitle_bounds = state.config.lock().map_err(error)?.subtitle_bounds;
     validate_shortcuts(&config)?;
+    if config.mic_tts_enabled && config.mic_output_device.is_empty() {
+        return Err("请先选择虚拟音频播放设备，再开启自动麦克风发音".into());
+    }
     save_ui_config(&config).map_err(error)?;
+    let mic_tts_enabled = config.mic_tts_enabled;
     *state.config.lock().map_err(error)? = config;
+    if !mic_tts_enabled {
+        state.tts_generation.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(tray) = app.tray_by_id("to_words_tray") {
+        let tooltip = if mic_tts_enabled {
+            "to_words · 自动麦克风发音已开启"
+        } else {
+            "to_words · 自动麦克风发音已关闭"
+        };
+        let _ = tray.set_tooltip(Some(tooltip));
+    }
     state.hotkey_version.fetch_add(1, Ordering::Relaxed);
     let _ = app.emit_to("query", "config-updated", ());
+    let _ = app.emit_to("settings", "config-updated", ());
+    let _ = app.emit_to("system_audio", "config-updated", ());
     Ok(())
 }
 
@@ -242,6 +366,8 @@ fn validate_shortcuts(config: &UiConfig) -> Result<(), String> {
         &config.hotkeys.clear_composed,
         &config.hotkeys.ocr,
         &config.hotkeys.voice,
+        &config.hotkeys.mic_tts,
+        &config.hotkeys.system_audio,
     ];
     let mut unique = HashSet::new();
     for shortcut in shortcuts {
@@ -260,7 +386,12 @@ fn copy_text(
     used_entries: Vec<UsedWord>,
     state: State<'_, WebState>,
 ) -> Result<(), String> {
-    write_clipboard(text)?;
+    write_clipboard(text.clone())?;
+    if let Ok(config) = state.config.lock() {
+        if let Err(reason) = queue_tts(&state, &config, &text) {
+            eprintln!("自动麦克风发音未开始：{reason}");
+        }
+    }
     let uses: Vec<_> = used_entries
         .into_iter()
         .map(|entry| (entry.library, entry.key))
@@ -423,15 +554,48 @@ async fn translate_text(
 
 fn open_settings(app: &AppHandle, origin: SettingsOrigin) {
     if let Some(window) = app.get_webview_window("settings") {
-        if let Ok(size) = window.outer_size() {
-            if let Some((x, y)) = settings_position(origin, (size.width, size.height)) {
-                let _ = window.set_position(tauri::Position::Physical(
-                    tauri::PhysicalPosition::new(x, y),
-                ));
+        // 只在首次显示时按唤起位置居中；重复唤起保留用户调整过的位置。
+        if !window.is_visible().unwrap_or(false) {
+            if let Ok(size) = window.outer_size() {
+                if let Some((x, y)) = settings_position(origin, (size.width, size.height)) {
+                    let _ = window.set_position(tauri::Position::Physical(
+                        tauri::PhysicalPosition::new(x, y),
+                    ));
+                }
             }
+        }
+        if window.is_minimized().unwrap_or(false) {
+            let _ = window.unminimize();
         }
         let _ = window.show();
         let _ = window.set_focus();
+        #[cfg(windows)]
+        raise_settings_window(&window);
+    }
+}
+
+#[cfg(windows)]
+fn raise_settings_window(window: &tauri::WebviewWindow) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE,
+        SetForegroundWindow, SetWindowPos,
+    };
+    let Ok(handle) = window.hwnd() else { return };
+    let hwnd = handle.0 as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        if GetForegroundWindow() == hwnd {
+            return;
+        }
+        // 用户刚通过全局快捷键请求了这个窗口；先尝试正常激活。
+        let _ = SetForegroundWindow(hwnd);
+        if GetForegroundWindow() != hwnd {
+            // Windows 有时拒绝后台窗口激活。短暂提升层级后立即还原，
+            // 不让设置页永久保持“始终置顶”。
+            let flags = SWP_NOMOVE | SWP_NOSIZE;
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+            let _ = SetForegroundWindow(hwnd);
+        }
     }
 }
 
@@ -470,27 +634,30 @@ fn open_query(app: &AppHandle) {
 fn create_tray(app: &tauri::App) -> anyhow::Result<()> {
     let query = MenuItem::with_id(app, "query", "打开查询", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
-    let reload = MenuItem::with_id(app, "reload", "重新加载词库", true, None::<&str>)?;
     let exit = MenuItem::with_id(app, "exit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&query, &settings, &reload, &exit])?;
+    let menu = Menu::with_items(app, &[&query, &settings, &exit])?;
     let icon = app
         .default_window_icon()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("程序图标缺失"))?;
-    TrayIconBuilder::new()
+    let tts_enabled = app
+        .state::<WebState>()
+        .config
+        .lock()
+        .map_err(|reason| anyhow::anyhow!("无法读取语音设置：{reason}"))?
+        .mic_tts_enabled;
+    TrayIconBuilder::with_id("to_words_tray")
         .icon(icon)
+        .tooltip(if tts_enabled {
+            "to_words · 自动麦克风发音已开启"
+        } else {
+            "to_words · 自动麦克风发音已关闭"
+        })
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "query" => open_query(app),
             "settings" => open_settings(app, SettingsOrigin::Mouse),
-            "reload" => {
-                app.state::<WebState>()
-                    .search
-                    .lock()
-                    .map(|mut value| value.library.clear())
-                    .ok();
-            }
             "exit" => app.exit(0),
             _ => {}
         })
@@ -572,6 +739,8 @@ fn start_mouse_worker(app: AppHandle, window_handle: Option<isize>) {
                             (&config.hotkeys.clear_composed, "clear"),
                             (&config.hotkeys.ocr, "ocr"),
                             (&config.hotkeys.voice, "voice"),
+                            (&config.hotkeys.mic_tts, "mic_tts"),
+                            (&config.hotkeys.system_audio, "system_audio"),
                         ]
                         .into_iter()
                         .find_map(|(value, action)| {
@@ -597,6 +766,8 @@ fn start_mouse_worker(app: AppHandle, window_handle: Option<isize>) {
                     Some("voice") => {
                         let _ = toggle_voice(app.state::<WebState>());
                     }
+                    Some("mic_tts") => toggle_mic_tts(&app),
+                    Some("system_audio") => toggle_system_audio(&app),
                     _ => {}
                 }
             }
@@ -610,6 +781,8 @@ fn register_keyboard_shortcuts(manager: &GlobalHotKeyManager, config: &UiConfig)
         ("设置", &config.hotkeys.settings),
         ("OCR", &config.hotkeys.ocr),
         ("语音识别", &config.hotkeys.voice),
+        ("自动麦克风发音", &config.hotkeys.mic_tts),
+        ("系统声音字幕与翻译", &config.hotkeys.system_audio),
     ] {
         match value.parse::<Shortcut>() {
             Ok(Shortcut::Keyboard(key)) => {
@@ -629,6 +802,8 @@ fn keyboard_hotkey_action(config: &UiConfig, id: u32) -> Option<&'static str> {
         (&config.hotkeys.settings, "settings"),
         (&config.hotkeys.ocr, "ocr"),
         (&config.hotkeys.voice, "voice"),
+        (&config.hotkeys.mic_tts, "mic_tts"),
+        (&config.hotkeys.system_audio, "system_audio"),
     ]
     .into_iter()
     .find_map(|(binding, action)| match binding.parse::<Shortcut>() {
@@ -648,12 +823,15 @@ fn dispatch_keyboard_hotkey(app: &AppHandle, action: &str) {
             position_voice(app);
             let _ = toggle_voice(app.state::<WebState>());
         }
+        "mic_tts" => toggle_mic_tts(app),
+        "system_audio" => toggle_system_audio(app),
         _ => {}
     }
 }
 
 pub(crate) fn run() -> anyhow::Result<()> {
     let config = load_ui_config()?;
+    let browser_caption = Arc::new(Mutex::new(BrowserCaptionState::default()));
     let app = tauri::Builder::default()
         .manage(WebState {
             config: Mutex::new(config),
@@ -664,8 +842,13 @@ pub(crate) fn run() -> anyhow::Result<()> {
             ocr_generation: AtomicU64::new(0),
             ocr_request: AtomicU64::new(0),
             voice_control: Mutex::new(None),
+            tts_control: Mutex::new(None),
+            tts_generation: Arc::new(AtomicU64::new(0)),
+            recent_tts: Mutex::new(VecDeque::new()),
             voice_cache: Mutex::new(None),
             voice_display: Mutex::new(VoiceDisplay::default()),
+            system_audio_display: Mutex::new(VoiceDisplay::default()),
+            browser_caption: browser_caption.clone(),
             pending_query: Mutex::new(None),
             shortcut_recording: Mutex::new(None),
         })
@@ -696,6 +879,15 @@ pub(crate) fn run() -> anyhow::Result<()> {
             confirm_ocr,
             cancel_ocr,
             get_voice_display,
+            get_system_audio_display,
+            save_subtitle_bounds,
+            get_narrator_voice,
+            list_local_tts_voices,
+            list_windows_tts_voices,
+            list_audio_output_devices,
+            synthesize_piper,
+            synthesize_windows,
+            set_mic_tts_enabled,
             take_pending_query,
             toggle_voice,
             review_voice_cache_now,
@@ -704,6 +896,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             register_voice_profile,
         ])
         .setup(|app| {
+            start_bridge(app.state::<WebState>().browser_caption.clone());
             WebviewWindowBuilder::new(
                 app,
                 "query",
@@ -735,15 +928,42 @@ pub(crate) fn run() -> anyhow::Result<()> {
             .build()?;
             let _ = voice_window.set_ignore_cursor_events(true);
             position_voice(app.handle());
+            let system_audio_window = WebviewWindowBuilder::new(
+                app,
+                "system_audio",
+                WebviewUrl::App("index.html?view=system_audio".into()),
+            )
+            .title("to_words 系统声音字幕")
+            .inner_size(1020.0, 115.0)
+            .min_inner_size(320.0, 70.0)
+            .resizable(true)
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .focusable(false)
+            .visible(false)
+            .build()?;
+            if let Err(reason) = system_audio_window.set_ignore_cursor_events(false) {
+                eprintln!("字幕窗口无法启用鼠标拖动：{reason}");
+            }
             let (voice_tx, voice_rx) = mpsc::channel();
+            let (tts_tx, tts_rx) = mpsc::channel();
             let (cache_tx, cache_rx) = mpsc::channel();
             *app.state::<WebState>()
                 .voice_control
                 .lock()
                 .map_err(error)? = Some(voice_tx);
+            *app.state::<WebState>().tts_control.lock().map_err(error)? = Some(tts_tx);
             *app.state::<WebState>().voice_cache.lock().map_err(error)? = Some(cache_tx);
             start_cache_worker(app.handle().clone(), cache_rx);
             start_voice_worker(app.handle().clone(), voice_rx);
+            start_system_audio_worker(app.handle().clone());
+            start_tts_worker(
+                app.handle().clone(),
+                tts_rx,
+                app.state::<WebState>().tts_generation.clone(),
+            );
             create_tray(app)?;
             #[cfg(windows)]
             let window_handle = app

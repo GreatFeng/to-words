@@ -236,7 +236,13 @@ pub(super) fn type_voice_result(result: &str, config: &UiConfig) -> String {
 }
 
 pub(super) fn output_voice(app: &AppHandle, original: String, result: String, config: &UiConfig) {
-    let status = type_voice_result(&result, config);
+    let mut status = type_voice_result(&result, config);
+    if let Err(reason) = queue_tts(app.state::<WebState>().inner(), config, &result) {
+        if !status.is_empty() {
+            status.push_str("；");
+        }
+        status.push_str(&reason);
+    }
     show_voice(
         app,
         VoiceDisplay {
@@ -416,6 +422,7 @@ pub(super) fn start_voice_worker(app: AppHandle, controls: Receiver<VoiceControl
         let mut session: Option<VoiceSession> = None;
         let mut session_id = 0_u64;
         let mut latest_utterance = 0_u64;
+        let mut utterance_starts = HashMap::<u64, Instant>::new();
         let mut ai_pending = 0_usize;
         let mut lookup = VoiceLookup::default();
         let mut context = VecDeque::<String>::new();
@@ -445,6 +452,7 @@ pub(super) fn start_voice_worker(app: AppHandle, controls: Receiver<VoiceControl
                     };
                     session_id = session_id.wrapping_add(1);
                     latest_utterance = 0;
+                    utterance_starts.clear();
                     ai_pending = 0;
                     context.clear();
                     position_voice(&app);
@@ -479,6 +487,16 @@ pub(super) fn start_voice_worker(app: AppHandle, controls: Receiver<VoiceControl
                     ) {
                         Ok(started) => {
                             started.trace.record(0, "voice_session_ready", None, "ok");
+                            started.trace.record(
+                                0,
+                                "mic_tts_enabled",
+                                None,
+                                if config.mic_tts_enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                },
+                            );
                             session = Some(started);
                             hold_started = config.voice_hold_to_talk.then(Instant::now);
                             position_voice(&app);
@@ -532,6 +550,7 @@ pub(super) fn start_voice_worker(app: AppHandle, controls: Receiver<VoiceControl
                 match event {
                     VoiceEvent::SpeechStarted(id) => {
                         latest_utterance = id;
+                        utterance_starts.insert(id, Instant::now());
                         show_voice(
                             &app,
                             VoiceDisplay {
@@ -554,6 +573,24 @@ pub(super) fn start_voice_worker(app: AppHandle, controls: Receiver<VoiceControl
                     }
                     VoiceEvent::Utterance(id, Ok(text)) => {
                         let original = text.trim().to_owned();
+                        let started = utterance_starts.remove(&id).unwrap_or_else(Instant::now);
+                        if is_recent_tts_echo(app.state::<WebState>().inner(), &original, started) {
+                            if let Some(active) = &session {
+                                active.trace.record(id, "self_tts_echo", None, "filtered");
+                            }
+                            if id == latest_utterance {
+                                show_voice(
+                                    &app,
+                                    VoiceDisplay {
+                                        original: String::new(),
+                                        result: String::new(),
+                                        status: "已忽略扬声器回放".into(),
+                                    },
+                                );
+                                hide_at = Some(Instant::now() + Duration::from_secs(1));
+                            }
+                            continue;
+                        }
                         if id == latest_utterance {
                             show_voice(
                                 &app,
@@ -589,7 +626,8 @@ pub(super) fn start_voice_worker(app: AppHandle, controls: Receiver<VoiceControl
                             hide_at = Some(Instant::now() + Duration::from_secs(1));
                         }
                     }
-                    VoiceEvent::Utterance(_, Err(reason)) => {
+                    VoiceEvent::Utterance(id, Err(reason)) => {
+                        utterance_starts.remove(&id);
                         show_voice(
                             &app,
                             VoiceDisplay {
@@ -600,16 +638,19 @@ pub(super) fn start_voice_worker(app: AppHandle, controls: Receiver<VoiceControl
                         );
                         hide_at = Some(Instant::now() + Duration::from_secs(1));
                     }
-                    VoiceEvent::Filtered(id) if id == latest_utterance => {
-                        show_voice(
-                            &app,
-                            VoiceDisplay {
-                                original: String::new(),
-                                result: String::new(),
-                                status: "不是已注册的本人声音，已跳过".into(),
-                            },
-                        );
-                        hide_at = Some(Instant::now() + Duration::from_secs(1));
+                    VoiceEvent::Filtered(id) => {
+                        utterance_starts.remove(&id);
+                        if id == latest_utterance {
+                            show_voice(
+                                &app,
+                                VoiceDisplay {
+                                    original: String::new(),
+                                    result: String::new(),
+                                    status: "不是已注册的本人声音，已跳过".into(),
+                                },
+                            );
+                            hide_at = Some(Instant::now() + Duration::from_secs(1));
+                        }
                     }
                     VoiceEvent::Stopped(reason) => {
                         session = None;
@@ -656,15 +697,12 @@ pub(super) fn start_voice_worker(app: AppHandle, controls: Receiver<VoiceControl
                             Ok(config) => config.clone(),
                             Err(_) => continue,
                         };
-                        let status = type_voice_result(&candidate.translated, &config);
                         if translated.utterance_id == latest_utterance {
-                            show_voice(
+                            output_voice(
                                 &app,
-                                VoiceDisplay {
-                                    original: translated.recognized,
-                                    result: candidate.translated,
-                                    status,
-                                },
+                                translated.recognized,
+                                candidate.translated,
+                                &config,
                             );
                             hide_at = Some(Instant::now() + Duration::from_secs(1));
                         }

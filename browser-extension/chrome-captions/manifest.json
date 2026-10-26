@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "to_words 网页字幕连接",
+  "version": "0.1.0",
+  "description": "将当前播放视频的标准字幕轨道传给本机 to_words。",
+  "permissions": ["tabs"],
+  "host_permissions": ["http://127.0.0.1:47836/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": ["http://*/*", "https://*/*"],
+    "js": ["captions.js"],
+    "all_frames": true,
+    "run_at": "document_idle"
+  }]
+}

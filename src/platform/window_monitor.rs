@@ -56,6 +56,42 @@ pub(crate) fn settings_position(
     }
 }
 
+/// Place subtitles over the work area of the active application, leaving room
+/// for the taskbar and for controls at the bottom of a video.
+#[cfg(windows)]
+pub(crate) fn subtitle_bounds(desired_width: u32, height: u32) -> Option<(i32, i32, u32)> {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let monitor = if !foreground.is_null() {
+            MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST)
+        } else {
+            let mut cursor = POINT { x: 0, y: 0 };
+            if GetCursorPos(&mut cursor) == 0 {
+                return None;
+            }
+            MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST)
+        };
+        if monitor.is_null() {
+            return None;
+        }
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        let work = info.rcWork;
+        let width = desired_width.min((work.right - work.left).max(1) as u32);
+        let x = work.left + ((work.right - work.left - width as i32) / 2).max(0);
+        let y = (work.bottom - height as i32 - 80).max(work.top);
+        Some((x, y, width))
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn subtitle_bounds(_desired_width: u32, _height: u32) -> Option<(i32, i32, u32)> {
+    None
+}
+
 #[cfg(not(windows))]
 pub(crate) fn settings_position(
     _origin: SettingsOrigin,

@@ -2,7 +2,7 @@
 
 use crate::{project_directory, word_library_directory};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -293,6 +293,41 @@ pub(crate) fn load_search_rows(library: &str) -> Result<Vec<(String, String, u64
     rows.map(|row| row.map_err(Into::into)).collect()
 }
 
+/// 音标不参与搜索排序；只为当前展示页的词条读取，避免增大常驻索引。
+pub(crate) fn load_search_pronunciations(
+    library: &str,
+    keys: &[&str],
+) -> Result<BTreeMap<String, String>> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    // 搜索每次输入都会调用这里；不重复执行 open() 中的建表/迁移检查。
+    let connection =
+        Connection::open_with_flags(database_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    load_search_pronunciations_on(&connection, library, keys)
+}
+
+fn load_search_pronunciations_on(
+    connection: &Connection,
+    library: &str,
+    keys: &[&str],
+) -> Result<BTreeMap<String, String>> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders = vec!["?"; keys.len()].join(",");
+    let sql = format!(
+        "SELECT key_text,pronunciation FROM word_entries \
+         WHERE library_name=? AND quality_status='active' AND key_text IN ({placeholders})"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(
+        params_from_iter(std::iter::once(library).chain(keys.iter().copied())),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+    rows.map(|row| row.map_err(Into::into)).collect()
+}
+
 /// 仅统计仍在词库中的词条；一次组合复制可包含同一词条多次。
 pub(crate) fn record_word_uses(uses: &[(String, String)]) -> Result<Vec<(String, String)>> {
     if uses.is_empty() {
@@ -564,6 +599,35 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_pronunciations_exclude_other_libraries_and_quarantined_words() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE word_entries (
+               library_name TEXT NOT NULL, key_text TEXT NOT NULL,
+               pronunciation TEXT NOT NULL, quality_status TEXT NOT NULL
+             );
+             INSERT INTO word_entries VALUES ('ko', '안녕하세요', 'annyeonghaseyo', 'active');
+             INSERT INTO word_entries VALUES ('ko', '감사합니다', 'gamsahamnida', 'active');
+             INSERT INTO word_entries VALUES ('ko', '오류', 'oryu', 'quarantined');
+             INSERT INTO word_entries VALUES ('ja', '안녕하세요', 'wrong', 'active');",
+            )
+            .unwrap();
+        let found =
+            load_search_pronunciations_on(&connection, "ko", &["안녕하세요", "오류"]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found.get("안녕하세요").map(String::as_str),
+            Some("annyeonghaseyo")
+        );
+        assert!(
+            load_search_pronunciations_on(&connection, "ko", &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn existing_word_table_gains_usage_column_without_losing_entries() {

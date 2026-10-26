@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::ai::PolitenessLevel;
@@ -27,9 +28,18 @@ pub(crate) struct UiConfig {
     pub(crate) voice_hold_to_talk: bool,
     pub(crate) voice_owner_filter: bool,
     pub(crate) voice_playback_filter: bool,
+    pub(crate) system_audio_monitor: bool,
+    pub(crate) system_audio_translate: bool,
+    pub(crate) system_audio_device: String,
+    pub(crate) system_audio_language: String,
+    pub(crate) subtitle_font_size: f32,
+    pub(crate) subtitle_bounds: Option<SubtitleBounds>,
     pub(crate) voice_silence_seconds: f32,
     pub(crate) voice_backend: String,
     pub(crate) voice_language: String,
+    pub(crate) speech_voices: HashMap<String, String>,
+    pub(crate) mic_tts_enabled: bool,
+    pub(crate) mic_output_device: String,
     pub(crate) clear_on_focus_return: bool,
     pub(crate) translation_language: String,
     pub(crate) source_language: String,
@@ -59,9 +69,18 @@ impl Default for UiConfig {
             voice_hold_to_talk: false,
             voice_owner_filter: false,
             voice_playback_filter: false,
+            system_audio_monitor: false,
+            system_audio_translate: false,
+            system_audio_device: String::new(),
+            system_audio_language: "auto".into(),
+            subtitle_font_size: 20.0,
+            subtitle_bounds: None,
             voice_silence_seconds: 0.6,
             voice_backend: "sensevoice".into(),
             voice_language: "auto".into(),
+            speech_voices: HashMap::new(),
+            mic_tts_enabled: false,
+            mic_output_device: String::new(),
             clear_on_focus_return: false,
             translation_language: String::new(),
             source_language: "auto".into(),
@@ -72,6 +91,14 @@ impl Default for UiConfig {
             selected_opacity: 0.72,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub(crate) struct SubtitleBounds {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -136,6 +163,8 @@ pub(crate) struct HotkeyConfig {
     pub(crate) clear_composed: String,
     pub(crate) ocr: String,
     pub(crate) voice: String,
+    pub(crate) mic_tts: String,
+    pub(crate) system_audio: String,
 }
 
 impl Default for HotkeyConfig {
@@ -146,6 +175,8 @@ impl Default for HotkeyConfig {
             clear_composed: "ctrl+backspace".into(),
             ocr: "ctrl+alt+o".into(),
             voice: "ctrl+alt+v".into(),
+            mic_tts: "ctrl+f12".into(),
+            system_audio: "ctrl+alt+b".into(),
         }
     }
 }
@@ -179,6 +210,21 @@ impl UiConfig {
             .code()
             .to_string();
         self.voice_language = translation_language::normalize_source_code(&self.voice_language);
+        if !matches!(
+            self.system_audio_language.as_str(),
+            "target" | "auto" | "cn" | "en" | "ja" | "ko"
+        ) {
+            self.system_audio_language = "auto".into();
+        }
+        self.subtitle_font_size = if self.subtitle_font_size.is_finite() {
+            self.subtitle_font_size.clamp(12.0, 48.0).round()
+        } else {
+            20.0
+        };
+        if let Some(bounds) = &mut self.subtitle_bounds {
+            bounds.width = bounds.width.clamp(320, 2400);
+            bounds.height = bounds.height.clamp(70, 500);
+        }
         if !matches!(self.voice_backend.as_str(), "sensevoice" | "whisper") {
             self.voice_backend = "sensevoice".into();
         }
@@ -209,7 +255,12 @@ pub(crate) fn load_ui_config() -> Result<UiConfig> {
     let Some(content) = storage::load_setting("ui_config")? else {
         return Ok(UiConfig::default());
     };
-    let config: UiConfig = serde_json::from_str(&content).context("数据库中的 UI 设置格式错误")?;
+    let mut config: UiConfig =
+        serde_json::from_str(&content).context("数据库中的 UI 设置格式错误")?;
+    // 仅迁移旧设置。新设置若故意录制了相同快捷键，由保存时的冲突校验提示用户。
+    if !content.contains("\"mic_tts\"") && config.hotkeys.voice.eq_ignore_ascii_case("ctrl+f12") {
+        config.hotkeys.voice = "ctrl+alt+v".into();
+    }
     Ok(config.normalized())
 }
 
@@ -254,5 +305,23 @@ mod tests {
         assert!(!hidden.ocr_show_original);
         let saved = serde_json::to_value(hidden).unwrap();
         assert_eq!(saved["ocr_show_original"], false);
+    }
+
+    #[test]
+    fn system_audio_monitor_is_opt_in_for_existing_settings() {
+        let old: UiConfig = serde_json::from_str("{}").unwrap();
+        assert!(!old.system_audio_monitor);
+        assert!(!old.system_audio_translate);
+        assert!(old.system_audio_device.is_empty());
+        assert_eq!(old.system_audio_language, "auto");
+        assert_eq!(old.subtitle_font_size, 20.0);
+        let enabled: UiConfig = serde_json::from_str(
+            r#"{"system_audio_monitor":true,"system_audio_translate":true,"system_audio_device":"selected-output"}"#,
+        )
+        .unwrap();
+        let saved = serde_json::to_value(enabled).unwrap();
+        assert_eq!(saved["system_audio_monitor"], true);
+        assert_eq!(saved["system_audio_translate"], true);
+        assert_eq!(saved["system_audio_device"], "selected-output");
     }
 }

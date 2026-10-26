@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-windows",
   "description": "React 窗口仅使用基础事件 API；文件、剪贴板和设置通过受控 Rust 命令处理。",
-  "windows": ["settings", "query", "ocr", "voice"],
-  "permissions": ["core:default"]
+  "windows": ["settings", "query", "ocr", "voice", "system_audio"],
+  "permissions": ["core:default", "core:window:allow-start-dragging", "core:window:allow-start-resize-dragging"]
 }
