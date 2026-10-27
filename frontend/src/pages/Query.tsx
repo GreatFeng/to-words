@@ -35,6 +35,8 @@ export function QueryPage() {
   const [languageMismatch, setLanguageMismatch] = useState(false);
   const [unmatchedEnter, setUnmatchedEnter] = useState(false);
   const [translating, setTranslating] = useState(false);
+  const [selectedTranslationPending, setSelectedTranslationPending] = useState(false);
+  const selectionPendingRef = useRef(false);
   const input = useRef<HTMLInputElement>(null);
   const content = useRef<HTMLElement>(null);
   const lastWindowSize = useRef({ width: 0, height: 0 });
@@ -48,7 +50,8 @@ export function QueryPage() {
   const searching = !!query.trim() && (searched?.query !== query.trim() || searched.page !== page);
   const sameLanguage = !!config?.translation_language && config.source_language === config.translation_language;
   const noMatch = !!query.trim() && !searching && !searchError && !languageMismatch && total === 0 && !translation;
-  const canTranslate = !!query.trim() && !sameLanguage && !!config?.ai_translation && !!config.translation_language;
+  const canTranslate = !!query.trim() && !!config?.translation_language
+    && (selectedTranslationPending || (!sameLanguage && !!config.ai_translation));
 
   const stopSpeech = () => {
     ++speechRequest.current;
@@ -133,6 +136,8 @@ export function QueryPage() {
   </button>;
 
   const reset = () => {
+    selectionPendingRef.current = false;
+    setSelectedTranslationPending(false);
     stopSpeech();
     ++lastRequested.current;
     ++translationRequest.current;
@@ -187,24 +192,56 @@ export function QueryPage() {
       }
     }).catch(error => { if (id === lastRequested.current) setSearchError(String(error)); });
   }, [query, page, pageSize, config?.source_language, config?.translation_language]);
+  const beginSelectedTranslation = (text: string) => {
+    selectionPendingRef.current = true;
+    setSelectedTranslationPending(true);
+    setQuery(text);
+    setPage(0);
+    setTranslation("");
+    setTranslationPronunciation("");
+    setPreferTranslation(false);
+    setTranslating(true);
+    setStatus("正在翻译选中文字…");
+    const request = ++translationRequest.current;
+    void api.translateSelection(text).then(result => {
+      if (request !== translationRequest.current) return;
+      setTranslation(result.translated);
+      setTranslationPronunciation(result.pronunciation);
+      setPreferTranslation(true);
+      setStatus("");
+    }).catch(error => {
+      if (request === translationRequest.current) setStatus(`选中文字翻译失败：${String(error)}`);
+    }).finally(() => {
+      if (request === translationRequest.current) {
+        setTranslating(false);
+      }
+    });
+  };
   useEffect(() => {
     const opened = listen("query-opened", () => {
       reset();
-      void api.takePendingQuery().then(pending => { if (pending) setQuery(pending); });
+      void api.takePendingSelectedTranslation().then(selected => {
+        if (selected) beginSelectedTranslation(selected);
+        else {
+          void api.takePendingQuery().then(pending => { if (pending) setQuery(pending); });
+        }
+      });
       input.current?.focus();
       requestAnimationFrame(() => fitWindow(true));
     });
     const onFocus = () => {
+      if (selectionPendingRef.current) return;
       void api.takePendingQuery().then(pending => {
+        if (selectionPendingRef.current) return;
         if (pending) { setQuery(pending); setPage(0); }
-        else if (config?.clear_on_focus_return) setQuery("");
         input.current?.focus();
       });
     };
     window.addEventListener("focus", onFocus);
+    const selectedError = listen<string>("selected-text-error", event => setStatus(event.payload));
     void api.takePendingQuery().then(pending => { if (pending) { setQuery(pending); setPage(0); } });
-    return () => { window.removeEventListener("focus", onFocus); void opened.then(stop => stop()); };
-  }, [config?.clear_on_focus_return]);
+    return () => { window.removeEventListener("focus", onFocus); void opened.then(stop => stop()); void selectedError.then(stop => stop()); };
+  }, []);
 
   const finish = async (next: SearchHit[]) => {
     stopSpeech();
@@ -221,6 +258,8 @@ export function QueryPage() {
   const append = (hit: SearchHit) => {
     stopSpeech();
     ++translationRequest.current;
+    selectionPendingRef.current = false;
+    setSelectedTranslationPending(false);
     setComposed(items => [...items, hit]);
     setQuery(""); setHits([]); setTotal(0); setSelected(0); setPage(0);
     setTranslation(""); setTranslationPronunciation(""); setPreferTranslation(false); setStatus(""); setSearched(null); setUnmatchedEnter(false); setTranslating(false); setLanguageMismatch(false);
@@ -228,11 +267,11 @@ export function QueryPage() {
   };
   const translate = async () => {
     if (!query.trim() || translating) return;
-    if (sameLanguage) {
+    if (sameLanguage && !selectedTranslationPending) {
       setStatus("原始语言和目标语言相同，无需 AI 翻译");
       return;
     }
-    if (!config?.ai_translation || !config.translation_language) {
+    if ((!config?.ai_translation && !selectedTranslationPending) || !config?.translation_language) {
       setStatus("请先在设置中启用 AI 翻译并选择目标语言");
       return;
     }
@@ -241,7 +280,9 @@ export function QueryPage() {
     setPreferTranslation(false);
     setStatus("");
     try {
-      const result = await api.translate(query.trim());
+      const result = selectedTranslationPending
+        ? await api.translateSelection(query.trim())
+        : await api.translate(query.trim());
       if (request === translationRequest.current) {
         setTranslation(result.translated);
         setTranslationPronunciation(result.pronunciation);
@@ -260,7 +301,7 @@ export function QueryPage() {
     else if (event.key === "Enter" && event.ctrlKey) { event.preventDefault(); void translate(); }
     else if (event.key === "Enter") {
       event.preventDefault();
-      if (languageMismatch && query.trim()) return;
+      if (languageMismatch && query.trim() && !(translation && preferTranslation)) return;
       if (translation && preferTranslation) void finish([...composed, { key: translation, value: query, rank: "exact" }]);
       else if (visible[selected]) void finish([...composed, visible[selected]]);
       else if (translation) void finish([...composed, { key: translation, value: query, rank: "exact" }]);
@@ -289,7 +330,7 @@ export function QueryPage() {
     <div className="flex shrink-0 items-center rounded-[var(--input-radius)] border border-slate-400/40 px-2"
       style={{ height: config?.input.height ?? 30, width: config?.input.width ?? 200, "--input-radius": `${config?.input.corner_radius ?? 9}px`, backgroundColor: `${inputColor}${Math.round((config?.input.opacity ?? .2) * 255).toString(16).padStart(2, "0")}` } as React.CSSProperties}>
       <button type="button" aria-label="拖动查询窗口" className="mr-1 cursor-move select-none text-xs text-slate-500" onMouseDown={event => { event.preventDefault(); void api.dragQuery(); }}>⋮</button>
-      <input ref={input} value={query} onChange={event => { stopSpeech(); ++translationRequest.current; setQuery(event.target.value); setPage(0); setTotal(0); setTranslation(""); setTranslationPronunciation(""); setPreferTranslation(false); setTranslating(false); setStatus(""); setUnmatchedEnter(false); setLanguageMismatch(false); }} onKeyDown={onKeyDown}
+      <input ref={input} value={query} onChange={event => { stopSpeech(); ++translationRequest.current; selectionPendingRef.current = false; setSelectedTranslationPending(false); setQuery(event.target.value); setPage(0); setTotal(0); setTranslation(""); setTranslationPronunciation(""); setPreferTranslation(false); setTranslating(false); setStatus(""); setUnmatchedEnter(false); setLanguageMismatch(false); }} onKeyDown={onKeyDown}
         placeholder="输入文字…" className="h-full min-w-0 flex-1 bg-transparent px-0 outline-none placeholder:text-slate-500/70" style={{ fontSize: config?.input.font_size ?? 14 }} />
       <button type="button" aria-label="退出" className="ml-2 rounded-full px-1 text-lg text-slate-600 hover:bg-red-100 hover:text-red-700" onClick={() => void api.exit()}>×</button>
     </div>
@@ -297,7 +338,7 @@ export function QueryPage() {
       style={{ marginTop: config?.gap ?? 4, borderRadius: config?.results.corner_radius ?? 7, minWidth: config?.results.min_width ?? 200, maxWidth: config?.results.max_width ?? 600, maxHeight: config?.results.max_height ?? 360, fontSize: config?.results.font_size ?? 12, backgroundColor: `${resultColor}${Math.round((config?.results.opacity ?? .2) * 255).toString(16).padStart(2, "0")}` }}>
       {composed.length > 0 && <p className="mb-1 border-b border-slate-500/20 py-1 text-xs text-slate-700">{composed.map(item => item.value ? `${item.key}（${item.value}）` : item.key).join(" · ")}</p>}
       {canTranslate && <button type="button" disabled={translating} onMouseDown={event => event.preventDefault()} onClick={() => void translate()}
-        className="mx-2 my-1 rounded-md bg-white/75 px-2.5 py-1.5 text-left text-xs font-medium text-slate-800 hover:bg-white disabled:opacity-50">{translating ? "DeepSeek 翻译中…" : translation ? "重新使用 DeepSeek 翻译 · Ctrl+Enter" : "使用 DeepSeek 翻译 · Ctrl+Enter"}</button>}
+        className="mx-2 my-1 rounded-md bg-white/75 px-2.5 py-1.5 text-left text-xs font-medium text-slate-800 hover:bg-white disabled:opacity-50">{translating ? "DeepSeek 翻译中…" : selectedTranslationPending ? "重新翻译选中文字 · Ctrl+Enter" : translation ? "重新使用 DeepSeek 翻译 · Ctrl+Enter" : "使用 DeepSeek 翻译 · Ctrl+Enter"}</button>}
       {translation && <div className="mx-2 my-1 max-w-full min-w-0 rounded-md px-2.5 py-1.5 hover:bg-white/70"
         style={{ backgroundColor: preferTranslation ? `${config?.selected_color ?? "#A9CEFF"}${Math.round((config?.selected_opacity ?? .72) * 255).toString(16).padStart(2, "0")}` : undefined }}>
         <div className="flex min-w-0 items-center gap-1.5">

@@ -282,7 +282,7 @@ fn report_error(app: &AppHandle, reason: anyhow::Error) {
     let _ = app.emit_to("settings", "mic-tts-status", &message);
 }
 
-fn change_mic_tts(
+pub(super) fn change_mic_tts(
     app: &AppHandle,
     enabled: Option<bool>,
     output_device: Option<String>,

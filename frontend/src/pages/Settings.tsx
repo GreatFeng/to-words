@@ -5,12 +5,11 @@ import { t } from "../i18n";
 import { availableVoices, findConfiguredVoice, findLocalVoice, speechLanguage } from "../localSpeech";
 import { LibraryPage } from "./Library";
 
-type Section = "library" | "ai" | "voice" | "ocr" | "shortcuts" | "appearance";
+type Section = "library" | "ai" | "voice" | "shortcuts" | "appearance";
 const sections: { id: Section; title: string }[] = [
   { id: "library", title: "词库" },
   { id: "ai", title: "AI 翻译 · DeepSeek" },
   { id: "voice", title: "语音识别" },
-  { id: "ocr", title: "OCR 识别" },
   { id: "shortcuts", title: "快捷键" },
   { id: "appearance", title: "通用外观" },
 ];
@@ -92,7 +91,6 @@ export function SettingsPage() {
   const [recordingShortcut, setRecordingShortcut] = useState<keyof UiConfig["hotkeys"] | null>(null);
   const scrollArea = useRef<HTMLDivElement>(null);
   const [showScrollTop, setShowScrollTop] = useState(false);
-  const [ocrStatus, setOcrStatus] = useState("");
   const [voiceStatus, setVoiceStatus] = useState("");
   const [playbackVoices, setPlaybackVoices] = useState<SpeechSynthesisVoice[] | null>(null);
   const [localTtsVoices, setLocalTtsVoices] = useState<LocalTtsVoice[]>([]);
@@ -124,17 +122,38 @@ export function SettingsPage() {
     const subtitleState = listen<boolean>("system-audio-toggle", event =>
       setConfig(current => current && { ...current, system_audio_monitor: event.payload, system_audio_translate: event.payload }));
     const subtitleStatus = listen<string>("system-audio-status", event => setNotice(t(event.payload, uiLanguage.current)));
+    const voiceCommand = listen<string[]>("voice-command-applied", event => {
+      void api.getConfig().then(saved => setConfig(current => {
+        if (!current) return saved;
+        const next = { ...current, input: { ...current.input }, results: { ...current.results }, hotkeys: { ...current.hotkeys } };
+        for (const key of event.payload) {
+          if (key === "max_visible_results") next.results.max_visible_results = saved.results.max_visible_results;
+          else if (key.startsWith("input.")) {
+            const field = key.slice("input.".length);
+            (next.input as unknown as Record<string, unknown>)[field] = (saved.input as unknown as Record<string, unknown>)[field];
+          } else if (key.startsWith("results.")) {
+            const field = key.slice("results.".length);
+            (next.results as unknown as Record<string, unknown>)[field] = (saved.results as unknown as Record<string, unknown>)[field];
+          } else if (key.startsWith("hotkeys.")) {
+            const field = key.slice("hotkeys.".length);
+            (next.hotkeys as unknown as Record<string, unknown>)[field] = (saved.hotkeys as unknown as Record<string, unknown>)[field];
+          }
+          else if (key in saved) (next as unknown as Record<string, unknown>)[key] = (saved as unknown as Record<string, unknown>)[key];
+        }
+        return next;
+      })).catch(() => {});
+    });
     const refresh = () => void api.getConfig().then(saved =>
       setConfig(current => current && { ...current, mic_tts_enabled: saved.mic_tts_enabled,
         system_audio_monitor: saved.system_audio_monitor, system_audio_translate: saved.system_audio_translate })).catch(() => {});
     window.addEventListener("focus", refresh);
     return () => { void state.then(stop => stop()); void status.then(stop => stop());
-      void subtitleState.then(stop => stop()); void subtitleStatus.then(stop => stop()); window.removeEventListener("focus", refresh); };
+      void subtitleState.then(stop => stop()); void subtitleStatus.then(stop => stop());
+      void voiceCommand.then(stop => stop()); window.removeEventListener("focus", refresh); };
   }, []);
   useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(""), noticeDuration); return () => clearTimeout(timer); }, [notice, noticeRevision, noticeDuration]);
   useEffect(() => { scrollArea.current?.scrollTo({ top: 0, behavior: "auto" }); setShowScrollTop(false); }, [active]);
   useEffect(() => {
-    if (active === "ocr") void api.ocrEngineStatus().then(setOcrStatus).catch(error => setOcrStatus(String(error)));
     if (active === "voice" && config) void api.voiceEngineStatus(config.voice_backend, config.source_language, config.translation_language).then(setVoiceStatus).catch(error => setVoiceStatus(String(error)));
   }, [active, config?.voice_backend, config?.source_language, config?.translation_language]);
   useEffect(() => {
@@ -172,7 +191,8 @@ export function SettingsPage() {
   const voicesForLanguage = playbackVoices?.filter(voice => !playbackLanguage
     || voice.lang.toLocaleLowerCase().split("-")[0] === playbackKey.split("-")[0]) ?? [];
   const localVoicesForLanguage = [...localTtsVoices, ...windowsTtsVoices].filter(voice => !playbackLanguage
-    || voice.lang.toLocaleLowerCase().split("-")[0] === playbackKey.split("-")[0]);
+    || voice.lang.toLocaleLowerCase().split("-")[0] === playbackKey.split("-")[0]
+    || (playbackKey.startsWith("zh-") && voice.lang.toLocaleLowerCase().startsWith("yue-")));
   const choosePlaybackVoice = (uri: string) => setConfig(current => {
     if (!current) return current;
     const speech_voices = { ...current.speech_voices };
@@ -185,7 +205,9 @@ export function SettingsPage() {
     previewAudio.current = null;
     window.speechSynthesis?.cancel();
     if (!playbackLanguage) return;
-    const sample = playbackKey.startsWith("ko") ? "안녕하세요. 반갑습니다."
+    const selectedVoice = [...localTtsVoices, ...windowsTtsVoices].find(voice => voice.id === selectedPlaybackUri);
+    const sample = selectedVoice?.lang.toLocaleLowerCase().startsWith("yue-") ? "你好，今日天氣好好。"
+      : playbackKey.startsWith("ko") ? "안녕하세요. 반갑습니다."
       : playbackKey.startsWith("ja") ? "こんにちは。よろしくお願いします。"
         : playbackKey.startsWith("zh") ? "你好，很高兴认识你。"
           : "Hello, nice to meet you.";
@@ -297,6 +319,7 @@ export function SettingsPage() {
           </div>}
           {active === "voice" && <div className="grid gap-4">
             {voiceStatus && <p className="whitespace-pre-wrap rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">{voiceStatus}</p>}
+            <p className="text-xs text-slate-600">{label("语音指令模式会持续监听；可连续下达多条设置指令。再次按快捷键或说“关闭指令模式”即可停止。需要 DeepSeek API Key。")}</p>
             <label className="grid gap-2 text-sm">{label("识别引擎")}
               <select className="field" value={config.voice_backend} onChange={event => update("voice_backend", event.target.value)}>
                 <option value="sensevoice">SenseVoice</option><option value="whisper">whisper.cpp</option>
@@ -313,6 +336,31 @@ export function SettingsPage() {
             <Switch label={label("多条词库匹配时自动输入第一条")} checked={config.voice_auto_copy_first} onChange={value => update("voice_auto_copy_first", value)} />
             <Switch label={label("Aion2 兼容模式：复制语音结果，手动粘贴")} checked={config.voice_aion2_manual_paste} onChange={value => update("voice_aion2_manual_paste", value)} />
             <Switch label={label("仅识别已注册的本人声音")} checked={config.voice_owner_filter} onChange={value => update("voice_owner_filter", value)} />
+            <details className="group rounded-xl border border-slate-200 bg-slate-50 text-sm">
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-xl px-4 py-3 font-medium text-slate-800 hover:bg-slate-100 [&::-webkit-details-marker]:hidden">
+                {label("本人声纹")}
+                <svg aria-hidden="true" viewBox="0 0 20 20" fill="none" className="h-4 w-4 shrink-0 text-slate-500 transition-transform group-open:rotate-180">
+                  <path d="m5 7.5 5 5 5-5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </summary>
+              <div className="border-t border-slate-200 px-4 pb-4 pt-3">
+              <p className="whitespace-pre-line text-xs leading-5 text-slate-600">{label("1. 今天我想试试语音输入，看看识别是否准确。\n2. 请把这句话记下来，等一下我还会继续说话。\n3. 现在我会用平时的声音，完成最后一段录音。")}</p>
+              <p className="mt-2 text-xs leading-5 text-slate-600">{label("点击“注册本人声纹”后先等约 1 秒，再逐句朗读。每句说约 3–5 秒，每句后（包括最后一句）停顿约 1 秒，看界面是否依次显示 1/3、2/3、3/3。")}</p>
+              <div className="mt-4 flex items-center gap-2">
+                <button type="button" className="button" disabled={voiceEnrolling} onClick={async () => {
+                  setVoiceEnrolling(true); setVoiceEnrollmentStatus(label("请开始朗读第一段"));
+                  try { await api.registerVoiceProfile(); setVoiceRegistered(true); }
+                  catch (error) { setVoiceEnrollmentStatus(String(error)); }
+                  finally { setVoiceEnrolling(false); }
+                }}>{label("注册本人声纹")}</button>
+                {voiceRegistered && <button type="button" className="button button-danger" disabled={voiceEnrolling} onClick={async () => {
+                  try { await api.deleteVoiceProfile(); setVoiceRegistered(false); update("voice_owner_filter", false); setVoiceEnrollmentStatus(label("声纹已删除")); }
+                  catch (error) { setVoiceEnrollmentStatus(String(error)); }
+                }}>{label("删除声纹")}</button>}
+              </div>
+              <p role="status" className="mt-3 text-xs text-slate-600">{label("本人声纹")} · {voiceRegistered ? label("已注册本人声纹") : label("尚未注册本人声纹")}{voiceEnrollmentStatus && ` · ${voiceEnrollmentStatus}`}</p>
+              </div>
+            </details>
             <Switch label={label("过滤电脑播放声")} checked={config.voice_playback_filter} onChange={value => update("voice_playback_filter", value)} />
             <div className="grid gap-2 border-t border-slate-200 pt-4">
               <Switch label={label("监听系统播放声音并显示识别字幕")} checked={config.system_audio_monitor} onChange={value => update("system_audio_monitor", value)} />
@@ -338,24 +386,7 @@ export function SettingsPage() {
               <p className="text-xs text-slate-600">{label("选择网页视频实际使用的播放设备；原始语言为自动识别时，字幕译为简体中文。翻译需要 DeepSeek API Key。")}</p>
             </div>
             <Slider label={label("语音停顿时间（秒）")} value={config.voice_silence_seconds} min={0.2} max={3} step={0.1} unit="s" onChange={value => update("voice_silence_seconds", value)} />
-            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm">
-              <p className="mb-3 font-medium">{label("本人声纹")} · {voiceRegistered ? label("已注册本人声纹") : label("尚未注册本人声纹")}</p>
-              <p className="whitespace-pre-line text-xs leading-5 text-slate-600">{label("1. 今天我想试试语音输入，看看识别是否准确。\n2. 请把这句话记下来，等一下我还会继续说话。\n3. 现在我会用平时的声音，完成最后一段录音。")}</p>
-              <p className="mt-2 text-xs leading-5 text-slate-600">{label("点击“注册本人声纹”后先等约 1 秒，再逐句朗读。每句说约 3–5 秒，每句后（包括最后一句）停顿约 1 秒，看界面是否依次显示 1/3、2/3、3/3。")}</p>
-              <div className="mt-4 flex items-center gap-2">
-                <button type="button" className="button" disabled={voiceEnrolling} onClick={async () => {
-                  setVoiceEnrolling(true); setVoiceEnrollmentStatus(label("请开始朗读第一段"));
-                  try { await api.registerVoiceProfile(); setVoiceRegistered(true); }
-                  catch (error) { setVoiceEnrollmentStatus(String(error)); }
-                  finally { setVoiceEnrolling(false); }
-                }}>{label("注册本人声纹")}</button>
-                {voiceRegistered && <button type="button" className="button button-danger" disabled={voiceEnrolling} onClick={async () => {
-                  try { await api.deleteVoiceProfile(); setVoiceRegistered(false); update("voice_owner_filter", false); setVoiceEnrollmentStatus(label("声纹已删除")); }
-                  catch (error) { setVoiceEnrollmentStatus(String(error)); }
-                }}>{label("删除声纹")}</button>}
-                <span role="status" className="text-xs text-slate-600">{voiceEnrollmentStatus}</span>
-              </div>
-            </div>
+            <Slider label={label("指令模式停顿时间（秒）")} value={config.command_silence_seconds} min={0.3} max={3} step={0.1} unit="s" onChange={value => update("command_silence_seconds", value)} />
             <div className="grid gap-4 border-t border-slate-200 pt-5 text-sm text-slate-700">
               <h2 className="font-semibold text-slate-900">{label("查询结果发音")}</h2>
               <p>{label("选择查询结果与自动麦克风发音使用的本地声音。")}</p>
@@ -390,18 +421,14 @@ export function SettingsPage() {
               </div>
             </div>
           </div>}
-          {active === "ocr" && <div className="grid gap-3">
-            <p className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">{ocrStatus || label("正在检查 OCR 环境…")}</p>
-          </div>}
           {active === "shortcuts" && <div className="grid gap-1">
-            {(["popup", "settings", "clear_composed", "ocr", "voice", "mic_tts", "system_audio"] as const).map((key, index) =>
-              <ShortcutField key={key} label={label(["打开查询", "设置", "清空所有组合内容", "OCR 识别", "语音识别", "自动麦克风发音开关", "系统声音字幕与翻译开关"][index])}
+            {(["popup", "settings", "clear_composed", "ocr", "voice", "command", "mic_tts", "system_audio"] as const).map((key, index) =>
+              <ShortcutField key={key} label={label(["打开查询", "设置", "清空所有组合内容", "OCR 识别", "语音识别", "语音指令模式", "自动麦克风发音开关", "系统声音字幕与翻译开关"][index])}
                 value={config.hotkeys[key]} onChange={value => updatePart("hotkeys", key, value)}
                 recording={recordingShortcut === key} onRecordingChange={recording => setRecordingShortcut(recording ? key : null)} />)}
           </div>}
           {active === "appearance" && <div className="grid gap-7">
-            <Switch label={label("切回查询框时清空输入")} checked={config.clear_on_focus_return} onChange={value => update("clear_on_focus_return", value)} />
-            <div className="grid gap-5 border-t border-slate-200 pt-5">
+            <div className="grid gap-5">
               <h2 className="font-semibold">{label("输入框")}</h2>
               <ColorField label={label("背景颜色")} value={config.input.background_color} onChange={value => updatePart("input", "background_color", value)} />
               <Slider label={label("透明度")} value={config.input.opacity} min={0} max={1} step={0.05} onChange={value => updatePart("input", "opacity", value)} />

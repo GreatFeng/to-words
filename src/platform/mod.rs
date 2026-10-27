@@ -11,6 +11,7 @@ pub(crate) mod mouse_hotkey;
 pub(crate) mod narrator_voice;
 pub(crate) mod ocr;
 pub(crate) mod piper_tts;
+pub(crate) mod selected_text;
 #[cfg(windows)]
 pub(crate) mod streaming_asr;
 pub(crate) mod tts_output;

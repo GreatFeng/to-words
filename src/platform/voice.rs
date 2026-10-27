@@ -32,6 +32,7 @@ pub(crate) enum VoiceEvent {
     Recognizing(u64),
     Utterance(u64, Result<String, String>),
     Filtered(u64),
+    CaptureReleased,
     Stopped(Option<String>),
 }
 
@@ -91,6 +92,7 @@ fn start_streaming_subtitles(sender: Sender<VoiceEvent>) -> Option<Sender<Stream
 
 pub(crate) struct VoiceSession {
     stop: Arc<AtomicBool>,
+    discard_on_stop: Arc<AtomicBool>,
     pub(crate) trace: VoiceTrace,
     pub(crate) receiver: Receiver<VoiceEvent>,
     pub(crate) stopping: bool,
@@ -105,6 +107,14 @@ impl VoiceSession {
     pub(crate) fn stop(&mut self) {
         self.stopping = true;
         self.stop.store(true, Ordering::Release);
+    }
+
+    /// Switch recording modes without transcribing the abandoned tail. The
+    /// caller may start a new capture after CaptureReleased, while old ASR
+    /// cleanup completes independently.
+    pub(crate) fn cancel_for_handoff(&mut self) {
+        self.discard_on_stop.store(true, Ordering::Release);
+        self.stop();
     }
 }
 
@@ -175,6 +185,30 @@ pub(crate) fn start(
     owner_filter: bool,
     playback_filter: bool,
 ) -> Result<VoiceSession> {
+    start_with_idle_timeout(
+        keep_input,
+        push_to_talk,
+        language,
+        backend,
+        strict_language,
+        silence_seconds,
+        owner_filter,
+        playback_filter,
+        Duration::from_secs(15),
+    )
+}
+
+pub(crate) fn start_with_idle_timeout(
+    keep_input: bool,
+    push_to_talk: bool,
+    language: &str,
+    backend: &str,
+    strict_language: Option<&str>,
+    silence_seconds: f32,
+    owner_filter: bool,
+    playback_filter: bool,
+    no_speech_timeout: Duration,
+) -> Result<VoiceSession> {
     start_with_source(
         keep_input,
         push_to_talk,
@@ -186,6 +220,7 @@ pub(crate) fn start(
         playback_filter,
         false,
         None,
+        no_speech_timeout,
     )
 }
 
@@ -206,6 +241,7 @@ pub(crate) fn start_playback(
         false,
         true,
         Some(playback_device),
+        Duration::from_secs(15),
     )
 }
 
@@ -220,6 +256,7 @@ fn start_with_source(
     playback_filter: bool,
     system_playback: bool,
     playback_device: Option<&str>,
+    no_speech_timeout: Duration,
 ) -> Result<VoiceSession> {
     let engine = selected_engine(backend)?;
     let engine = match engine {
@@ -275,8 +312,10 @@ fn start_with_source(
     bail!("语音识别目前仅支持 Windows");
 
     let stop = Arc::new(AtomicBool::new(false));
+    let discard_on_stop = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
     let worker_stop = Arc::clone(&stop);
+    let worker_discard = Arc::clone(&discard_on_stop);
     let worker_trace = trace.clone();
     std::thread::spawn(move || {
         let (audio_sender, audio_receiver) = mpsc::channel();
@@ -289,8 +328,12 @@ fn start_with_source(
         let asr_sender = sender.clone();
         let asr_trace = worker_trace.clone();
         let asr_stop = Arc::clone(&worker_stop);
+        let asr_discard = Arc::clone(&worker_discard);
         let transcriber = std::thread::spawn(move || {
             for (utterance_id, mut samples) in segment_receiver {
+                if asr_discard.load(Ordering::Acquire) {
+                    continue;
+                }
                 if let Some(verifier) = &owner_verifier {
                     match verifier.select_owner_audio(&samples) {
                         Ok(Some(owner_audio)) => {
@@ -369,7 +412,7 @@ fn start_with_source(
         let mut pending_short: Option<(CompletedSegment, Instant)> = None;
         let started_at = Instant::now();
         loop {
-            if !keep_input && !heard_speech && started_at.elapsed() >= Duration::from_secs(15) {
+            if !keep_input && !heard_speech && started_at.elapsed() >= no_speech_timeout {
                 worker_stop.store(true, Ordering::Release);
                 worker_trace.record(0, "no_speech_timeout", None, "timeout");
                 break;
@@ -451,13 +494,20 @@ fn start_with_source(
             .join()
             .map_err(|_| "音频采集线程意外终止".to_string())
             .and_then(|result| result.map_err(|error| format!("{error:#}")));
+        let discarded = worker_discard.load(Ordering::Acquire);
+        if discarded {
+            let _ = sender.send(VoiceEvent::CaptureReleased);
+        }
         // 手动停止时还没等到静音，仍提交最后一句；自动停止已经提交过，不再重复识别。
         let min_final_samples = if push_to_talk {
             SAMPLE_RATE / 5
         } else {
             SAMPLE_RATE / 2
         };
-        if !auto_stopped && let Some(segment) = gate.take_active(min_final_samples) {
+        if !discarded
+            && !auto_stopped
+            && let Some(segment) = gate.take_active(min_final_samples)
+        {
             worker_trace.speech_end(utterance_id, Duration::ZERO);
             worker_trace.record(utterance_id, "manual_segment", None, "ok");
             worker_trace.record(
@@ -474,7 +524,7 @@ fn start_with_source(
                 ));
             }
         }
-        if let Some((segment, _)) = pending_short.take() {
+        if !discarded && let Some((segment, _)) = pending_short.take() {
             submit_segment(
                 utterance_id,
                 segment,
@@ -498,6 +548,7 @@ fn start_with_source(
     });
     Ok(VoiceSession {
         stop,
+        discard_on_stop,
         trace,
         receiver,
         stopping: false,

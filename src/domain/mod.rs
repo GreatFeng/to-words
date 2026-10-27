@@ -4,6 +4,7 @@
 //! 领域层尽量不依赖界面框架或 Windows API，以便独立测试和复用。
 
 pub(crate) mod ai_word_save;
+pub(crate) mod settings_command;
 pub(crate) mod shortcut;
 pub(crate) mod storage;
 pub(crate) mod translation_language;

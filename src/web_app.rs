@@ -2,19 +2,24 @@
 //! 词库、OCR 和语音命令分别由同目录子模块实现。
 
 mod browser_captions;
+mod command_actions;
 mod library;
 mod ocr_runtime;
+mod selected_translation;
 mod system_audio_runtime;
 mod tts_runtime;
 mod voice_runtime;
 
 use self::browser_captions::*;
+use self::command_actions::*;
 use self::library::*;
 use self::ocr_runtime::*;
+use self::selected_translation::*;
 use self::system_audio_runtime::*;
 use self::tts_runtime::*;
 use self::voice_runtime::*;
 use crate::domain::ai_word_save;
+use crate::domain::settings_command;
 use crate::domain::shortcut::{MouseShortcut, Shortcut};
 use crate::domain::storage::{self, StoredWord};
 use crate::domain::voice_word_cache::{self, VoiceCacheRequest, VoiceWordCache};
@@ -25,12 +30,15 @@ use crate::platform::mouse_hotkey::MouseHotkeyListener;
 use crate::platform::narrator_voice;
 use crate::platform::ocr::{self, CapturedScreen};
 use crate::platform::piper_tts::{self, LocalTtsVoice};
+use crate::platform::selected_text;
 use crate::platform::voice::{self, VoiceEvent, VoiceSession};
 use crate::platform::voice_identity::{self, EnrollmentEvent};
 use crate::platform::voice_output::VoiceInputTarget;
 use crate::platform::window_monitor::{SettingsOrigin, settings_position};
 use crate::platform::{tts_output, windows_tts};
-use crate::web_config::{UiConfig, load_ui_config, save_ui_config};
+use crate::web_config::{
+    SELECTED_TEXT_TRANSLATION_ACTIVE, UiConfig, load_ui_config, save_ui_config,
+};
 use crate::{
     ai::{self, AiCandidate},
     project_directory, translation_language,
@@ -65,6 +73,9 @@ struct WebState {
     system_audio_display: Mutex<VoiceDisplay>,
     browser_caption: Arc<Mutex<BrowserCaptionState>>,
     pending_query: Mutex<Option<String>>,
+    pending_selected_translation: Mutex<Option<String>>,
+    selection_menu_text: Mutex<Option<String>>,
+    selection_menu_generation: AtomicU64,
     shortcut_recording: Mutex<Option<Instant>>,
 }
 
@@ -136,6 +147,7 @@ struct VoiceDisplay {
 
 enum VoiceControl {
     Toggle,
+    Command,
     Release,
 }
 enum CacheCommand {
@@ -149,6 +161,17 @@ struct VoiceTranslation {
     recognized: String,
     previous: Option<String>,
     result: Result<AiCandidate, String>,
+}
+
+struct CommandInterpretation {
+    session_id: u64,
+    recognized: String,
+    result: Result<Vec<settings_command::SettingChange>, String>,
+}
+
+struct QueuedSettingCommand {
+    recognized: String,
+    change: settings_command::SettingChange,
 }
 
 #[derive(Default)]
@@ -271,6 +294,10 @@ fn get_default_config() -> UiConfig {
 
 #[tauri::command]
 fn save_config(config: UiConfig, app: AppHandle, state: State<'_, WebState>) -> Result<(), String> {
+    apply_config(config, &app, &state)
+}
+
+fn apply_config(config: UiConfig, app: &AppHandle, state: &WebState) -> Result<(), String> {
     use tauri::Emitter;
     let mut config = config.normalized();
     // The overlay saves its geometry independently while Settings may remain open.
@@ -281,7 +308,12 @@ fn save_config(config: UiConfig, app: AppHandle, state: State<'_, WebState>) -> 
     }
     save_ui_config(&config).map_err(error)?;
     let mic_tts_enabled = config.mic_tts_enabled;
+    let selection_menu_enabled =
+        SELECTED_TEXT_TRANSLATION_ACTIVE && config.selected_text_context_menu;
     *state.config.lock().map_err(error)? = config;
+    if !selection_menu_enabled {
+        hide_selection_menu(app.clone());
+    }
     if !mic_tts_enabled {
         state.tts_generation.fetch_add(1, Ordering::Relaxed);
     }
@@ -366,16 +398,16 @@ fn validate_shortcuts(config: &UiConfig) -> Result<(), String> {
         &config.hotkeys.clear_composed,
         &config.hotkeys.ocr,
         &config.hotkeys.voice,
+        &config.hotkeys.command,
         &config.hotkeys.mic_tts,
         &config.hotkeys.system_audio,
     ];
     let mut unique = HashSet::new();
     for shortcut in shortcuts {
         let parsed = shortcut.parse::<Shortcut>()?;
-        if !unique.insert(shortcut.to_ascii_lowercase()) {
+        if !unique.insert(parsed) {
             return Err("快捷键不能使用相同的组合".to_string());
         }
-        let _ = parsed;
     }
     Ok(())
 }
@@ -702,6 +734,18 @@ fn start_mouse_worker(app: AppHandle, window_handle: Option<isize>) {
                     }
                     continue;
                 }
+                if event.pressed
+                    && event.button == crate::domain::shortcut::MouseButton::Right
+                    && SELECTED_TEXT_TRANSLATION_ACTIVE
+                    && app
+                        .state::<WebState>()
+                        .config
+                        .lock()
+                        .ok()
+                        .is_some_and(|config| config.selected_text_context_menu)
+                {
+                    offer_selected_text_menu(&app);
+                }
                 if !event.pressed {
                     let release_voice =
                         app.state::<WebState>()
@@ -739,6 +783,7 @@ fn start_mouse_worker(app: AppHandle, window_handle: Option<isize>) {
                             (&config.hotkeys.clear_composed, "clear"),
                             (&config.hotkeys.ocr, "ocr"),
                             (&config.hotkeys.voice, "voice"),
+                            (&config.hotkeys.command, "command"),
                             (&config.hotkeys.mic_tts, "mic_tts"),
                             (&config.hotkeys.system_audio, "system_audio"),
                         ]
@@ -766,8 +811,14 @@ fn start_mouse_worker(app: AppHandle, window_handle: Option<isize>) {
                     Some("voice") => {
                         let _ = toggle_voice(app.state::<WebState>());
                     }
+                    Some("command") => {
+                        let _ = start_command_mode(&app);
+                    }
                     Some("mic_tts") => toggle_mic_tts(&app),
                     Some("system_audio") => toggle_system_audio(&app),
+                    Some("selected_translate") if SELECTED_TEXT_TRANSLATION_ACTIVE => {
+                        translate_selected_hotkey(&app)
+                    }
                     _ => {}
                 }
             }
@@ -781,6 +832,7 @@ fn register_keyboard_shortcuts(manager: &GlobalHotKeyManager, config: &UiConfig)
         ("设置", &config.hotkeys.settings),
         ("OCR", &config.hotkeys.ocr),
         ("语音识别", &config.hotkeys.voice),
+        ("语音指令模式", &config.hotkeys.command),
         ("自动麦克风发音", &config.hotkeys.mic_tts),
         ("系统声音字幕与翻译", &config.hotkeys.system_audio),
     ] {
@@ -802,6 +854,7 @@ fn keyboard_hotkey_action(config: &UiConfig, id: u32) -> Option<&'static str> {
         (&config.hotkeys.settings, "settings"),
         (&config.hotkeys.ocr, "ocr"),
         (&config.hotkeys.voice, "voice"),
+        (&config.hotkeys.command, "command"),
         (&config.hotkeys.mic_tts, "mic_tts"),
         (&config.hotkeys.system_audio, "system_audio"),
     ]
@@ -823,8 +876,12 @@ fn dispatch_keyboard_hotkey(app: &AppHandle, action: &str) {
             position_voice(app);
             let _ = toggle_voice(app.state::<WebState>());
         }
+        "command" => {
+            let _ = start_command_mode(app);
+        }
         "mic_tts" => toggle_mic_tts(app),
         "system_audio" => toggle_system_audio(app),
+        "selected_translate" if SELECTED_TEXT_TRANSLATION_ACTIVE => translate_selected_hotkey(app),
         _ => {}
     }
 }
@@ -850,6 +907,9 @@ pub(crate) fn run() -> anyhow::Result<()> {
             system_audio_display: Mutex::new(VoiceDisplay::default()),
             browser_caption: browser_caption.clone(),
             pending_query: Mutex::new(None),
+            pending_selected_translation: Mutex::new(None),
+            selection_menu_text: Mutex::new(None),
+            selection_menu_generation: AtomicU64::new(0),
             shortcut_recording: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
@@ -889,6 +949,10 @@ pub(crate) fn run() -> anyhow::Result<()> {
             synthesize_windows,
             set_mic_tts_enabled,
             take_pending_query,
+            take_pending_selected_translation,
+            translate_menu_selection,
+            translate_selected_text,
+            hide_selection_menu,
             toggle_voice,
             review_voice_cache_now,
             voice_registered,
@@ -910,6 +974,23 @@ pub(crate) fn run() -> anyhow::Result<()> {
             .always_on_top(true)
             .visible(false)
             .build()?;
+            if SELECTED_TEXT_TRANSLATION_ACTIVE {
+                WebviewWindowBuilder::new(
+                    app,
+                    "selection_menu",
+                    WebviewUrl::App("index.html?view=selection_menu".into()),
+                )
+                .title("to_words 翻译选中文字")
+                .inner_size(190.0, 46.0)
+                .decorations(false)
+                .shadow(false)
+                .transparent(true)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .focusable(false)
+                .visible(false)
+                .build()?;
+            }
             // 预热 OCR WebView；第一次按快捷键时无需再创建浏览器窗口。
             create_ocr_window(app.handle())?;
             let voice_window = WebviewWindowBuilder::new(
@@ -1044,7 +1125,11 @@ pub(crate) fn run() -> anyhow::Result<()> {
             ..
         } = event
         {
-            if label == "settings" || label == "query" || label == "ocr" {
+            if label == "settings"
+                || label == "query"
+                || label == "ocr"
+                || label == "selection_menu"
+            {
                 api.prevent_close();
                 if label == "ocr" {
                     let _ = cancel_ocr(app.clone());
@@ -1056,4 +1141,34 @@ pub(crate) fn run() -> anyhow::Result<()> {
         let _ = &manager;
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_hotkey_routes_to_command_mode() {
+        let config = UiConfig::default();
+        let Shortcut::Keyboard(hotkey) = config.hotkeys.command.parse().unwrap() else {
+            panic!("default command shortcut should use the keyboard");
+        };
+        assert_eq!(
+            keyboard_hotkey_action(&config, hotkey.id()),
+            Some("command")
+        );
+        assert!(validate_shortcuts(&config).is_ok());
+    }
+
+    #[test]
+    fn selected_translation_hotkey_is_inactive() {
+        let mut config = UiConfig::default();
+        let Shortcut::Keyboard(hotkey) = config.hotkeys.selected_translate.parse().unwrap() else {
+            panic!("selected-text translation should default to a keyboard shortcut");
+        };
+        assert_eq!(keyboard_hotkey_action(&config, hotkey.id()), None);
+        assert!(!config.selected_text_context_menu);
+        config.hotkeys.ocr = "control+alt+t".into();
+        assert!(validate_shortcuts(&config).is_ok());
+    }
 }

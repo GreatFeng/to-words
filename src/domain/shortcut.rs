@@ -95,7 +95,7 @@ impl fmt::Display for MouseShortcut {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Shortcut {
     Keyboard(HotKey),
     Mouse(MouseShortcut),

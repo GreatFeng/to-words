@@ -110,7 +110,7 @@ fn models_in_directory(dir: &Path, root: &Path) -> Vec<LocalModel> {
     if !tokens.is_file() || (!data_dir.is_dir() && !lexicon.is_file()) {
         return Vec::new();
     }
-    let rule_fsts = ["phone.fst", "date.fst", "number.fst"]
+    let rule_fsts = ["rule.fst", "phone.fst", "date.fst", "number.fst"]
         .iter()
         .map(|name| dir.join(name))
         .filter(|path| path.is_file())
@@ -149,7 +149,10 @@ fn models_in_directory(dir: &Path, root: &Path) -> Vec<LocalModel> {
         models.push(LocalModel::Piper(PiperModel {
             voice: LocalTtsVoice {
                 id: format!("piper:{relative}"),
-                name: format!("{name} · Piper"),
+                name: config["display_name"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{name} · Piper")),
                 lang,
             },
             model,
@@ -331,6 +334,23 @@ mod tests {
             return;
         };
         let audio = synthesize(&voice.id, "你好").expect("Piper should synthesize Chinese");
+        assert!(audio.starts_with("data:audio/wav;base64,"));
+        assert!(audio.len() > 1000);
+    }
+
+    #[test]
+    fn cantonese_model_generates_wav_when_installed() {
+        if !super::root().join("vits-cantonese-hf-xiaomaiiwn").is_dir() {
+            return;
+        }
+        let voice = list_voices()
+            .into_iter()
+            .find(|voice| voice.id.contains("vits-cantonese-hf-xiaomaiiwn"))
+            .expect("installed Cantonese voice should appear in the list");
+        assert_eq!(voice.lang, "yue-HK");
+        assert_eq!(voice.name, "粤语 · Xiaomaiiwn");
+        let audio = synthesize(&voice.id, "你好，今日天氣好好。")
+            .expect("Cantonese model should synthesize speech");
         assert!(audio.starts_with("data:audio/wav;base64,"));
         assert!(audio.len() > 1000);
     }

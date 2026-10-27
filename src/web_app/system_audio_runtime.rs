@@ -21,10 +21,20 @@ pub(super) fn get_system_audio_display(state: State<'_, WebState>) -> Result<Voi
 
 pub(super) fn toggle_system_audio(app: &AppHandle) {
     use tauri::Emitter;
+    let changed = change_system_audio(app, None);
+    if let Err(reason) = changed {
+        eprintln!("切换系统声音字幕失败：{reason}");
+        let _ = app.emit_to("settings", "system-audio-status", reason);
+    }
+}
+
+pub(super) fn change_system_audio(app: &AppHandle, desired: Option<bool>) -> Result<bool, String> {
+    use tauri::Emitter;
     let state = app.state::<WebState>();
     let changed = (|| -> Result<bool, String> {
         let mut config = state.config.lock().map_err(error)?;
-        let enabled = !(config.system_audio_monitor && config.system_audio_translate);
+        let enabled =
+            desired.unwrap_or(!(config.system_audio_monitor && config.system_audio_translate));
         let mut next = config.clone();
         next.system_audio_monitor = enabled;
         next.system_audio_translate = enabled;
@@ -41,11 +51,9 @@ pub(super) fn toggle_system_audio(app: &AppHandle) {
             };
             let _ = app.emit_to("settings", "system-audio-toggle", enabled);
             let _ = app.emit_to("settings", "system-audio-status", status);
+            Ok(enabled)
         }
-        Err(reason) => {
-            eprintln!("切换系统声音字幕失败：{reason}");
-            let _ = app.emit_to("settings", "system-audio-status", reason);
-        }
+        Err(reason) => Err(reason),
     }
 }
 

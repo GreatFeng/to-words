@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use crate::ai::PolitenessLevel;
 use crate::domain::{storage, translation_language};
 
+/// Temporarily disables every selected-text entry point while retaining saved values.
+pub(crate) const SELECTED_TEXT_TRANSLATION_ACTIVE: bool = false;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct UiConfig {
@@ -18,6 +21,7 @@ pub(crate) struct UiConfig {
     pub(crate) continuous_input: bool,
     pub(crate) ai_translation: bool,
     pub(crate) ai_auto_save: bool,
+    pub(crate) selected_text_context_menu: bool,
     #[serde(alias = "ai_polite_mode", alias = "ai_korean_honorific")]
     pub(crate) ai_politeness: PolitenessLevel,
     pub(crate) ocr_auto_translate: bool,
@@ -35,12 +39,12 @@ pub(crate) struct UiConfig {
     pub(crate) subtitle_font_size: f32,
     pub(crate) subtitle_bounds: Option<SubtitleBounds>,
     pub(crate) voice_silence_seconds: f32,
+    pub(crate) command_silence_seconds: f32,
     pub(crate) voice_backend: String,
     pub(crate) voice_language: String,
     pub(crate) speech_voices: HashMap<String, String>,
     pub(crate) mic_tts_enabled: bool,
     pub(crate) mic_output_device: String,
-    pub(crate) clear_on_focus_return: bool,
     pub(crate) translation_language: String,
     pub(crate) source_language: String,
     pub(crate) ui_language: String,
@@ -60,6 +64,7 @@ impl Default for UiConfig {
             continuous_input: false,
             ai_translation: false,
             ai_auto_save: true,
+            selected_text_context_menu: false,
             ai_politeness: PolitenessLevel::Informal,
             ocr_auto_translate: true,
             ocr_show_original: true,
@@ -76,12 +81,12 @@ impl Default for UiConfig {
             subtitle_font_size: 20.0,
             subtitle_bounds: None,
             voice_silence_seconds: 0.6,
+            command_silence_seconds: 0.9,
             voice_backend: "sensevoice".into(),
             voice_language: "auto".into(),
             speech_voices: HashMap::new(),
             mic_tts_enabled: false,
             mic_output_device: String::new(),
-            clear_on_focus_return: false,
             translation_language: String::new(),
             source_language: "auto".into(),
             ui_language: "zh-CN".into(),
@@ -163,8 +168,10 @@ pub(crate) struct HotkeyConfig {
     pub(crate) clear_composed: String,
     pub(crate) ocr: String,
     pub(crate) voice: String,
+    pub(crate) command: String,
     pub(crate) mic_tts: String,
     pub(crate) system_audio: String,
+    pub(crate) selected_translate: String,
 }
 
 impl Default for HotkeyConfig {
@@ -175,8 +182,10 @@ impl Default for HotkeyConfig {
             clear_composed: "ctrl+backspace".into(),
             ocr: "ctrl+alt+o".into(),
             voice: "ctrl+alt+v".into(),
+            command: "ctrl+alt+c".into(),
             mic_tts: "ctrl+f12".into(),
             system_audio: "ctrl+alt+b".into(),
+            selected_translate: "ctrl+alt+t".into(),
         }
     }
 }
@@ -201,6 +210,11 @@ impl UiConfig {
         }
         self.voice_silence_seconds =
             (self.voice_silence_seconds.clamp(0.2, 3.0) * 10.0).round() / 10.0;
+        if !self.command_silence_seconds.is_finite() {
+            self.command_silence_seconds = 0.9;
+        }
+        self.command_silence_seconds =
+            (self.command_silence_seconds.clamp(0.3, 3.0) * 10.0).round() / 10.0;
         self.gap = self.gap.clamp(0.0, 40.0);
         self.selected_opacity = self.selected_opacity.clamp(0.0, 1.0);
         self.translation_language =
@@ -261,6 +275,49 @@ pub(crate) fn load_ui_config() -> Result<UiConfig> {
     if !content.contains("\"mic_tts\"") && config.hotkeys.voice.eq_ignore_ascii_case("ctrl+f12") {
         config.hotkeys.voice = "ctrl+alt+v".into();
     }
+    if !content.contains("\"command\"") {
+        let occupied = [
+            &config.hotkeys.popup,
+            &config.hotkeys.settings,
+            &config.hotkeys.clear_composed,
+            &config.hotkeys.ocr,
+            &config.hotkeys.voice,
+            &config.hotkeys.mic_tts,
+            &config.hotkeys.system_audio,
+            &config.hotkeys.selected_translate,
+        ];
+        for candidate in ["ctrl+alt+c", "ctrl+alt+shift+c", "ctrl+shift+f11"] {
+            if occupied
+                .iter()
+                .all(|binding| !binding.eq_ignore_ascii_case(candidate))
+            {
+                config.hotkeys.command = candidate.into();
+                break;
+            }
+        }
+    }
+    if !content.contains("\"selected_translate\"") {
+        let occupied = [
+            &config.hotkeys.popup,
+            &config.hotkeys.settings,
+            &config.hotkeys.clear_composed,
+            &config.hotkeys.ocr,
+            &config.hotkeys.voice,
+            &config.hotkeys.command,
+            &config.hotkeys.mic_tts,
+            &config.hotkeys.system_audio,
+        ];
+        for candidate in ["ctrl+alt+t", "ctrl+alt+shift+t", "ctrl+shift+f10"] {
+            let parsed_candidate = candidate.parse::<crate::domain::shortcut::Shortcut>().ok();
+            if occupied
+                .iter()
+                .all(|binding| binding.parse().ok() != parsed_candidate)
+            {
+                config.hotkeys.selected_translate = candidate.into();
+                break;
+            }
+        }
+    }
     Ok(config.normalized())
 }
 
@@ -284,6 +341,18 @@ mod tests {
     use super::UiConfig;
     use crate::ai::PolitenessLevel;
 
+    #[test]
+    fn command_pause_is_independent_from_voice_input_pause() {
+        let old: UiConfig = serde_json::from_str(r#"{"voice_silence_seconds":0.6}"#).unwrap();
+        assert_eq!(old.voice_silence_seconds, 0.6);
+        assert_eq!(old.command_silence_seconds, 0.9);
+        let mut changed = old;
+        changed.command_silence_seconds = 1.4;
+        let restored: UiConfig =
+            serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(restored.voice_silence_seconds, 0.6);
+        assert_eq!(restored.command_silence_seconds, 1.4);
+    }
     #[test]
     fn old_polite_switch_migrates_to_conversational_and_new_level_round_trips() {
         let old: UiConfig = serde_json::from_str(r#"{"ai_polite_mode":true}"#).unwrap();
@@ -323,5 +392,25 @@ mod tests {
         assert_eq!(saved["system_audio_monitor"], true);
         assert_eq!(saved["system_audio_translate"], true);
         assert_eq!(saved["system_audio_device"], "selected-output");
+    }
+
+    #[test]
+    fn old_hotkeys_receive_command_mode_binding() {
+        let config: UiConfig =
+            serde_json::from_str(r#"{"hotkeys":{"voice":"ctrl+alt+v"}}"#).unwrap();
+        assert_eq!(config.hotkeys.command, "ctrl+alt+c");
+    }
+
+    #[test]
+    fn selected_translation_settings_round_trip_and_default_to_opt_in_menu() {
+        let mut config: UiConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.selected_text_context_menu);
+        assert_eq!(config.hotkeys.selected_translate, "ctrl+alt+t");
+        config.selected_text_context_menu = true;
+        config.hotkeys.selected_translate = "ctrl+shift+t".into();
+        let saved = serde_json::to_string(&config).unwrap();
+        let loaded: UiConfig = serde_json::from_str(&saved).unwrap();
+        assert!(loaded.selected_text_context_menu);
+        assert_eq!(loaded.hotkeys.selected_translate, "ctrl+shift+t");
     }
 }

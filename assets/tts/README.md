@@ -22,7 +22,12 @@ assets/tts/huayan/vits-piper-zh_CN-huayan-medium/
 | 语言 | 模型 | 安装目录 | 官方下载 |
 | --- | --- | --- | --- |
 | 中文 | Chaowen（Piper medium） | `vits-piper-zh_CN-chaowen-medium/` | [Sherpa-ONNX 模型包](https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-zh_CN-chaowen-medium.tar.bz2) |
+| 粤语 | Xiaomaiiwn（VITS） | `vits-cantonese-hf-xiaomaiiwn/` | [模型及配套文件](https://huggingface.co/csukuangfj/vits-cantonese-hf-xiaomaiiwn/tree/main) |
 | 英文 | Lessac（Piper high） | `vits-piper-en_US-lessac-high/` | [Sherpa-ONNX 模型包](https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-high.tar.bz2) |
 | 韩文、日文、英文 | Supertonic 3（每种语言 10 种声线） | `sherpa-onnx-supertonic-3-tts-int8-2026-05-11/` | [Sherpa-ONNX 模型包](https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2) |
+
+粤语模型需有 `.onnx`、`tokens.txt`、`lexicon.txt`、`rule.fst` 和同名 `.onnx.json` 元数据。它会在目标语言为中文时显示为可选声音，选中后点击试听即可验证。模型源仓库没有给出明确的模型授权；在对外分发前请向模型作者确认许可。
+
+四川话、东北话、上海话及台湾口音普通话目前没有已验证能由本项目现有引擎直接加载的轻量模型，因此未把普通话模型标为这些口音。它们不能仅靠改目录名实现对应口音。
 
 模型文件在本机，不提交到 Git。发布新版本时，请把选用的模型目录随 `to_words.exe` 一起复制到 `assets/tts/`。Supertonic 使用 CPU 合成，初次选择时加载模型可能稍慢。对外分发模型前，请分别核对原始模型及训练数据的许可条款；尤其不要仅依据转换包里的 `LICENSE` 推断原模型授权。
